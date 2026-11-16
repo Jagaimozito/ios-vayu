@@ -7,6 +7,9 @@ This branch ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generatio
 **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd,
 SpringBoard, the stock apps and sideloaded apps, drawn on the phone's **Adreno 640 GPU**.
 
+> This repository also contains the experimental iOS 27.2 port. Its current feature status and known problems are
+> tracked separately in [`docs/ios27.md`](docs/ios27.md); the description below remains the iOS 16 port overview.
+
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's
 > security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's
 > user data**.
