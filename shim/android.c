@@ -201,8 +201,33 @@ const char *android_boot(uintptr_t dtb)
 	uint32_t dtb_room = fdt_totalsize(dtb) + 0x2000;
 	uintptr_t tramp = (ndtb + dtb_room + BLK - 1) & ~(uintptr_t)(BLK - 1);
 	uintptr_t tramp_len = (uintptr_t)(linux_tramp_end - linux_tramp);
-	if (kdst + image_size > (uintptr_t)dtb || tramp + BLK > LOW_LIMIT || rd < (uintptr_t)dtb + fdt_totalsize(dtb))
-		return "memory layout does not fit";
+	uintptr_t dtb_end = (uintptr_t)dtb + fdt_totalsize(dtb);
+	if (kdst + image_size > (uintptr_t)dtb || tramp + BLK > LOW_LIMIT || rd < dtb_end) {
+		/*
+		 * Triple boot image (2026-11-14): two iOS payloads make our ramdisk ~37 MB, and ABL then puts its DTB
+		 * (and our ramdisk) lower, under the end of Android's kernel. Our payloads are not needed any more:
+		 * build Android's ramdisk, DTB and trampoline top-down below LOW_LIMIT instead, above the kernel's end
+		 * and clear of ABL's DTB (still read by make_bootargs and fdt_rebuild_chosen).
+		 */
+		/*
+		 * Not right under LOW_LIMIT: Linux maps the DTB with up-to-2 MiB blocks, so the DTB must not share a 2 MiB
+		 * block with the no-map hyp region (Documentation/arch/arm64/booting.rst). First try (top at 0x85700000)
+		 * hung at "Booting Android". Everything goes below the 2 MiB boundary under LOW_LIMIT.
+		 */
+		uintptr_t top = LOW_LIMIT & ~(uintptr_t)0x1fffff;
+		uintptr_t t2 = (top - BLK) & ~(uintptr_t)(BLK - 1);
+		uintptr_t d2 = (t2 - dtb_room) & ~(uintptr_t)(BLK - 1);
+		uintptr_t r2 = (d2 - rsz) & ~(uintptr_t)(BLK - 1);
+		con_hex2("LAYOUT", "dtb=", (uintptr_t)dtb, "dtb_end=", dtb_end);
+		con_hex2("LAYOUT", "kernel_end=", kdst + image_size, "abl_rd=", rd);
+		con_hex2("LAYOUT", "top rd=", r2, "tramp=", t2);
+		if (tramp_len > BLK || r2 < kdst + image_size || (r2 < dtb_end && t2 + BLK > (uintptr_t)dtb))
+			return "memory layout does not fit";
+		rd = r2;
+		rd_end = rd + rsz;
+		ndtb = d2;
+		tramp = t2;
+	}
 
 	uint8_t sys_guid[16];
 	uint8_t slun;

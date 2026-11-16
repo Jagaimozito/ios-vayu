@@ -561,9 +561,15 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 	}
 }
 
-/* the network to join: "ssid=NAME" and "psk=PASSPHRASE" lines (on the phone only, never in a repo) */
+/*
+ * The networks to join: "ssid=NAME" and "psk=PASSPHRASE" lines (on the phone only, never in a repo). Several
+ * networks: one ssid= line each, its psk= after it (none = open); wland joins the strongest one it hears.
+ */
 #define WLAN_CONF	"/var/local/wlan.conf"
-static char conf_ssid[33], conf_psk[65];
+#define CONF_MAX	16
+static struct { char ssid[33], psk[65]; unsigned fails; } conf[CONF_MAX];
+static unsigned nconf;
+static char conf_ssid[33];	/* nonzero when wlan.conf names at least one network (bridge/ipnet setup) */
 
 static void read_conf(void)
 {
@@ -573,24 +579,57 @@ static void read_conf(void)
 		return;
 	while (fgets(line, sizeof(line), f)) {
 		line[strcspn(line, "\r\n")] = 0;
-		if (!strncmp(line, "ssid=", 5))
-			snprintf(conf_ssid, sizeof(conf_ssid), "%s", line + 5);
-		else if (!strncmp(line, "psk=", 4))
-			snprintf(conf_psk, sizeof(conf_psk), "%s", line + 4);
+		if (!strncmp(line, "ssid=", 5) && nconf < CONF_MAX) {
+			snprintf(conf[nconf].ssid, sizeof(conf[nconf].ssid), "%s", line + 5);
+			conf[nconf].psk[0] = 0;
+			conf[nconf].fails = 0;
+			nconf++;
+		} else if (!strncmp(line, "psk=", 4) && nconf > 0) {
+			snprintf(conf[nconf - 1].psk, sizeof(conf[nconf - 1].psk), "%s", line + 4);
+		}
 	}
 	fclose(f);
-	printf("net: will join '%s' (%s)\n", conf_ssid, conf_psk[0] ? "WPA2-PSK" : "open");
+	for (unsigned i = 0; i < nconf; i++)
+		printf("net: known network %u: '%s' (%s)\n", i, conf[i].ssid, conf[i].psk[0] ? "WPA2-PSK" : "open");
+	if (nconf)
+		snprintf(conf_ssid, sizeof(conf_ssid), "%s", conf[0].ssid);
+}
+
+/* the known network heard most strongly in the last minute, skipping ones that failed 3 times in a row; -1 none */
+static int pick_conf(void)
+{
+	struct radio_bss b;
+	int best = -1, best_rssi = -1000;
+	for (unsigned i = 0; radio_heard(i, &b) == 0; i++) {
+		if (b.age_ms > 60000)
+			continue;
+		for (unsigned k = 0; k < nconf; k++) {
+			if (conf[k].fails >= 3 || strlen(conf[k].ssid) != b.ssid_len ||
+			    memcmp(conf[k].ssid, b.ssid, b.ssid_len))
+				continue;
+			if (b.rssi > best_rssi) {
+				best_rssi = b.rssi;
+				best = (int)k;
+			}
+		}
+	}
+	if (best < 0) {
+		for (unsigned k = 0; k < nconf; k++)
+			conf[k].fails = 0;	/* nothing usable heard: give every network its chances again */
+	}
+	return best;
 }
 
 /*
- * Join after the first scan and stay joined: a failed try again after 5 s (4 times), then every 30 s with a
- * fresh scan first; a lost link (deauth, kickout, beacon miss) joins again after 3 s.
+ * Join after a scan and stay joined: the strongest known network heard; a failed try again after 5 s (a network
+ * that failed 3 times in a row is skipped until nothing else is heard), with nothing known in range a fresh scan
+ * every 30 s; a lost link (deauth, kickout, beacon miss, moving away) picks again after 3 s.
  */
 static void join_poll(void)
 {
-	static int asked, joined, fails;
+	static int asked, joined, cur = -1;
 	static uint64_t next;
-	if (!conf_ssid[0] || !radio_scans() || bridge_joins)
+	if (!nconf || !radio_scans() || bridge_joins)
 		return;				/* (wifid has taken over: bridge.c) */
 	uint64_t now = link_ms();
 	int r = radio_join_result();
@@ -600,33 +639,38 @@ static void join_poll(void)
 		asked = 0;
 		if (r == 0) {
 			joined = 1;
-			fails = 0;
+			conf[cur].fails = 0;
 			return;
 		}
-		fails++;
-		next = now + (fails < 4 ? 5000 : 30000);
-		if (fails >= 4)
-			radio_rescan(25000);
-		printf("[%6llu] net: join failed (%s), try %d, next in %llu s\n", (unsigned long long)now, strerror(r), fails,
-		       (unsigned long long)(next - now) / 1000);
+		conf[cur].fails++;
+		next = now + 5000;
+		printf("[%6llu] net: join '%s' failed (%s), %u in a row\n", (unsigned long long)now, conf[cur].ssid,
+		       strerror(r), conf[cur].fails);
 		return;
 	}
 	if (joined) {
 		if (r != ENOTCONN)
 			return;
 		joined = 0;
-		fails = 0;
 		next = now + 3000;
-		printf("[%6llu] net: link lost, joining again in 3 s\n", (unsigned long long)now);
+		printf("[%6llu] net: link lost, picking a network again in 3 s\n", (unsigned long long)now);
 		return;
 	}
 	if (next && now < next)
 		return;
-	r = radio_join(conf_ssid, conf_psk);
-	printf("[%6llu] net: join '%s' (try %d) -> %d\n", (unsigned long long)now, conf_ssid, fails + 1, r);
+	cur = pick_conf();
+	if (cur < 0) {
+		radio_rescan(1000);
+		next = now + 30000;
+		printf("[%6llu] net: no known network heard; scanning again\n", (unsigned long long)now);
+		return;
+	}
+	r = radio_join(conf[cur].ssid, conf[cur].psk);
+	printf("[%6llu] net: join '%s' -> %d\n", (unsigned long long)now, conf[cur].ssid, r);
 	if (r == EINVAL || r == EIO) {
-		printf("net: cannot join with this wlan.conf; not trying again\n");
-		conf_ssid[0] = 0;
+		printf("net: cannot join '%s' with its wlan.conf entry; skipped\n", conf[cur].ssid);
+		conf[cur].fails = 3;
+		next = now + 1000;
 		return;
 	}
 	asked = 1;

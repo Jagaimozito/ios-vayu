@@ -1,6 +1,6 @@
 /*
  * tsample: a sampling profiler for one process (iOS has no `sample`).
- *   tsample PID [SAMPLES] [INTERVAL_US]
+ *   tsample PID [SAMPLES] [INTERVAL_US] [THREAD]   (THREAD -1: every thread, SAMPLES each)
  * Picks the busiest thread, suspends it SAMPLES times (default 500, every 4000 us), walks its frame-pointer
  * chain and prints, per sample, "S <depth> <pc> <pc> ..." plus the loaded images ("I <base> <path>") for
  * symbolication on the host. Signed with task_for_pid-allow (tsample.plist).
@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+#include <ctype.h>
+#include <sys/sysctl.h>
 
 static uint64_t
 rd64(task_t t, uint64_t a)
@@ -22,6 +25,30 @@ rd64(task_t t, uint64_t a)
 	return v;
 }
 
+/* 2026-11-15: PID may be a process name (first match on p_comm), as the phone's SSH shell has no ps/pgrep/awk. */
+static int
+find_pid(const char *arg)
+{
+	if (isdigit((unsigned char)arg[0]))
+		return atoi(arg);
+	int mib[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
+	size_t len = 0;
+	if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0)
+		return -1;
+	len += 64 * sizeof(struct kinfo_proc);
+	struct kinfo_proc *kp = malloc(len);
+	if (!kp || sysctl(mib, 3, kp, &len, NULL, 0) != 0)
+		return -1;
+	int pid = -1;
+	for (size_t i = 0; i < len / sizeof(*kp); i++)
+		if (strncmp(kp[i].kp_proc.p_comm, arg, MAXCOMLEN) == 0) {
+			pid = kp[i].kp_proc.p_pid;
+			break;
+		}
+	free(kp);
+	return pid;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -29,7 +56,12 @@ main(int argc, char **argv)
 		fprintf(stderr, "usage: tsample PID [SAMPLES] [INTERVAL_US] [THREAD]\n");
 		return 2;
 	}
-	int pid = atoi(argv[1]), samples = argc > 2 ? atoi(argv[2]) : 500, us = argc > 3 ? atoi(argv[3]) : 4000;
+	int pid = find_pid(argv[1]), samples = argc > 2 ? atoi(argv[2]) : 500, us = argc > 3 ? atoi(argv[3]) : 4000;
+	printf("P %s pid %d\n", argv[1], pid);
+	if (pid <= 0) {
+		fprintf(stderr, "no process %s\n", argv[1]);
+		return 1;
+	}
 	task_t task;
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
 	if (kr != KERN_SUCCESS) {
@@ -78,10 +110,16 @@ main(int argc, char **argv)
 		printf("T thread #%d: %.1f%% of a core over 1 s\n", m, used[m] / 10000.0);
 		used[m] = (uint64_t)-1;
 	}
-	if (argc > 4)
+	/* 2026-11-15: THREAD -1 = every thread, SAMPLES each ("A <index>" before each thread's samples): for a process
+	 * that waits (no busy thread), e.g. a daemon that never answers an XPC request. */
+	int all = argc > 4 && atoi(argv[4]) < 0;
+	if (argc > 4 && !all)
 		best = atoi(argv[4]) < (int)nth ? atoi(argv[4]) : best;
-	printf("T %d threads, sampling #%d\n", nth, best);
-	thread_act_t t = th[best];
+	printf("T %d threads, sampling %s%d\n", nth, all ? "all from #" : "#", all ? 0 : best);
+	for (unsigned ti = all ? 0 : (unsigned)best; ti < (all ? nth : (unsigned)best + 1); ti++) {
+	thread_act_t t = th[ti];
+	if (all)
+		printf("A %u\n", ti);
 	for (int s = 0; s < samples; s++) {
 		if (thread_suspend(t) != KERN_SUCCESS)
 			break;
@@ -110,6 +148,7 @@ main(int argc, char **argv)
 			printf(" %llx", pcs[i]);
 		printf("\n");
 		usleep(us);
+	}
 	}
 	struct task_dyld_info di;
 	mach_msg_type_number_t c = TASK_DYLD_INFO_COUNT;

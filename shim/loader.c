@@ -76,7 +76,52 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/* Bytes a payload takes in the ramdisk: up to the end of its last segment or its ADT. */
+static uint64_t payload_span(const struct payload *p)
+{
+	uint64_t end = p->adt_off + p->adt_size;
+	for (uint32_t i = 0; i < p->nsegs; i++) {
+		uint64_t e = p->segs[i].file_off + p->segs[i].file_size;
+		if (e > end)
+			end = e;
+	}
+	return end;
+}
+
+/* The n-th payload in [rd_start, rd_end), or 0. */
+static uint64_t payload_at(uint64_t rd_start, uint64_t rd_end, int n)
+{
+	uint64_t at = rd_start;
+	for (int k = 0;; k++) {
+		if (at + sizeof(struct payload) > rd_end)
+			return 0;
+		const struct payload *p = (const struct payload *)at;
+		if (!magic_ok(p->magic) || p->version != 1 || p->nsegs > 64)
+			return 0;
+		if (k == n)
+			return at;
+		at = (at + payload_span(p) + 0xfff) & ~0xfffUL;
+	}
+}
+
+int loader_count(uintptr_t dtb)
+{
+	uint64_t rd_start, rd_end;
+	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
+		return 0;
+	int n = 0;
+	while (n < 8 && payload_at(rd_start, rd_end, n))
+		n++;
+	return n;
+}
+
 const char *loader_boot(uintptr_t dtb)
+{
+	return loader_boot_n(dtb, 0);
+}
+
+const char *loader_boot_n(uintptr_t dtb, int n)
 {
 	uint64_t rd_start, rd_end;
 
@@ -85,11 +130,14 @@ const char *loader_boot(uintptr_t dtb)
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
-	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
-		return "no SWEETXNU payload";
-	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
+	uint64_t pay = payload_at(rd_start, rd_end, n);
+	if (pay == 0)
+		return n == 0 ? "no SWEETXNU payload" : "no such SWEETXNU payload";
+	const struct payload *p = (const struct payload *)pay;
+	if (p->version != 1 || (p->adt_off & 7) || (pay & 7))
 		return "bad payload header";
+	/* the payload's own offsets are from its start; the overlap check below covers the whole ramdisk */
+	uint64_t base = pay;
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
@@ -103,7 +151,7 @@ const char *loader_boot(uintptr_t dtb)
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
-		copy64(dst, rd_start + s->file_off, s->file_size);
+		copy64(dst, base + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
 	}
@@ -111,7 +159,7 @@ const char *loader_boot(uintptr_t dtb)
 
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
-	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	copy64(adt_pa, base + p->adt_off, p->adt_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 

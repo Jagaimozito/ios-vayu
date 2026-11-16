@@ -62,6 +62,11 @@ static void show_acl(const char *dir, const uint8_t *b, unsigned n)
 static const char *const links[] = { "/dev/cu.bluetooth", "/dev/uart.bluetooth" };
 static const char bcm4357b1_hcd[] =
 	"/usr/share/firmware/bluetooth/BCM4357B1_19.1.282.5154_Hercules_OS_USI_20210524.hcd";
+/* iOS 27.2's legacy BCM4357B1/USI row is named Tuborg. The contents are still
+ * intentionally a one-record stand-in because Broadcom vendor downloads are
+ * answered locally and never sent to the WCN3998. */
+static const char bcm4357b1_tuborg_hcd[] =
+	"/usr/share/firmware/bluetooth/BCM4357B1_19.1.282.5162_Tuborg_OS_USI_20210524.hcd";
 
 /* BlueTool's bcm -W parser expects H4 command records in the HCD file. Our
  * bridge consumes Broadcom vendor commands locally, so a harmless one-record
@@ -69,30 +74,33 @@ static const char bcm4357b1_hcd[] =
 static int ensure_hcd(void)
 {
 	static const uint8_t placeholder[] = { 0x01, 0x4e, 0xfc, 0x04, 0xff, 0xff, 0xff, 0xff };
-	if (access(bcm4357b1_hcd, F_OK) == 0)
-		return 0;
 	if ((mkdir("/usr/share/firmware", 0755) && errno != EEXIST) ||
 	    (mkdir("/usr/share/firmware/bluetooth", 0755) && errno != EEXIST)) {
 		printf("btbridge: create HCD directory: %s\n", strerror(errno));
 		return -1;
 	}
-	int fd = open(bcm4357b1_hcd, O_WRONLY | O_CREAT | O_EXCL, 0644);
-	if (fd < 0) {
-		if (errno == EEXIST)
-			return 0;
-		printf("btbridge: create %s: %s\n", bcm4357b1_hcd, strerror(errno));
-		return -1;
+	const char *paths[] = { bcm4357b1_hcd, bcm4357b1_tuborg_hcd };
+	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		if (access(paths[i], F_OK) == 0)
+			continue;
+		int fd = open(paths[i], O_WRONLY | O_CREAT | O_EXCL, 0644);
+		if (fd < 0) {
+			if (errno == EEXIST)
+				continue;
+			printf("btbridge: create %s: %s\n", paths[i], strerror(errno));
+			return -1;
+		}
+		ssize_t n = write(fd, placeholder, sizeof(placeholder));
+		int saved_errno = errno;
+		close(fd);
+		if (n != (ssize_t)sizeof(placeholder)) {
+			unlink(paths[i]);
+			printf("btbridge: write %s: %s\n", paths[i],
+			    n < 0 ? strerror(saved_errno) : "short write");
+			return -1;
+		}
+		printf("btbridge: installed one-record stand-in HCD at %s\n", paths[i]);
 	}
-	ssize_t n = write(fd, placeholder, sizeof(placeholder));
-	int saved_errno = errno;
-	close(fd);
-	if (n != (ssize_t)sizeof(placeholder)) {
-		unlink(bcm4357b1_hcd);
-		printf("btbridge: write %s: %s\n", bcm4357b1_hcd,
-		    n < 0 ? strerror(saved_errno) : "short write");
-		return -1;
-	}
-	printf("btbridge: installed one-record stand-in HCD at %s\n", bcm4357b1_hcd);
 	return 0;
 }
 
@@ -287,6 +295,14 @@ static void fake_vendor_complete(int m, uint16_t opcode, const uint8_t *params, 
 	memset(ev + 7, 0, 16);
 	if (nparams > 0)
 		ev[7] = params[0];
+	/* BD_VSC_LE_META2_READ_LOCAL_CONTROLLER_CACHED_INFO (FCE2 subcommand 0x1c)
+	 * returns a length-prefixed block. bcm_vsc.c validates that the declared length
+	 * exactly matches the bytes left in the reply; a zero length with this fixed-size
+	 * response makes bluetoothd assert at bcm_vsc.c:939 and exit. The reply below has
+	 * 14 data bytes after this length field.
+	 */
+	if (opcode == 0xfce2 && nparams > 0 && params[0] == 0x1c)
+		ev[8] = 14;
 	if (write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
 		printf("btbridge: write: %s\n", strerror(errno));
 }

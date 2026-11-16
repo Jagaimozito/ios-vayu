@@ -13,6 +13,7 @@
 
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
+int con_quiet;	/* 1: con_str/con_hex/con_hex2 print nothing (boot menu's clean screen) */
 static int row;
 
 void con_clear(uint32_t bg)
@@ -68,6 +69,8 @@ void con_skip(void)
 
 void con_str(const char *label, const char *s)
 {
+	if (con_quiet)
+		return;
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
 	row++;
@@ -75,6 +78,8 @@ void con_str(const char *label, const char *s)
 
 void con_hex(const char *label, uint64_t v)
 {
+	if (con_quiet)
+		return;
 	char buf[17];
 	fmt_hex(buf, v, 16);
 	con_str(label, buf);
@@ -82,6 +87,8 @@ void con_hex(const char *label, uint64_t v)
 
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb)
 {
+	if (con_quiet)
+		return;
 	char buf[9];
 	int col = put_str(0, label, YELLOW);
 	col = col < LABEL_COLS ? LABEL_COLS : col + 1;

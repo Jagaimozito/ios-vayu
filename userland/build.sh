@@ -27,6 +27,7 @@ codesign -f -s - --entitlements sysapps/entitlements.plist out/sweet-sysapps
 build sweet-fs fsutil/sweet-fs.c -framework CoreFoundation
 # MobileGestalt answer cache editor (metal/gamekit for AB2; ArtworkDeviceSubType for the Dynamic Island); install to /usr/local/bin
 build mgtool jb/mgtool.c -framework CoreFoundation
+build urlprops jb/urlprops.m -fobjc-arc -framework Foundation
 build haptic jb/haptic.c
 build auprobe jb/auprobe.c -framework CoreFoundation
 build sweet-msd jb/sweet-msd.c
@@ -73,10 +74,11 @@ fi
 # Wi-Fi: ios-flame's wland (userland/wland/README.md): modem + WLFW + WCN3990 radio from userland over /dev/pmem
 (cd wland && $CC -Wno-unused-parameter -o ../out/wland wland.c smem.c pmem.c glink.c link.c qmi.c rmtfs.c pdmapper.c \
 	tftp.c scm.c wlfw.c radio.c ipnet.c bridge.c) && codesign -f -s - out/wland && echo out/wland
-# Audio from upstream OtVaL228/ios-sweet ed7afa8 (docs/guacamole.md, Audio): ADSP boot + APR q6core (adspd) and the
-# two TFA9874 speaker amps on QUP SE4 (tfa), both over /dev/pmem. No sound yet: AFE/ASM/ADM do not answer.
+# Audio from the Guacamole branch: ADSP/APR playback daemon, TFA9874 amp controller, and Hakios HAL plugin.
+# SweetCodec publishes the HAL mix through /var/local/pcm.ring; adspd feeds it to the ADSP ASM stream.
 build adspd adsp/adspd.c adsp/edge.c wland/smem.c wland/qmi.c wland/pmem.c -Iwland -Wno-unused-parameter
 build tfa adsp/tfa.c wland/pmem.c -Iwland -Wno-unused-parameter
+sh audio/build.sh
 # Alert Slider pins over /dev/pmem (upstream fc1dcb1; kernel side xnu 0264)
 build slider jb/slider.c
 # Files app / Safari downloads (upstream f0c75ce): fileproviderd with libsweet-fpfs (HFS taken as FPFS-eligible).

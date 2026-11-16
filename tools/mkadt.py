@@ -60,9 +60,21 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+# --identity d73: present the iPhone 14 Pro the iOS 26 IPSW is for (iPhone15,2 / D73AP), so MobileGestalt's
+# ProductType / marketing name ("iPhone 14 Pro" in Settings > About) and /product match the userland. Needs the
+# decoded D73AP device tree (LZFSE inside the IM4P; decode on the Mac):
+#   ipsw img4 im4p extract research/ios26/DeviceTree.d73ap.im4p -o research/ios26/d73ap.adt
+# chip-id, ECID and /chosen/manifest-properties stay as before on purpose: IOPlatformUUID (ByHost prefs, the
+# kernel's migration-skip plist A9683613-...) is derived from chip-id + ECID, and cryptexd already accepts them.
+D73AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ios26/d73ap.adt')
+IDENTITY = sys.argv[sys.argv.index('--identity') + 1] if '--identity' in sys.argv else 'd22'
+if IDENTITY not in ('d22', 'd73'):
+    sys.exit('--identity: d22 (iPhone X, default) or d73 (iPhone 14 Pro)')
+IDENT_ADT = D73AP_ADT if IDENTITY == 'd73' else D22AP_ADT
 
 
-def d22ap_product_child(child, path=D22AP_ADT):
+def d22ap_product_child(child, path=None):
+    path = path or IDENT_ADT
     """Properties of one child node of the real D22AP /product (e.g. 'audio'), or None."""
     if not os.path.exists(path):
         return None
@@ -75,7 +87,10 @@ def d22ap_product_child(child, path=D22AP_ADT):
     return None
 
 
-def d22ap_product(path=D22AP_ADT):
+def d22ap_product(path=None):
+    path = path or IDENT_ADT
+    if IDENTITY == 'd73' and not os.path.exists(path):
+        sys.exit(f'--identity d73 needs {path} (see D73AP_ADT above)')
     """/product properties of the real D22AP tree, without the syscfg
     placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
     if not os.path.exists(path):
@@ -150,7 +165,9 @@ def build(seed=None, qemu=False, highmem=False):
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
-    seed = seed if seed is not None else os.urandom(64)
+    # 256 bytes: xnu-12377 (iOS 26) asks the bootloader for 4 * SEED_SIZE and panics with less
+    # ("Expected 256 seed bytes from bootloader, but got 64"); xnu-8796 takes the first 64.
+    seed = seed if seed is not None else os.urandom(256)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
@@ -159,6 +176,11 @@ def build(seed=None, qemu=False, highmem=False):
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
+        # XNU 12377's ml_unsafe_kernel_text_init() requires this iBoot-populated
+        # flag in /chosen even on SWEET, where CTRR is absent. Zero means CTRR
+        # is disabled and marks kernel text as unsafe/writable for the pmap
+        # policy path; omitting it leaves initialization false and panics.
+        ('kernel-ctrr-to-be-enabled', u32(0)),
         ('debug-enabled', u32(1)),
         ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
         ('firmware-version', cstr('sweet-shim')),
@@ -204,7 +226,14 @@ def build(seed=None, qemu=False, highmem=False):
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
         # The iOS shared cache is in no trust cache, so dyld can only map it
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
-        node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
+        node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))]),
+        # libimage4 (cryptexd, iOS 26) panics "failed to get manifest properties" unless
+        # IODeviceTree:/chosen/manifest-properties exists (iBoot publishes the boot manifest's
+        # properties there). Values mirror the identity above (A11 chip, D22 board, dev-fused).
+        node('manifest-properties', [ph(), ('CHIP', u32(0x8015)), ('BORD', u32(6)),
+            ('ECID', struct.pack('<Q', SWEET_ECID)), ('CPRO', u32(0)), ('CSEC', u32(1)),
+            ('SDOM', u32(1)), ('EPRO', u32(0)), ('ESEC', u32(1)),
+            ('BNCH', hashlib.sha384(b'sweet boot nonce').digest())])])
 
     # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
     # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
@@ -263,16 +292,18 @@ def build(seed=None, qemu=False, highmem=False):
             ('device_type', cstr('wlan')),
             ('compatible', cstr('guacamole,wcn3990')),
         ]),
-        # --guacamole Bluetooth: bluetoothd logs "marconi-bt / bluetooth: Unable to match bluetooth service in device
-        # tree" without the iPhone X's bluetooth node (research/bluetooth/ios-side.md), then opens /dev/cu.bluetooth
-        # or /dev/uart.bluetooth. Properties as D22AP's /arm-io/uart1/bluetooth (compatible bluetooth,n88, 3 Mbaud,
-        # encoding 3, Apple vendor / product IDs, coex 2); local-mac-address is the address itself (iBoot fills it
-        # from syscfg on a real phone), = /chosen mac-address-bluetooth0. It needs an IOService nub, not just a DT
-        # entry: under uart1 (first try, 2026-11-09) bluetoothd still found no service, because SweetPlatformExpert
-        # creates nubs for /arm-io's children only (on an iPhone the UART driver publishes its bluetooth child). So
-        # it sits directly under /arm-io. The controller is the WCN3998 behind QUP wrapper 2 SE3, driven from
-        # userland (userland/bt/).
-        node('bluetooth', [
+        # --guacamole: retain the D73/iPhone 14 Pro product identity, but publish the UART Bluetooth service
+        # at the D22 path that bluetoothd/Marconi looks for: /arm-io/uart1/bluetooth. The live iOS 27.2 tree
+        # previously exposed a standalone /arm-io/bluetooth nub; ioreg showed that nub registered, while
+        # bluetoothd still logged "Unable to match bluetooth service in device tree". The WCN3998 is behind
+        # QUP wrapper 2 SE3 and remains driven by userland (userland/bt/); this uart1 node is the service topology
+        # expected by Apple's Bluetooth stack, not a claim that the Samsung UART hardware is present.
+        node('uart1', [
+            ph(),
+            ('device_type', cstr('uart')),
+            ('compatible', cstr('uart-1,samsung')),
+            ('uart-version', u32(1)),
+        ], [node('bluetooth', [
             ph(),
             ('device_type', cstr('bluetooth')),
             ('compatible', cstr('bluetooth,n88')),
@@ -282,7 +313,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('product-id', u32(0x12a0)),
             ('coex', u32(2)),
             ('local-mac-address', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x02])),
-        ])] if GUACAMOLE else []) + [
+        ])])] if GUACAMOLE else []) + [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
@@ -291,8 +322,9 @@ def build(seed=None, qemu=False, highmem=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(828 if SCALE2 else 1125)),
-            ('canvas-height', u32(1792 if SCALE2 else 2436)),
+            # d73: the iPhone 14 Pro's 1179x2556 (393x852 pt @3x; 2.168:1, the panel is 2.167:1).
+            ('canvas-width', u32(828 if SCALE2 else (1179 if IDENTITY == 'd73' else 1125))),
+            ('canvas-height', u32(1792 if SCALE2 else (2556 if IDENTITY == 'd73' else 2436))),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -314,7 +346,9 @@ def build(seed=None, qemu=False, highmem=False):
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
     # as a plain plist instead of decrypting it with the effaceable key.
-    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
+    # kern.maxvnodes: xnu's xsmall CONFIG_VNODES caps desiredvnodes at 1024 ("vnode: table is full" on iOS 26);
+    # PE_get_default("kern.maxvnodes") in bsd_startupearly overrides it uncapped.
+    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1)), ('kern.maxvnodes', u32(65536))])
 
     # MobileGestalt HomeButtonType = IODeviceTree:/buttons home-button-type
     # (D22AP: 2, no Home button; absent = 0 = Home-button device).
@@ -358,12 +392,15 @@ def build(seed=None, qemu=False, highmem=False):
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    IDENT = ('D73AP', 'iPhone15,2', 'D73') if IDENTITY == 'd73' else ('D22AP', 'iPhone10,3', 'D22')
+    if product_props:
+        print(f'/product ({IDENTITY}): ' + ' '.join(k for k, v in product_props), file=sys.stderr)
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
-        ('model', cstr('iPhone10,3')),
-        ('target-type', cstr('D22')),
-        ('target-sub-type', cstr('D22AP')),
+        ('compatible', cstr(IDENT[0]) + cstr(IDENT[1]) + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('model', cstr(IDENT[1])),
+        ('target-type', cstr(IDENT[2])),
+        ('target-sub-type', cstr(IDENT[0])),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),

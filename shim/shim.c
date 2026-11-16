@@ -15,6 +15,7 @@
 #include "spmi.h"
 #include "bootsel.h"
 #include "android.h"
+#include "menu.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0c264000UL
@@ -151,6 +152,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 		irq_handler();
 		return;
 	}
+	con_quiet = 0;
 	con_clear(BLUE);
 	switch (slot & 3) {
 	case 0: con_str("PANIC", "SYNC"); break;
@@ -391,26 +393,60 @@ void shim_main(uint64_t dtb)
 	con_skip();
 #if defined(BOARD_GUACAMOLE)
 	/*
-	 * Boot selector (bootsel.c, android.c): Alert Slider at the top = Android from boot_a,
-	 * middle or bottom = iOS. If Android cannot be started the reason stays on screen
-	 * for 15 s, then iOS boots.
+	 * Boot menu (menu.c): iOS 27 / iOS 16 / Android, volume keys to move, power to start.
+	 * The Alert Slider picks the default (top Android, middle iOS 27, bottom iOS 16), which
+	 * starts after 5 s unless a key is pressed. If Android cannot be started the reason
+	 * stays on screen for 15 s, then iOS 16 boots.
 	 */
 	stage = "bootsel";
 	uint32_t slider_raw = 0;
 	int slider = bootsel_slider(&slider_raw);
-	bootsel_show("SLIDER", slider);
-	if (slider == SLIDER_TOP) {
+	/* Filled in code, not with an initializer: a table of string pointers in data would need
+	 * relocation, and the shim runs unrelocated. */
+	struct menu_entry entries[3];
+	/* tools/mktripleboot.py: payload 0 = iOS 16 (partition ios), payload 1 = iOS 27 (partition ios26) */
+	int npay = loader_count(dtb);
+	entries[0].title = "iOS 27";
+	entries[0].detail = npay >= 2 ? "iPhone 14 Pro, partition ios26" : "not in this boot image";
+	entries[0].enabled = npay >= 2;
+	entries[1].title = "iOS 16";
+	entries[1].detail = "iPhone X, partition ios";
+	entries[1].enabled = 1;
+	entries[2].title = "Android";
+	entries[2].detail = "boot_a";
+	entries[2].enabled = 1;
+	__asm__ volatile("" ::: "memory");
+	int def = slider == SLIDER_TOP ? 2 : (slider == SLIDER_MIDDLE && entries[0].enabled) ? 0 : 1;
+	stage = "menu";
+	int choice = menu_choose(entries, 3, def, 5000);
+	con_quiet = 1;	/* only "Booting ..." until the kernel takes the screen; errors turn it back on */
+	if (choice == 2) {
 		stage = "android";
-		con_str("BOOTSEL", "Android (boot_a)");
+		menu_booting("Booting Android");
 		const char *afail = android_boot(dtb);
+		con_quiet = 0;
+		con_clear(BLACK);
 		con_str("ANDROID", afail);
 		bootsel_report(dtb, slider, slider_raw);
 		delay_ms(15000);
-		stage = "loader";
+		con_quiet = 1;
 	}
-	con_str("BOOTSEL", "iOS");
+	stage = "loader";
+	int pay_index = 0;
+	if (choice == 0 && entries[0].enabled) {
+		pay_index = 1;
+		menu_booting("Booting iOS 27");
+	} else {
+		menu_booting("Booting iOS 16");
+	}
+#else
+	int pay_index = 0;
 #endif
-	const char *why = loader_boot(dtb);
+	const char *why = loader_boot_n(dtb, pay_index);
+	if (con_quiet) {	/* the iOS loader failed after the boot menu: show why */
+		con_quiet = 0;
+		con_clear(BLACK);
+	}
 	con_str("LOADER", why);
 	con_skip();
 

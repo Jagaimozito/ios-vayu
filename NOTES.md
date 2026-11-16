@@ -1,3 +1,1811 @@
+# Priority handoff — Guacamole RAM accounting; defer remaining haptics (2026-11-15)
+
+## Active Wi-Fi join/reporting fix — suppress requested link-off (2026-11-15)
+
+The earlier quiet-link change suppressed `redwood_sta_lost(ECONNRESET)` during a requested join/leave, but it still
+published `redwood_net_link_state(false)`. That emits an interface link-off event to iOS and can make `wifid` mark an
+otherwise successful join as failed, so the password is not added to known networks. `bsd/dev/flame_sta.c` now returns
+early for `!up && sta_quiet`, suppressing both notifications while `wland` replaces/leaves an association. This does
+not suppress a real AP deauthentication after the requested operation completes.
+
+The xnu-12377 kernel rebuilt successfully with this change; build log: `xnu12377-wifi-quiet-link-netevent-build2.log`.
+Kernel SHA-256: `fde31759e0f7ebafc2979260d7b102917d51525eaa827d91bafb8829b2c1b224`. New candidate uses the existing
+D73 ADT and iOS 27 boot arguments with `sweettime=1794800292` refreshed (584 chars). Required selector/tripleboot
+image: `outputs/guacamole-ios27a-wifiquiet-netevent-triple.img`, SHA-256
+`bf0f6a20d26b19cfffbb816f05ce60097133443fe85955cc0074fce808350843`. Standalone wrapper is also present at
+`outputs/guacamole-ios27a-wifiquiet-netevent.img`, but do not boot it; the standalone image is not bootable here.
+The triple image combines Android boot_b, the selector shim, the existing iOS 16 payload, and this iOS 27 payload.
+
+Boot manually and select iOS 27 (do not flash/reboot from the host):
+
+```sh
+cd /Users/coreycusick/Documents/Codex/2026-11-06/ok/work/ios-sweet-latest
+fastboot boot outputs/guacamole-ios27a-wifiquiet-netevent-triple.img
+```
+
+The phone was not reachable over SSH at `172.28.200.47` during this handoff, so the new kernel has not been runtime
+verified. After boot, join a network once and check whether it persists across a later Wi-Fi toggle/reconnect. The
+expected kernel line during an intentional join is `flame wifi: suppressed requested link-down during join/leave`.
+If Wi-Fi still drops after the join completed, capture fresh `wland.out` and `wifid` logs: the earlier capture showed
+AP-originated reason 252 deauthentication and no confirmed `wland` crash, which this requested-link event fix cannot
+prevent.
+
+### DHCP diagnostic follow-up (2026-11-16)
+
+The latest capture shows association and link-up succeed (`GuestConnect` reaches auth status 0, association status 0,
+`*** joined ***`, and `bridge: link up`). `wifid` then reports `failed to become routable` / DHCP failure. The phone
+still had an active `en0` address and default route, so do not tap Join while relying on SSH; that can interrupt the
+session. The `net: in/out` lines are `printf` kernel-console records, not unified logging, so `/var/local/bin/oslog`
+will not show them. A diagnostic tripleboot was built with `net_trace=200` (same current kernel and D73 ADT):
+`outputs/guacamole-ios27a-dhcpdiag-triple.img`, SHA-256
+`335726ecc1872205e3ea32bfcfc51c873c4f9dcb36deb4eabf27cac3884cbed5`. To retrieve its SWEETLOG ring, boot Android
+and run from the Mac repo folder:
+
+```sh
+sh tools/ios27-klog-pull.sh
+grep -a 'net:' outputs/ios27-klog.txt
+```
+
+The script reads the `ios26` partition's kernel-log ring via ADB (read-only). No Wi-Fi UI interaction is needed. The
+diagnostic image was subsequently booted and its ring pulled on 2026-11-16. The trace shows DHCP broadcasts from
+`0.0.0.0:68` to `255.255.255.255:67`, then server replies from `192.168.1.1:67` to the phone at
+`192.168.0.71:68` (twice). DNS requests to `209.18.47.61:53` get replies, and outbound TCP SYNs receive replies, so
+IPv4 connectivity works. The trace ends with `net: the link (wcn3990) is down`; its cause and timing are not
+identified. Packet logging records headers only, so it cannot distinguish DHCP OFFER from ACK or show lease options.
+Next correlate that link-down with `wifid`/`wland` logs; do not ask the user to tap Join while SSH is needed.
+
+## Active Bluetooth handoff — D73 UART service match (2026-11-15)
+
+The D73/iPhone 14 Pro identity remains intact. Live iOS 27.2 inspection showed the current ADT registered
+`/arm-io/bluetooth` directly as an `IOPlatformDevice`; it has no `/arm-io/uart1`, while the manual
+`bluetoothd` log says `marconi-bt: Unable to match bluetooth service in device tree.` The existing BlueTool
+profile alias and btbridge are running: btbridge has initialized the WCN3998 UART and services
+`com.sweet.bt.host`, but Marconi still rejects the flattened DT service. This identifies the current blocker
+as the service topology, before the D73-compatible Bluetooth switch can initialize.
+
+The current tree generator now retains the D73 product identity but emits the D22-compatible service path
+`/arm-io/uart1/bluetooth`. `work/xnu-12377/iokit/Kernel/arm/SweetPlatformExpert.cpp` publishes the nested
+Bluetooth child as an IOKit nub. The kernel build succeeded; its SHA-256 is
+`7441e64d8cd22b6716661d021cf41be05f76fc4982ae8699094df7dea3197d67`. Generated D73 ADT:
+`work/guacamole-ios27a-bt-d73.adt`. Boot arguments are copied from the haptic-ready iOS 27 image with only
+`sweettime` refreshed (584 chars). Tripleboot image (iOS16 / iOS27 / Android):
+`outputs/guacamole-ios27a-bt-d73-triple.img`, SHA-256
+`79f526631b71bf3ca2749d1363aaa4e64c4c3d2dc68b4b638a41aa8686311462`. It reuses the existing iOS 16 payload,
+boot_b stock image, and selector shim. It has not been booted yet; do not use a standalone image.
+
+Boot and select iOS 27:
+
+```sh
+cd /Users/coreycusick/Documents/Codex/2026-11-06/ok/work/ios-sweet-latest
+fastboot boot outputs/guacamole-ios27a-bt-d73-triple.img
+```
+
+After boot, verify `ioreg -p IODeviceTree -l` shows `uart1` containing `bluetooth`, then toggle Bluetooth and
+check whether the Marconi “Unable to match” line is gone. If it remains, capture the bluetoothd log and the
+`IOService` parent chain for the Bluetooth nub before changing BlueTool or the H4/Skywalk controls again.
+
+## Current haptics status (deferred)
+
+- User reports keyboard haptics and ringtone haptics work. Haptics for holding an app and Settings switches do not.
+- The iOS 27 kernel change that publishes `AHSFirmwareReadyNotifier` after AW8697 initialization is built in
+  `work/xnu-12377/iokit/Kernel/arm/AHSFirmwareReadyNotifier.cpp`, and a tripleboot image was created as recorded below.
+  It was not booted or tested because the phone was unreachable at that time. Do not treat that notifier as confirmed
+  to fix the missing system-UI patterns. Resume haptics after the RAM issue; preserve the working keyboard/ringtone
+  behavior and the existing iOS 16 strength-value notes.
+
+## Brightness and Night Shift port (2026-11-15)
+
+- iOS 16's working stack is already in this tree: kernel service `AppleARMBacklight` (0197), plus
+  `userland/jb/sweet-displayd.m`, which reads the BackBoard brightness slider and `CBBlueLightClient`, writes panel
+  brightness by DSI DCS `0x51`, and applies Night Shift through DSPP PCC. The Night Shift current on/off bit is status
+  byte 1, not byte 0 (byte 0 is schedule-active).
+- The iOS 27 kernel port uses D73AP backlight properties plus `backlight-calibration-parameters` because the iPhone X
+  property table crashed iOS 27 CoreBrightness. The current xnu-12377 source includes this adaptation. The iOS 27.2
+  shared cache still contains `CBBlueLightClient`, `getBlueLightStatus:`, `getStrength:`, and the brightness getter
+  used by the old daemon. These are compatibility indicators, not a successful runtime test.
+- `tools/mkios27root-mac.sh` now installs `userland/out/sweet-displayd` and adds `com.sweet.displayd` when that signed
+  binary is present. The source-level port status and remaining runtime checks are in
+  `research/ios27.2/brightness/PORT-STATUS.md`.
+- Do not make a RAM or GPU-pool change as part of brightness/Night Shift work. The UMA explanation, observed 162–229
+  MiB ordinary-game compositor use, anomalous ~2.4 GiB post-recovery held pool, and unvalidated 2 GiB trial are
+  recorded in `research/ios27.2/ram-split-implementation.md`.
+- **Runtime test passed (2026-11-15):** installed the signed daemon atomically to `/var/local/bin/sweet-displayd`
+  and started it manually over SSH, without rebooting or respringing. `sweet-displayd -1` found both brightness and
+  `CBBlueLightClient` APIs (`brightness 0.550`, Night Shift off, strength 0.500); the user confirmed the brightness
+  slider and Night Shift both work. The live launchd catalog was not changed, so this manually started daemon is not
+  reboot-persistent. `tools/mkios27root-mac.sh` now includes the binary and `com.sweet.displayd` job when building a
+  future root image. Do not reboot; if a service reload is needed, respring using `killall -9 backboardd`.
+
+## RAM: evidence and safe next step
+
+- **Target split chosen by user:** aim for about 6 GB decimal XNU-managed memory and 2 GiB reserved for the GPU, matching the
+  iPhone 14 Pro's memory budget while Guacamole has 8 GiB installed. Keep the existing dedicated upper GPU aperture
+  `0x200000000–0x280000000` (2 GiB), and change `gpu_pool_ranges[]` so GPU allocations use that range only. User
+  explicitly selected this split on 2026-11-15; do not ask them to choose it again. The
+  current `sweetgpuhigh=0` boot arg is not this configuration: it disables the upper range and leaves the lower
+  ranges enabled. Reclaim the lower GPU ranges for XNU only after the allocator is changed to preserve GPU capacity
+  at 2 GiB. A first read-only ledger gives an optimistic ceiling of 5.484 GiB (5.888 GB decimal) after fixed
+  reserved-memory entries, before dynamic pools and other platform reservations. Do not promise 6 GB usable unless
+  an exact audited range list proves it; report the measured safe count.
+- User measured `hw.memsize: 4239392768` (0xfcb00000 bytes, about 3.95 GiB) on the current iOS 27 boot.
+- This is the size of the contiguous range XNU currently manages, not evidence that the phone only has 4 GB of DRAM.
+  The Guacamole DDR map recorded in `docs/guacamole.md` and `tools/mkadt.py` is
+  `0x80000000–0xbbb00000` plus `0xc0000000–0x280000000` (about 7.93 GiB before reserved regions). The current
+  `--highmem` ADT instead exposes only `0x100000000` plus `0xfcc00000`; `PANIC_LOG_SIZE` subtracts 1 MiB, leaving
+  `0xfcb00000`, which matches the phone's `hw.memsize` exactly.
+- Source confirms `tools/mkpayload.py` uses `/chosen` `dram-base`/`dram-size` as the payload's contiguous load window;
+  `shim/loader.c` copies it into `boot_args.physBase`/`memSize`. XNU `arm_vm_init()` sets `gPhysBase`, `gPhysSize`,
+  `avail_end`, and `max_mem` from that single range. `bsd/kern/kern_mib.c` exposes `hw.memsize` from `max_mem` on
+  this embedded target. `boot_args.memSizeActual` only feeds `mem_actual`/`max_mem_actual` and the separate physical
+  memory accounting; changing it alone will not enlarge `hw.memsize` or safely make extra pages allocatable.
+- XNU also exposes `hw.memsize_physical` from `max_mem_actual`. `hw.memsize_usable` is only registered in the macOS
+  branch; this embedded build reports `unknown oid` for it.
+  On 2026-11-15 the phone returned `hw.memsize=4239392768` and `hw.memsize_physical=4239392768` (both 0xfcb00000),
+  with `hw.memsize_usable` unknown. The shim currently sets `memSizeActual` equal to the single payload window, so
+  the physical-size sysctl is not yet a trustworthy reading of all DRAM. The user's `ssh ...` attempt was issued at
+  the iPhone shell prompt, so it tried to read the Mac's private key from `/var/jb/var/root/.ssh`; it did not run
+  remotely. The local sysctl results themselves are valid.
+- XNU's `osfmk/arm/pmap/pmap.c` currently counts and allocates pages as the contiguous span
+  `first_avail..avail_end` (`initialize_ram_ranges()` and `pmap_next_page()`). It explicitly assumes there are no
+  gaps. Simply increasing `dram-size` would make XNU allocate across the real DDR hole and/or reserved GPU memory.
+- New source-audit finding: `vm_page_create_canonical()` can represent individual pages below the normal
+  `vm_pages[]` array using an existing radix tree. That is a plausible extension point for adding verified low-bank
+  pages while preserving the high contiguous kernel/load window. It still needs range-aware `pa_valid()`, pmap
+  metadata sized for the PA index envelope, physmap support, and correct VM/hash/sysctl accounting. It is not
+  implemented or safe to build yet. `gPhysBase` remains tied to the loaded kernel's VA/PA mapping and cannot simply
+  be lowered to the first DDR bank. See `research/ios27.2/ram-split-implementation.md` for the design and estimate.
+- The GPU driver deliberately allocates non-cacheable buffers from physical ranges XNU does not map, including
+  `0x200000000–0x280000000`; its comment explains this avoids cacheable/WC aliasing. The existing pool also has
+  reserved regions below 4 GiB. Any RAM expansion must preserve those reservations or change the GPU memory/cache
+  design first.
+- **GPU pool relocation is possible in principle, but has a measurable capacity cost.** `gpu_pool_ranges[]` in
+  `work/xnu-12377/bsd/dev/sweet_gpu.c` currently gives the GPU 688 MiB below 4 GiB
+  (`0xc4000000–0xe0000000` and `0xe1000000–0xf0000000`) plus the 2 GiB range
+  `0x200000000–0x280000000`, for about 2.67 GiB total. `SweetAccelerator.cpp` allocates those BOs from physical
+  memory and maps CPU views as `kIOMapWriteCombineCache`; the source explicitly requires no normal cacheable XNU
+  alias. The upper 2 GiB range is already exercised by the GPU pool, so changing `gpu_pool_ranges[]` to use only it
+  would reclaim the lower 688 MiB for RAM but reduce GPU pool capacity to 2 GiB. Do not make that trade until pool
+  high-water use is measured under SpringBoard and the target apps. The less risky first RAM step is to preserve the
+  current pool and teach XNU to map/allocate the other physical ranges around it. XNU's existing `ptov_table` can
+  represent several physmap segments (up to 8 entries without MTE); the current early init still builds a contiguous
+  mapping, and pmap's available-page allocator still assumes one span, so both sides need explicit range support.
+- **Staged test image built (2026-11-15):** `work/xnu-12377/bsd/dev/sweet_gpu.c` now restricts the GPU pool to
+  `0x200000000–0x280000000` (2 GiB), excluding the previous 688 MiB low ranges. This is only a GPU-capacity trial;
+  XNU's managed memory remains the existing 4 GiB window. No low-bank memory is yet mapped or allocated by XNU.
+  Kernel build log: `xnu12377-ram-gpuhigh-build.log`; kernel SHA-256
+  `7ec0b0b741581c1ef4bd1ab35b65a5b6f00df563d743511470e03408214f0228`.
+  Payload uses the existing D73 identity ADT and the haptic-ready iOS 27 boot arguments, with only `sweettime`
+  refreshed (584 chars). Required selector/tripleboot image:
+  `outputs/guacamole-ios27a-ram-gpuhigh-triple.img`, SHA-256
+  `2008a8c8162237332d1f3da5918a8339cb04a2a02a41c1d7048740fe0ee953cd`. It was built with
+  `dtb/android-boot_b.img`, `shim/out/Image`, the iOS 16 payload extracted from the existing
+  `outputs/guacamole-ios27a-wifiquiet-triple.img`, and the new iOS 27 payload. Not booted or flashed.
+  Boot only by `fastboot boot outputs/guacamole-ios27a-ram-gpuhigh-triple.img`, then select iOS 27. Verify the
+  kernel log reports a 2048 MB GPU pool, and exercise SpringBoard/Metal apps. This tests whether the GPU can live
+  within 2 GiB before lower ranges are reclaimed. `hw.memsize` should still report the old managed window.
+- **Next implementation:** after the 2 GiB GPU test passes, represent the backed, usable Guacamole ranges
+  explicitly. Teach early XNU mapping plus pmap page accounting/allocation to consume verified ranges, excluding
+  carve-outs, panic-log, framebuffer, Wi-Fi/Zap pools, firmware reservations, and the 2 GiB GPU range. Keep the
+  current contiguous kernel/payload load window unchanged until a separate boot-layout change is designed. Do not
+  “fix” the 4 GiB reading by changing only `memSizeActual`: that changes reporting/resource sizing without making
+  extra RAM safe for VM allocation.
+
+# Active handoff — iOS 27 haptics notifier (2026-11-15)
+
+The kernel now publishes the exact `AHSFirmwareReadyNotifier` IOKit class expected by the iOS haptics path, but only
+after `sweet_haptic_ready()` reports that the AW8697 actuator has initialized. The SWEET-only source is
+`work/xnu-12377/iokit/Kernel/arm/AHSFirmwareReadyNotifier.cpp`; it is registered under IOResources in
+`iokit/KernelConfigTables.cpp` and compiled from `iokit/conf/files.arm64`. This makes the firmware-ready service
+appear after the hardware is usable, rather than pretending firmware is ready at boot.
+
+Build succeeded with `USE_LTO=0 BUILD_DSYM=0` (DSYMUTIL's process-substitution command is blocked in this local
+environment; the kernel link itself succeeded). Kernel:
+`work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256
+`f7d7763dfc866d530d95d8879fe6aa8d2a57c64830078685d7016b15b5eece27`.
+
+Built `outputs/guacamole-ios27a-haptic-ready.img` and, as required, the tripleboot image
+`outputs/guacamole-ios27a-haptic-ready-triple.img`. The triple image reuses the iOS 16 payload from
+`outputs/guacamole-ios27a-haptic-default-triple.img`, retains the same selector shim and Android boot_b stock
+image, and puts the new iOS 27 payload second. Boot args are copied from the haptic-default image with only
+`sweettime` refreshed (584 characters, includes `sweethaptic=2`). Triple image SHA-256:
+`b1c6b675fb4269cb0eb96b96d3dfabf1656d502f93910588b32f7d4d4f117cd8`.
+
+The phone could not be reached for staging over SSH (192.168.0.61, 192.168.0.70, 192.168.0.51 and the previously
+used 172.28.200.47 timed out), and `fastboot devices` returned empty. Nothing was rebooted or flashed. Once it is
+connected in bootloader mode, boot the **tripleboot** image from this repository:
+
+```sh
+cd /Users/coreycusick/Documents/Codex/2026-11-06/ok/work/ios-sweet-latest
+fastboot boot outputs/guacamole-ios27a-haptic-ready-triple.img
+```
+
+After selecting iOS 27, test a system haptic and check `oslog`/`ioreg` for `AHSFirmwareReadyNotifier` and
+`SWEET HAPTIC: AHSFirmwareReadyNotifier registered after actuator initialization`.
+
+# Build reference — iOS 26 kernel (xnu-12377) and boot image (keep this section at the top)
+
+# Active handoff — iOS 27.2 kernel + root image (2026-11-13 22:00, Claude) — step 3 done, steps 4-5 for Codex/user
+
+Kernel (DONE in work/xnu-12377, not built): UniXNU's Darwin 26 patches for 24A446-class userland, applied with
+`git apply` (copies in research/ios27.2/kernel/, pre-patch files in research/ios27.2/kernel-backup/*.before-darwin26):
+- darwin26-syscalls.patch: pipe2 (148), dup3 (149), fchflagsat (214), getumask (215), aio_readv/aio_writev (246/247,
+  ENOTSUP), fsctlat (249), guarded_ftruncate_np (352) - slots that were nosys (SIGSYS) in Darwin 25.
+- darwin26-shared-region.patch: clamp the shared-region slide so Darwin 26's larger caches still fit.
+Both are additive; iOS 26 keeps working. darwin26-kpi.patch is NOT applied (it is for Apple's prelinked kexts,
+which we do not load; it also conflicts in kern_trustcache.c). kern.osrelease stays 25.5.0 as in UniXNU's profile.
+Everything else carries over: hid26e (touch), IOSurface 0xc68, IOMFB 0x588, AMFI 102, XPC check-in, migration
+skip, stackshot abort, Metal 26 accelerator. Expect new iOS 27 ABI breaks there; find them from logs as for 26.
+
+Root image: NEW tools/mkios27root-mac.sh [SIZE] -> research/ios27.2/ios27-root.cdr (raw HFS+, 30g default).
+= mkios26root-mac.sh with the research/ios27.2 overlays (os-root-, systemos-cryptex-, appos-cryptex-lowered.tar,
+dsc-lowered-0..4.tar, NEW driverkit-dsc-lowered.tar into the SystemOS cryptex), plus the iOS 26 hand patches baked in:
+- /sbin/launchd Boot.fips -N via NEW tools/launchd-fips-noverify.py (rewrites the __TEXT,__config plist at the
+  same length, refreshes page hashes; verified: on the iOS 26 launchd it gives a plist equal to research/ios26/
+  fips-fix/launchd; on 27.2's lowered launchd it finds the same Boot.fips and patches 3 pages);
+- launchd.plist without com.apple.fairplayd.H2 (in place, owner/mode kept);
+- stub islands: already lowered by lower-stubs.py in the 27.2 pipeline (iOS 26 needed a phone patch).
+Space: needs ~20 GB (sparseimage) + 30 GB (cdr) free; delete ios27-root.sparseimage after the cdr exists.
+
+Codex:
+1. Build the kernel (same command as the iOS 26 build reference below), log work/xnu12377-ios27a-build.log.
+2. `tools/mkios27root-mac.sh` (sudo). Report the launchd/FIPS and launchd.plist lines and the cdr SHA-256.
+3. Boot image outputs/guacamole-ios27a.img: new kernel + work/guacamole-ios26-d73.adt (iPhone 14 Pro identity),
+   boot args = outputs/ios26-d73-boot-args.txt with `sweetsample=backboardd,SpringBoard` replaced by
+   `sweetcsoff=1 sweetmigrate=1` (installd then installs /private/var/staged_system_apps instead of discarding
+   them; DataMigration runs its normal first-boot pass) and a fresh sweettime. Check the args stay <= 607 chars.
+   Also outputs/guacamole-ios27a-normal.img with the same args WITHOUT sweetcsoff/sweetmigrate (for later boots).
+Codex build result (2026-11-13): kernel build succeeded with the recorded SDK/KERNEL_SDKROOT overrides; log
+`work/xnu12377-ios27a-build.log`; kernel SHA-256 `df7fcfc8bb18abbac0acde2795bfa4e1a19eb1c5c62814c5a69454397f421570`.
+Both boot images were built from `dtb/android-boot_a.img`, `shim/out/shim-guacamole.Image`, and
+`work/guacamole-ios26-d73.adt`. First-boot args are `outputs/ios27a-first-boot-args.txt` (595 bytes, `sweetcsoff=1 sweetmigrate=1`); normal args are `outputs/ios27a-normal-boot-args.txt` (567 bytes).
+`outputs/guacamole-ios27a.img` SHA-256 `886424c3595c4e99d4491ed126eb096fecb4bd3823abf9c73194dabf21720685`;
+`outputs/guacamole-ios27a-normal.img` SHA-256 `0cbbab5e6616ba433dedd07cdb0a8db46808f633e0d1f0825cca96ea50f80df9`.
+Root image built by `tools/mkios27root-mac.sh`; log `work/ios27-root-build.log`. FIPS output: `old Boot.fips` had `RequireSuccess`/`RequireRun`; `new Boot.fips` adds `ProgramArguments: [cc_fips_test, -N]`; 3 page hashes refreshed. `launchd.plist` removed `/System/Library/LaunchDaemons/com.apple.fairplayd.H2.plist`. `research/ios27.2/ios27-root.cdr` is 32,212,254,720 bytes; SHA-256 `d15c583509ab696111b1b94f1f42902b2fac553e080b2cf8630d49c8363452d0`.
+
+User (destructive, ios26 partition only; Android, bootloaders, recovery, modem, persist untouched), phone in
+TWRP/Android with root:
+   adb exec-in "su -c 'dd of=/dev/block/by-name/ios26 bs=4194304'" < research/ios27.2/ios27-root.cdr
+   (or the TWRP form in docs/ios26.md); then re-flash the Metal box outputs/ios26-metal-box.img to rawdump (the
+   fresh root has no NativeAdrenoMetal.bundle), boot guacamole-ios27a.img, leave it on the "updating" screen
+   until done, then pull the kernel log as usual.
+
+- 2026-11-14 01:35 (Claude) ios27a first boot (root flashed): panic "initproc failed to start -- exit reason namespace 6
+  subcode 0x1 Library not loaded: /usr/lib/libSystem.B.dylib Referenced from /sbin/launchd (no such file, no dyld
+  cache)". The root has the cache (build log: hard links made). Cause: 27.2's cache is too big for our shared
+  region. Header sharedRegionSize 0x190258000, mappings 0x180000000..0x310254000 (0x190254000 bytes); iOS 26's
+  was 0x141a84000; xnu-12377 SHARED_REGION_SIZE_ARM64 = 0x180000000 (6 GiB), so the map fails and dyld has no
+  cache. (UniXNU's 24A446 iPad cache still fit: their darwin26-shared-region patch says "fill almost all".)
+  Slide info is still v5 (checked). FIX (source): osfmk/mach/shared_region.h SHARED_REGION_SIZE_ARM64 =
+  0x200000000 (8 GiB) for SWEET (ARM64_BOARD_CONFIG_SWEET), unchanged otherwise. Region end 0x380000000; the
+  commpage (0xFFFFFC000) and pmap max address (base+size+0x20000000) are well above. Diff
+  research/ios27.2/kernel/xnu12377-shared-region-8g.diff. Codex: rebuild the kernel, re-wrap
+  guacamole-ios27a.img (first-boot args) and guacamole-ios27a-normal.img exactly as before (fresh sweettime).
+  Root image unchanged: no reflash.
+
+- 2026-11-14 01:50 (Claude) shared-region-8g boot: launchd now runs (pid 1, 1110 pages, 4 threads) and then aborts:
+  panic "initproc exited -- exit reason namespace 2 subcode 0x6" (SIGABRT). The pulled log has NO line from the
+  27.2 boots (it is the 19:08 iOS 26 migrate boot): the sweetlog thread writes the ring to the partition only every
+  ufslogsecs seconds (default 10, bsd/dev/sweet_ufs.c) and launchd dies sooner, so nothing reached the disk.
+  Next image: same kernel and ADT, first-boot args with `sweetfb_noconsole=1` replaced by `ufslogsecs=1` (1 s
+  flushes; and the console text, incl. launchd's abort message, shows on the panel until the panic screen). Args
+  596 -> 589 chars. Codex: outputs/guacamole-ios27a-log.img, fresh sweettime. User: boot it, photo of the screen
+  just before/at the panic if possible, then pull the kernel log.
+
+- 2026-11-14 02:05 (Claude) ios27a-log boot: log header total 30,520 bytes (read the ring by the SWEETLOG header, the
+  rest of the 4 MiB is older boots). 27.2 gets far: dyld cache mapped, launchd up, mount-phase-1/2, FIPS POST all
+  PASSED with -N, keybag, usermanagerd, tzinit, ... last line "(sysstatuscheck) <Notice>: Doing boot task", then the
+  SIGABRT. 27.2's embedded Boot.sysstatuscheck = {RebootOnSuccess, AllowCrash, LimitLoadFromBootModes [rem]}; on
+  iOS 26 the task exited 1 (EXIT line) and boot went on; here no EXIT line (we log non-zero exits), so it most
+  likely succeeded and launchd's RebootOnSuccess reboot failed -> abort. FIX (no kernel/root rebuild):
+  tools/launchd-fips-noverify.py gains --no-reboot-task NAME; outputs/ios27-launchdfix/launchd = 27.2 lowered
+  launchd with fips -N + sysstatuscheck without RebootOnSuccess (SHA-256 1d0ee8c7...8944), installed by SWEETBOX
+  outputs/ios27-launchdfix-box.img (ROOT/sbin/launchd, SHA-256 3b1b7bc1...d8bc) before launchd starts. (Bug fixed in
+  the tool: a variable clash wrote its output to a file named "-N"; Codex's root build used the earlier version
+  and was not affected; stray file moved to _to_delete/stray-launchd-N.) Boot: guacamole-ios27a-log.img again.
+  If this is right, rebuild the root later with `--no-reboot-task sysstatuscheck` in mkios27root-mac.sh.
+
+- 2026-11-14 02:15 (Claude) launchdfix boot: box installed /sbin/launchd; sysstatuscheck now logs "EXIT ... status 1"
+  (so the RebootOnSuccess theory is NOT confirmed; harmless either way), prng_seedctl exit 12 (as on iOS 26),
+  launchd_cache_loader sends the unsecure launchd.plist cache, workload-properties-init, init-exclavekit "Doing boot
+  task" = last line. Header: total 31,399 bytes but only seq 4 flushes, so the last second(s) before the abort
+  (launchd's own message, our CRASH lines) never reach the disk. FIX (source, diagnostic): bsd/dev/sweet_ufs.c
+  sweet_log_sync(ms) wakes the log thread and waits until everything logged is on disk; bsd/kern/kern_exit.c calls
+  it (3 s max) for initproc right before the "initproc exited" panic (SWEET only). Diff
+  research/ios27.2/kernel/xnu12377-initproc-logsync.diff. Codex: rebuild, wrap as outputs/guacamole-ios27a-log2.img
+  with the ios27a-log args (fresh sweettime). Box: leave the launchdfix box in rawdump.
+
+- 2026-11-14 02:25 (Claude) log2 boot: the sync flush works (header seq 5, total 31,683). Last lines:
+  "(init-exclavekit) Doing boot task", "(boot) <Notice>: Early boot complete. Continuing system boot.", then
+  "pid 1 exited -- exit reason namespace 2 subcode 0x6, description none" (plain SIGABRT, no abort message on the
+  console). Our CRASH report never ran for launchd: proc_prepareexit calls proc_handle_critical_exit (the
+  initproc panic) BEFORE the SWEET crash log. FIX (source, diagnostic): kern_exit.c prints sweet_crash_log
+  (pc/lr/sp/fp, 10-frame backtrace, shared-cache slide, mh) + exit reason for initproc killed by a signal, before
+  that panic; exception.c sweetscan default now "launchd,backboardd,SpringBoard" (launchd's heap text runs as STR
+  lines on SIGABRT). Diff research/ios27.2/kernel/xnu12377-initproc-crashlog.diff (backup
+  exception.c.before-initcrash). Codex: rebuild, wrap as outputs/guacamole-ios27a-log3.img, same args (fresh
+  sweettime). Box unchanged. Symbolicate with research/ios26/tools/dscsym.py on research/ios27.2/dsc-system-arm64.
+
+- 2026-11-14 02:15 (Claude) launchd's own log (/private/var/log/com.apple.xpc.launchd/launchd.log, catalog
+  outputs/ios27-catalog.tsv, pulled to outputs/ios27-launchd.log): after "Early boot complete" launchd enters
+  bootstrap mode, imports the LaunchDaemons (lint noise only; CommCenter "cannot be loaded on this hardware"),
+  many services log "service will attempt to elide xpcproxy" (iOS 27 spawns them directly, without
+  /usr/libexec/xpcproxy), and the log ends at the FIRST spawn: "(user/501/com.apple.UserEventAgent-System)
+  service state: spawning" -> SIGABRT. 27.2 launchd has boot-arg `launchd_proxyless_spawn=` and the message
+  "service will always use xpcproxy, elision was disabled by boot-arg". TEST (no build): boot args with
+  `sweethaptic=2` replaced by `launchd_proxyless_spawn=0` (length 601 <= 607), so services are spawned through
+  xpcproxy as on iOS 26. Codex: wrap the current (log2 or log3) kernel as outputs/guacamole-ios27a-noelide.img.
+  If it then boots, the proper fix is to find what the proxyless posix_spawn path needs from our kernel.
+
+- 2026-11-14 02:30 (Claude) noelide boot: launchd took the arg ("service will always use xpcproxy, elision was
+  disabled by boot-arg") and still aborts at the FIRST spawn, now com.apple.SpringBoard ("service state:
+  spawning"). So it is spawning itself, not elision. No unsupported AMFI/Sandbox op was logged. Diagnostic
+  (source): kern_exec.c posix_spawn wrapper logs "SWEET SPAWN: launchd posix_spawn PATH -> errno" for every
+  failing posix_spawn by pid 1 (SWEET only); diff research/ios27.2/kernel/xnu12377-spawnlog.diff. Together with
+  the 02:25 initproc crash report (backtrace + heap text) this pins the abort. Codex: build (tree has both), wrap
+  as outputs/guacamole-ios27a-log4.img with the ios27a-log2 args (elision on, sweethaptic=2), fresh sweettime.
+
+- 2026-11-14 02:45 (Claude) ROOT CAUSE of the launchd abort (log4: crash report worked). Only failing spawn:
+  /usr/libexec/HorizonSetup -> ENOENT (the optional restore-datapartition task; harmless). CRASH launchd sig 6,
+  slide 0x2f38000; symbolicated (dscsym, 27.2 cache): __pthread_kill <- abort <- libsystem_darwin crash helper
+  <- libsystem_darwin +0x52c0 <- dispatch_once <- os_lockdown_mode_enabled <- launchd. The once block (unslid
+  0x23c542260) does sysctlbyname("security.mac.lockdown_mode_state_public", &u64, 8) and calls the crash path when
+  it returns -1. That sysctl is new in Darwin 26; xnu-12377 only has security.mac.lockdown_mode_state.
+  FIX: bsd/kern/lockdown_mode.c adds SYSCTL_PROC security.mac.lockdown_mode_state_public (u64, read-only, same
+  value). Diff research/ios27.2/kernel/xnu12377-lockdown-public.diff. Codex: build (tree also keeps the
+  crash/spawn/log-sync diagnostics), wrap as outputs/guacamole-ios27a-ldm.img with the ios27a-log2 args (fresh
+  sweettime). Box unchanged.
+
+- 2026-11-14 03:10 (Claude) ldm boot: lockdown fix WORKS: no panic, full userland up (launchd log 1.4 MB,
+  outputs/ios27-launchd.log). New problem ("stuck"): backboardd[66] runs 12.5 s (waits for the GPU via sweetmtlwait,
+  GPU ready, opens/closes the accelerator), "uncorking domain", looks up ACCHWComponentAuthService and then
+  SIGKILLs ITSELF (launchd: "exited due to SIGKILL | sent by backboardd[66]"); the respawn [123] does the same
+  after 184 ms; SpringBoard exit(255); many others self-SIGKILL at the same moment (23:42:39); later logd
+  self-SIGKILLs every ~60 ms (200+ times), symptomsd/spindump kill hung ones. Kernel reason is plain ns 2 code 9
+  (kill(getpid(), SIGKILL)). Also noted: SweetFramebuffer still presents 1125x2436 with the d73 ADT (14 Pro is
+  1179x2556) - check later. DIAGNOSTIC (source): kern_sig.c kill(): a process SIGKILLing itself prints
+  "SELFKILL name[pid]" + the CRASH register/backtrace report (first 60). Diff
+  research/ios27.2/kernel/xnu12377-selfkill-log.diff. Codex: build, wrap as outputs/guacamole-ios27a-selfkill.img
+  with the ios27a-log2 args, fresh sweettime. User: boot, wait ~1 min, kernel log.
+
+- 2026-11-14 03:25 (Claude) selfkill boot (kernel had the hook: kern_sig.o contains SELFKILL): ZERO "SELFKILL"
+  lines, so the daemons are NOT killing themselves via kill(getpid()) - "sent by backboardd" was misleading.
+  ~40 daemons get SIGKILL (ns 2 code 9) within seconds (chronod, cameracaptured, mobiletimerd, lsd, driverkitd,
+  backboardd, powerd, configd, securityd, ...), then logd loops (196 logd exits). Some other process or kernel
+  path sends them. DIAGNOSTIC (source): kern_sig.c kill(): any SIGKILL via kill() -> "KILLSYS sender -> target" +
+  sender's user backtrace (first 40); psignal_internal(): every SIGKILL -> "SIGKILL by X[pid] to Y[pid] flavor
+  reason ra0 ra1 ref" (no copyin, first 400; ref = &psignal_internal to resolve ra offsets). Diff
+  research/ios27.2/kernel/xnu12377-killlog.diff (includes the selfkill hunk, now replaced). Codex: build, wrap as
+  outputs/guacamole-ios27a-killlog.img with the ios27a-log2 args, fresh sweettime. This boot's launchd.log (cnid
+  541444, 1209622 B) extents 3049179+178 3049370+41 3049946+61 3050012+16 (4 KiB blocks on ios26).
+
+- 2026-11-14 03:45 (Claude) killlog boot: ROOT CAUSE of the daemon SIGKILLs found. Every one is "SIGKILL by X to X",
+  ra0 = task_identity_token_try_sigkill+0x3c <- task_fatal_port_no_senders+0x24 (resolved against
+  mach.development.sweet.unstripped; slide 0): the CONFIG_PROC_RESOURCE_LIMITS task fatal port, handed out when a
+  process passes a kqworkloop/port/fd HARD limit. Why: iOS 27 libsystem_kernel's _posix_spawnattr is 256 bytes
+  (posix_spawn sets attr_size 0x100; ours 248). Disassembly of the 27.2 setters: same through launch_type @168,
+  then task_security_policy u32 @172, use_sanitizers u8 @176, crash_count @180, throttle_timeout @184,
+  kqworkloop soft/hard @188/@192, conclavememlimit @196, pointers @200. Our kernel reads crash_count @172,
+  throttle @176, kq soft/hard @180/@184 -> launchd's throttle_timeout became the kqworkloop HARD limit.
+  FIX: kern_exec.c posix_spawn: if attr_size == 256, re-read 172..199 and remap (sec_flags kept 0 as it was).
+  Diff research/ios27.2/kernel/xnu12377-spawnattr27.diff (backup kernel-backup/kern_exec.c.before-psa27).
+  SIGKILL/KILLSYS logging kept for one more boot to confirm. Codex: build, wrap as
+  outputs/guacamole-ios27a-psa27.img with the ios27a-log2 args, fresh sweettime.
+
+- 2026-11-14 04:10 (Claude) psa27 boot: spawnattr fix CONFIRMED - 0 "SIGKILL by" lines; backboardd[66] and
+  SpringBoard[30] stay up for the whole boot (only locationd sig 10, wifip2pd/BlueTool exit 1, *BlastDoor sig 5,
+  terminusd sig 5 loop - not blocking). backboardd: GPU ready, display on, creates 1179x2556 BGRA surfaces (the D73
+  size now), GPU present window set up, but swaps are "none" layers (CPU path, nothing shown, fShownSwapID stays 0,
+  SwapWait times out) and only 1 swap per 5 s. Cause, same as the iOS 26 swap26 bug: iOS 27.2 SwapEnd sends a 0x6e0
+  record (sel 5 in 0/1760) and we only folded 0x588. Disassembly of 24B119 IOMobileFramebuffer: SwapBegin zeroes 0x6e0
+  at fb+0x18, id fb+0xb0; kern_SwapSetLayer: ids fb+0xb4, rects fb+0xc4/+0x124, masks fb+0x164/+0x168, flags
+  fb+0x174 = iOS 26 offsets. FIX: SweetFramebuffer.cpp folds 0x6e0 like 0x588
+  (research/ios27.2/kernel/xnu12377-swap27.diff). Boot-args: put sweetfb_noconsole=1 back (keep ufslogsecs=1) so the
+  console stops drawing once a frame is shown. Codex: build, wrap as outputs/guacamole-ios27a-swap27.img.
+
+- 2026-11-14 04:50 (Claude) swap27 boot: UI WORKS - Apple logo + progress bar (migration), then the lock screen.
+  Then a respring loop: SpringBoard sig 6 x3, reason ns 32 code 0xb "BLS CB_DM watchdog: OSDI:...:LCD
+  transitionToDisplayMode:Off withDuration:0.185000s"; bt abort_with_reason <- BacklightServicesHost watchdog
+  (dispatch_after). Each time right after a display off/on (sel 12) + backboardd sel 86 (struct 72, new in 27).
+  SpringBoard twice asks for {IOPropertyMatch: {backlight-control: true}} -> none: the boot-args carry
+  sweetbacklight=0 (left over from the iOS 26 nogpu debugging), so AppleARMBacklight (SweetBacklight.cpp, worked on
+  iOS 16) is not registered and CoreBrightness's display module has no backlight to drive -> the Off transition never
+  completes. TEST (boot-args only, same kernel): swap27 args WITHOUT sweetbacklight=0 ->
+  outputs/guacamole-ios27a-bl.img. Not proven yet; if it still loops, RE CoreBrightness's transition completion.
+
+- 2026-11-14 05:05 (Claude) bl boot (sweetbacklight on, iPhone X props): as on iOS 26 (NOTES 2026-11-13 15:24, which
+  I should have checked first): backboardd SIGSEGV x3 in CoreBrightness (+0xeab20, nearest export
+  CBBrightDotMitigation...; ldr s2,[x8] with x8 = [obj+64] = NULL, a float array with count [obj+56]) -> launchd
+  "Rebooting to device recovery environment" (no panic). The X backlight node lacks 28 keys the D73 node has (incl.
+  bright-dot-mitigation-nits1/2, use-bright-dot-mitigation, aml-table, EDR*, rtplc-*). FIX (source):
+  SweetBacklight.cpp gets the D73AP /device-tree/backlight node (63 props, no name/phandle/function-*) and uses it by
+  default; boot-arg sweetblident=22 = the old iPhone X set. Diff research/ios27.2/kernel/xnu12377-backlight-d73.diff.
+  Codex: build, wrap as outputs/guacamole-ios27a-bl73.img with the bl args (no sweetbacklight=0), fresh sweettime.
+  Fallback image if it fails: guacamole-ios27a-swap27.img (lock screen, respring loop).
+
+- 2026-11-14 05:25 (Claude) bl73 boot: D73 props registered ("iPhone 14 Pro backlight properties") but the SAME
+  backboardd SIGSEGV (same pc, CoreBrightness +0xeab20) x3 -> "rebooting due to critical process crashes:
+  backboardd". RE of 24B119 CoreBrightness DisplayCreate (0x22cc606d0): after "Initializing Display.m" it calls
+  [obj+13136 getBacklightCalibration:&obj+0x574]; on failure it sets defaults and falls into code reading the NULL
+  float array at obj+64 (count obj+56) -> crash. getBacklightCalibration: (0x22cc56724) = [[self reader]
+  copyProperty:@"backlight-calibration-parameters"], must be an NSDictionary; reads lMaxProduct, lMidProduct,
+  lMinProduct, lMaxPanel, lMidPanel, lMinPanel (intValue as 16.16) and optional milliAmps2NitsScaleFactor. The ADT
+  node has no such key (the real display driver publishes it). FIX (source): SweetBacklight publishes
+  backlight-calibration-parameters from the node's LmaxProduct/LmidProduct/LminProduct (D73: 2175/155/2 nits),
+  panel = product. Diff research/ios27.2/kernel/xnu12377-backlight-d73.diff (now includes this).
+  Codex: build, wrap as outputs/guacamole-ios27a-blcal.img with the bl73 args.
+
+- 2026-11-14 05:40 (Claude) blcal boot: user reports it now goes back to Setup, and Setup gets stuck. Setup bypass:
+  24B119 SetupAssistant BYSetupAssistantNeedsToRun (0x1cbc9dc18): after the NonUI-variant check it reads
+  [[BYPreferencesController buddyPreferencesInternal] boolForKey:@"ForceNoBuddy"] -> YES = "NeedsToRun is NO due
+  to ForceNoBuddy" (no internal-install check before it). Box outputs/ios27-nobuddy-box.img = launchdfix launchd +
+  /private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist {ForceNoBuddy, SetupDone,
+  SetupFinishedAllSteps, UserChoseLanguage = true} + com.apple.purplebuddy.notbackedup.plist {ForceNoBuddy = true}
+  (which domain buddyPreferencesInternal uses is not confirmed, so both). Box reinstalls each boot (overwrites those
+  two prefs). Flash to rawdump, boot the blcal image unchanged.
+
+- 2026-11-14 05:45 (Claude) nobuddy boot: box installed both prefs (3/3) but Setup still runs ("update complete"
+  express flow), hangs on Location Services and runningboardd kills it (ns 10 code 0x8badf00d) twice. cfprefsd
+  rewrote both plists (purplebuddy 213 B blk 3664830, notbackedup 162 B blk 3269650; 0600 mobile) - contents to read.
+  locationd crash decoded: libdispatch +0x5abc (voucher adopt: compares with TSD[28] = current voucher, ldadd on
+  [x1+0xc]) is handed x1 = 0x1e2079c18 = a CFString constant "com.apple.locationd" in CoreFoundation __cfstring
+  (__AUTH_CONST, read-only) instead of a voucher -> SIGBUS. Who stores a CFString where a voucher belongs is open.
+
+- 2026-11-14 05:55 (Claude) purplebuddy read back (tools/sweet-blocks-pull.sh, new): com.apple.purplebuddy kept
+  ForceNoBuddy/SetupDone/SetupFinishedAllSteps (+ lastPrepareLaunchSentinel, CAEnableIOSurfaceCompression=0);
+  notbackedup kept ForceNoBuddy and has LocationServices5Presented = false, acceptedSLAVersion 2006. So Setup's
+  express flow runs anyway (ForceNoBuddy alone does not stop it) and stops at the pane not yet presented. Box
+  outputs/ios27-nobuddy2-box.img: both plists also mark every "<Pane>Presented" key found in SetupAssistant/Setup
+  (32 keys incl. LocationServices5Presented) true.
+
+- 2026-11-14 06:05 (Claude) nobuddy2 box: Setup skipped, home screen reached, but only Settings + Phone. Catalogs:
+  07:53 (first 27.2 boot) /private/var/staged_system_apps had 50 apps; 10:30: the dir is empty and there is no
+  /private/var/containers/Bundle/Application/* -> installd consumed the staged apps without installing them. Unlike
+  iOS 16, 27.2 installd never asks AMFI op 96 (only remoted does), so sweetcsoff does not reach it. Its reasons should
+  be in .../SystemGroup/356C6C78-.../Library/Logs/mobile_installation_helper.log.0 (48620 B, extents 3091368+1
+  3091376+5 3091579+3 3091626+3 in the 10:30 catalog). Staged apps still exist in the root image build
+  (research/ios27.2, appos cryptex) - restaging them needs a box or rebuild.
+
+- 2026-11-14 06:15 (Claude) mobile_installation_helper.log (pulled with tools/sweet-blocks-pull.sh): 202 x
+  "-[MIStagingManager stagingLocationForURL:withinStagingSubsystem:usingUniqueName:error:]: 652: Expected install path
+  file:///private/var/ to be located on an APFS formatted volume; got hfs" (00:15 local, the swap27 first boot) - one
+  per staged app; the strings live in com.apple.MobileInstallationHelperService (also has performAPFSClone). So 27.2
+  cannot install the staged system apps on our HFS+ root at all (not a code-signing problem). FIX (root image):
+  tools/mkios27root-mac.sh moves /private/var/staged_system_apps/*.app (lowered copies) to /Applications, where
+  LaunchServices registers them as system apps without installd. Codex: rm the old ios27-root.cdr/sparseimage, rerun
+  the script, report the "staged system apps moved" line + cdr SHA-256; user flashes it to ios26 and boots
+  guacamole-ios27a-blcal.img (first-boot args: sweetcsoff=1 sweetmigrate=1) with the nobuddy2 box still on rawdump.
+
+- 2026-11-14 15:20 (Claude) after the root reflash (cdr 11:06 UTC, apps-in-/Applications build): one rawdump box
+  for a fresh 27.2 root, outputs/ios27-full-box.img (39,886,848 B, SHA-256
+  7bca0a53fa1f486489ebb0e9b17f9839422f993ab9c89e723d842c45cf0d93a2) = launchdfix launchd + nobuddy2 Setup prefs +
+  the NativeAdrenoMetal bundle/publish files from ios26-metal-box.img (the kernel makes missing parent dirs;
+  /private/var/mobile/Library/Preferences already exists in the image, 501:501). The backlight fixes live in the
+  kernel: boot guacamole-ios27a-blcal.img (NOT the older guacamole-ios27a.img in the handoff above).
+
+- 2026-11-14 15:45 (Claude) ALL APPS WORK (apps-in-/Applications root + ios27-full-box + blcal kernel). User asks:
+  GPU hang recovery, Wi-Fi, SSH (ios27-patches.md = ChatGPT assessment of Wi-Fi/BT/haptics; no GPU part).
+  - GPU recovery: 0238 is already in xnu-12377 (sweet_gpu_hang_check/sweet_gpu_recover_locked, default
+    sweetgpurecoverms=3000, not disabled in the args; "SWEET GPU: RECOVER" x7 in the current kernel). On 27.2 it is
+    reached from SweetAccelerator's fence waits (timeouts 2 s / caller's). Nothing to add; test = reproduce a hang,
+    look for "SWEET GPU: HANG"/"RECOVER" in the kernel log.
+  - Wi-Fi phase 1 (independent of 27.2 wifid's Apple80211 ABI): wland + netsvc (userland/out, iOS 16 builds) in
+    /var/local/bin with its own utun + DHCP, boot-arg sweetwifid=0; firmware from the phone's modem_b/modemst1/
+    modemst2/fsg/fsc via NEW tools/mkwlanfw.sh -> research/ios27.2/extras/fw; network in extras/wlan.conf.
+    Phase 2 (Settings Wi-Fi): trace 27.2 wifid against redwood_apple80211 (ios27-patches.md) with sweetwifid=1.
+  - SSH: Procursus rootless bootstrap-ssh (apt.procurs.us/bootstraps/1900/) -> /var/jb, host keys, /bin/sh etc.
+    symlinks to /var/jb, extras/authorized_keys for root+mobile, launchd job com.sweet.sshd.
+  - tools/mkios27root-mac.sh: optional "Network extras" block does all of the above when the extras exist
+    (backup: kernel-backup/mkios27root-mac.sh.before-net). Root rebuild + reflash needed; boot image = blcal kernel
+    with sweetwifid=0 (outputs/guacamole-ios27a-net.img).
+
+- 2026-11-14 16:00 (Claude) "going home freezes 9/10, power button dead" - log 20:29 UTC: backboardd job 4706
+  (26 IBs) hangs; "report hang: smmu CB1 FSR 0x402 FSYNR0 0x30003 FAR 0x6d0c0000" = GPU SMMU translation fault on
+  IB1 0x6d0c0000 (the CP fetched an IB at an unmapped GPU VA). RECOVER #1 then failed: reset ok (GBIF acks 1 1 1,
+  RBBM_STATUS 1) but CP_ME_INIT never ran (shadow 0xdeadbeef, CP_INT 0x80) -> backend stopped for good ->
+  backboardd crashed, SpringBoard killed, phone dead. FIX (source, xnu12377-gpu-recover2.diff): recovery clears the
+  latched CB1 FSR + TLBIALL/SYNC, checks/restores the SQE image from /sweet-gpu sqe-firmware, logs CP state, waits
+  on the shadow only (be_ring_run bailed at the first nonzero CP_INT), and retries once after a second reset with
+  RBBM_SECVID_TRUST_CNTL=0; a latched SMMU fault triggers recovery after 500 ms instead of 3 s. OPEN: why backboardd's
+  IB points at an unmapped VA (NativeAdrenoMetal BO lifetime vs. submit, or a window unmapped under it).
+
+- 2026-11-14 16:10 (Claude) GPU recover2 confirmed by the user ("that worked"). wland: several networks in
+  /var/local/wlan.conf (one ssid= line each, its psk= after it, none = open; up to 16): join_poll picks the strongest
+  known network heard in the last minute (radio_heard), skips one after 3 failures in a row until nothing else is
+  heard, rescans every 30 s with none in range, re-picks after a lost link. Diff research/ios27.2/wland-multinet.diff
+  (gcc -fsyntax-only clean). Codex: rebuild userland (userland/build.sh) before the root build.
+
+- 2026-11-14 18:00 (Claude) net root (sweetwifid=0): lock screen ok, swipe up -> respring loop. Log: "SWEET BOX:
+  SWEETDNE - already extracted, skipping" (rawdump still stamped from the previous root, never re-flashed), so the
+  fresh root has NO NativeAdrenoMetal bundle: no "SWEET MTL: backboardd" lines; CoreAnimation falls back to its OGL
+  path and backboardd aborts "Assertion failed: (found != slist->end()), function push_surface, file
+  ogl-context.cpp, line 1309" (bt QuartzCore) when the home screen composes; SpringBoard killed with it. FIX: re-flash
+  outputs/ios27-full-box.img to rawdump after EVERY root reflash (the kernel stamps SWEETDNE after one install).
+
+- 2026-11-14 18:15 (Claude) weird colours after box re-flash: Metal fine, but backboardd's framebuffer surfaces are
+  fmt 0x26424741 '&BGA' (lossless-compressed BGRA; old root: 'BGRA'), copied to the panel as plain pixels.
+  QuartzCore reads CAEnableDeepFramebuffer / CAEnableIOSurfaceCompression / CAEnableFramebufferCompression with
+  CFPreferencesGetAppBooleanValue(key, kCFPreferencesCurrentApplication) (xrefs 0x184409ee0, 0x18442cb98,
+  0x184631974); the FramebufferCompression read only happens when the deep-framebuffer flag is set. Phone had
+  com.apple.backboardd {CAEnableFramebufferCompression, CAEnableIOSurfaceCompression = NO} but no DeepFramebuffer and
+  nothing global. Box outputs/ios27-caprefs-box.img: the phone's own .GlobalPreferences.plist (14 keys: language,
+  locale...) and com.apple.backboardd.plist, each + all three keys = NO (merged, not replaced).
+
+- 2026-11-14 18:30 (Claude) after caprefs box: kernel panic every ~5 min (photo): "vm_map.c:13413 Assertion failed:
+  not_in_kdp", task ReportCrashService, bt (unslid, mach.development.sweet.unstripped) vm_map_region_recurse_64 <-
+  _Xmach_vm_region_recurse <- ipc_kobject_server <- mach_msg2_trap; cores 5/6 at user PCs; "debugger
+  synchronization failed, no stackshot". = the iOS 26 stackshot race again (a core runs VM code while another core's
+  stackshot has not_in_kdp = 0), but the existing SWEET abort only covers cores that time out. A core whose
+  cpu_signal(SIGPdebug) is refused (SIGPdisabled, idle/offline transitions) is never counted in debugger_sync, so
+  the sync looks complete and the stackshot runs with it free. FIX (osfmk/arm/model_dep.c, diff
+  xnu12377-stackshot-sigfail.diff): refused cores are recorded; for a stackshot they give it up like late cores (wait
+  for the cores that did take the signal, release them, KERN_OPERATION_TIMED_OUT). Log line "SWEET DBG: stackshot:
+  cores X never took SIGPdebug, Y refused it". Hypothesis, not proven: confirm by that line + no more panics.
+
+- 2026-11-14 18:40 (Claude) sigfail kernel (23:12 build), sweetwifid=1: panic "Console I/O from interrupt-disabled
+  context @serial_console.c:174", osanalyticshelper: bt console_write <- printf <- DebuggerXCallEnter+0x574 <-
+  handle_debugger_trap <- stackshot_trap <- kern_stack_snapshot_internal. = the new stackshot give-up path WORKED
+  (it fired: a refused/late core) but its printf runs with interrupts off. Not Wi-Fi (the apple80211 lines before it
+  are wifid talking to the shim: "sets 481 REFUSED", "gets 103 CURRENT_NETWORK error 6"). FIX: DebuggerXCallEnter
+  only records late/refused masks; kern_stackshot.c prints them after ml_set_interrupts_enabled(prev) (diff now in
+  xnu12377-stackshot-sigfail.diff, both files). The old iOS 26 printf in that function had the same latent bug.
+
+- 2026-11-14 18:50 (Claude) next panic (osanalyticshelper stackshot): "Resuming from debugger synchronization
+  failed: waited 368 nanoseconds @model_dep.c:1411" from DebuggerXCallReturn in the give-up path. debug_ack_timeout
+  (MACHINE_TIMEOUT "debug-ack", default 240000 ticks = 10 ms) is 368 ticks (~15 us) on this boot: the sync wait in
+  DebuggerXCallEnter and the release wait in DebuggerXCallReturn are 650x too short - which is also why stackshots
+  keep finding "late" cores at all. FIX: SWEET clamps both waits to >= 240000 ticks (same diff). Source of 368 (ADT
+  machine-timeouts / scaling) not checked.
+
+- 2026-11-14 19:00 (Claude) clamp kernel: same panic (now @model_dep.c:1426, so the new build ran):
+  DebuggerXCallReturn still sees cores spinning after 10 ms, osanalyticshelper stackshot, CORE 0 PC=0 LR=0. The
+  multi-core freeze for stackshots is not reliable on this SoC (no dbgwrap, cores in idle/offline transitions) and
+  each attempt can take the phone down. Stop chasing it: xnu's own switch, boot-arg validation_disables=0x10
+  (KF_STACKSHOT_OVRD: kern_stack_snapshot_internal returns KERN_NOT_SUPPORTED, DEVELOPMENT kernels), so no user
+  stackshots at all (ReportCrash/osanalyticshelper/spindump get an error; panics still log). No rebuild: add it to
+  the boot-args (578 + 23 chars, under 607).
+
+- 2026-11-14 19:20 (Claude) Wi-Fi (sweetwifid=1, log 23:40): Settings spins, nothing listed. wifid talks to the
+  shim: POWER/CARD_CAPABILITIES/HW_SUPPORTED_CHANNELS answered, station present ("the station says: power, 1"), but
+  every "sets 10 (SCAN_REQ) ... 5528 bytes: error 22": set_scan wanted exactly 5456 (iOS 16.5). RE of 24B119 IO80211
+  (scan request builder 0x28c9b679c): same offsets as 16.5 (bssid +8, ssid len +0x10, scan type +0x34, dwell +0x3c,
+  count +0x44, channels +0x48, flags +0x1308, names 56 B each) + 72 bytes at the end (u64 +0x1590). Scan results /
+  CURRENT_NETWORK are 2280 bytes in 27.2 but the header is unchanged (elements_length at +0x8a, IO80211 sets it to
+  2048), so give_network's 1164 bytes + zeroed tail parse. FIX: set_scan accepts 5528 too
+  (xnu12377-apple80211-scan27.diff). Many other 27.2 requests are still REFUSED (383 x254 sets, 481/483/485, 115,
+  390, ...) - check after scanning works.
+- 2026-11-14 19:25 (Claude) shutdown/restart: PE_halt_restart was never set -> "MACH Reboot" then nothing. NEW
+  sweet_power_init (bsd/dev/sweet_rtc.c, called from bsd_init): PE_halt_restart = PSCI SYSTEM_OFF (0x84000008) /
+  SYSTEM_RESET (0x84000009) by SMC for kPEHaltCPU/kPERestartCPU/kPEUPSDelayHaltCPU only (panics unchanged), logs
+  "SWEET POWER: ..."; boot-arg sweetpower=0 disables. Diff xnu12377-psci-power.diff. Restart goes through the
+  bootloader: lands in iOS only if the iOS image is flashed in the boot slot (fastboot boot -> Android).
+
+- 2026-11-14 19:45 (Claude) triple boot (iOS 27 / iOS 16 / Android): the menu existed (docs/dualboot.md) with an
+  "iOS 26" entry that was never wired. shim: loader_count / loader_boot_n find the n-th SWEETXNU payload in the
+  ramdisk (each on a 4 KiB boundary after the previous one's last segment/ADT); shim.c enables "iOS 27" (payload 1)
+  when there are two, slider middle defaults to it (backups in research/ios27.2/shim-backup/). NEW
+  tools/mktripleboot.py STOCK SHIM IOS16.img IOS27.img OUT: concatenates both images' payloads (iOS 16 first),
+  warns if the boot-args lack ufsroot=ios / ufsroot=ios26, refuses > 50 MiB (ABL room ~56 MiB above the DTB).
+  Dry run with 0267-selector + ios27a-net: 37.1 MB ramdisk, 41.6 MB image, payload 1 at 0x105f000 (python
+  emulation of payload_at finds both). Not built for the phone yet (gcc -fsyntax-only clean). docs/dualboot.md
+  updated.
+
+- 2026-11-14 20:00 (Claude) scan fix WORKS (Settings lists networks; SCAN_REQ 5528 answered, 247 SCAN_RESULT 2280
+  answered). Joining fails: "sets 20 (ASSOCIATE), 656 bytes (a join: a name of 8 bytes, any access point,
+  authentication 0/.., a key of 1 bytes of kind 32): error 22". RE of 24B119 IO80211 _performAssociation (record at
+  sp+0x218): auth pair = two u32 at +0x8/+0xc (16.5: u16 +6/+8), so everything after is +4 (name length +0x10, name
+  +0x14, BSSID +0x34, key version +0x3c, length +0x40, cipher +0x44, key +0x4c); total 656 (16.5: 592). FIX: set_join
+  translates a 656-byte request into the 16.5 record (same diff, xnu12377-apple80211-scan27.diff). Still REFUSED and
+  frequent: sets 383 (4104 B), gets 115 (2568 B), gets 390, sets 481/483/473 - watch after the join.
+
+- 2026-11-14 20:10 (Claude) join -> panic "string operation caused an overflow", pc redwood_apple80211_ioctl.cold.1,
+  lr redwood_apple80211_ioctl+0x154c: my 656-byte translation memcpy'd 0x7c bytes starting at &asked->ssid_length,
+  which the kernel's checked memcpy bounds to that 4-byte field. FIX: copy through (uint8_t *)asked + offsetof(...).
+  (Note: stackshot succeeded in this panic - validation_disables was not in that boot's args, or it was the panic's.)
+
+- 2026-11-14 20:20 (Claude) triple image: Android entry says "memory layout does not fit" (shim/android.c: Android's
+  kernel end must lie below ABL's DTB, our ramdisk above it). With ~37 MB of payloads ABL places the DTB/ramdisk
+  lower (inferred: the check passed with one payload). FIX: when the old layout fails, build Android's ramdisk, new
+  DTB and trampoline top-down below LOW_LIMIT (0x85700000), above the kernel's end and clear of ABL's DTB (our
+  payloads are dead by then). Diff research/ios27.2/shim-android-toplayout.diff (gcc -fsyntax-only clean). If it
+  still does not fit, the boot_a ramdisk (Magisk) + kernel image do not leave room: then shrink the iOS payloads.
+
+- 2026-11-14 20:30 (Claude) top layout passed the check but Android hangs at "Booting Android". Most likely: the DTB
+  sat in the 2 MiB block 0x85600000-0x85800000 that also holds the no-map hyp region at 0x85700000; arm64 Linux maps
+  the DTB with 2 MiB blocks and booting.rst forbids that. FIX: top-down layout now ends at LOW_LIMIT rounded down to
+  2 MiB (0x85600000). Not proven; if it still hangs, the next step is to shrink the iOS payloads so ABL's original
+  layout fits again.
+
+- 2026-11-14 20:45 (Claude) join WORKS (ASSOCIATE 656 answered, "join -> 0", link 1; the hotspot shows the phone)
+  but no IP: en0 counters "0 frames sent", i.e. DHCP never starts. Pulled: SystemConfiguration/preferences.plist
+  is 200 B = only System/HostNames, NO NetworkServices / Sets / CurrentSet, so IPConfiguration has no service for
+  en0. NetworkInterfaces.plist has en0 (IEEE80211, "Wi-Fi", IOPathMatch .../RedwoodWLANController/RedwoodWLAN,
+  MAC 02:53:57:45:45:01). Private MAC off made no difference (user). FIX (no rebuild): box
+  outputs/ios27-netprefs-box.img = the phone's preferences.plist + one Wi-Fi service (Interface {DeviceName en0,
+  Hardware AirPort, Type Ethernet}, IPv4 DHCP, IPv6 Automatic) in set "Automatic", CurrentSet. Why 27.2 does not
+  create the default set itself is not known (iOS 16 had one). Also open: wifid "sets 531 (6 bytes)" refused
+  (likely the private MAC).
+
+- 2026-11-14 20:55 (Claude) netprefs box: configd now configures en0 -> panic "Bounds safety trap" pc in_control+0x3e0
+  (lr in_control+0x50), cmd 0x80206919 = SIOCDIFADDR. Our own SWEET NET logging in bsd/netinet/in.c read the
+  address through struct in_aliasreq (64 B) while SIOCDIFADDR passes a struct ifreq (32 B): -fbounds-safety trap.
+  (nested panic after it: vm_map_region_recurse assert, the old stackshot race, irrelevant.) FIX: read via struct
+  ifreq's ifr_addr (same offset) - xnu12377-in-log-bounds.diff. The netprefs box worked (Wi-Fi service exists).
+
+- 2026-11-14 21:05 (Claude) in-log-bounds kernel: next panic, kernel_task "Kernel data abort" pc
+  OSKext::foreachKextInBacktrace+0x44 (far 0) <- telemetry_backtrace_add_kexts <- drain_record_submission_buffer_thread_call
+  (kernel telemetry). gLoadedKextSummaries is NULL on SWEET (no kexts ever loaded). FIX: NULL guards in
+  foreachKextInBacktrace, summaryForAddress, findSummary (xnu12377-kext-summaries-null.diff). Did the phone get an
+  IP before it? check next log for "SWEET NET: configd en0 add address".
+
+# iOS 27.2 arm64e userland lowering (iPhone15,2, build 24B119) — 2026-11-13
+
+Converted the three unpacked volume tars for the Kryo 485 (ARMv8.2, no FEAT_PAuth), preserving the source
+tars and producing metadata-preserving overlay tars. The existing iOS 26 lowerers handle the 27.2 cache
+format: `ipsw dyld info` reports `Format 0 (NewFormatTLVs)`, 4,772 system-cache images and 81 subcaches.
+The local-symbol `.symbols` files are non-executable symbol data and remain unchanged in the source volume;
+the `.atlas` sidecars are preserved in the cache overlays.
+
+Commands used (from the repository root):
+```
+python3 research/ios26/tools/lower-tar.py research/ios27.2/os-root.tar research/ios27.2/low-os-root lower 120
+python3 research/ios26/tools/lower-tar.py research/ios27.2/systemos-cryptex.tar research/ios27.2/low-systemos-cryptex lower 120
+python3 research/ios26/tools/lower-tar.py research/ios27.2/appos-cryptex.tar research/ios27.2/low-appos-cryptex lower 120
+python3 research/ios26/tools/lower-dsc.py research/ios27.2/dsc-system research/ios27.2/dsc-system-arm64 copy
+for START in 0 500 1000 1500 2000 2500 3000 3500 4000 4500; do
+  END=$((START + 500)); test "$END" -le 4772 || END=4772
+  python3 research/ios26/tools/lower-dsc.py research/ios27.2/dsc-system research/ios27.2/dsc-system-arm64 lower "$START" "$END"
+done
+python3 research/ios26/tools/lower-stubs.py research/ios27.2/dsc-system-arm64 apply
+python3 research/ios26/tools/lower-dsc.py research/ios27.2/dsc-system research/ios27.2/dsc-system-arm64 sign
+python3 research/ios26/tools/lower-dsc.py research/ios27.2/dsc-driverkit research/ios27.2/dsc-driverkit-arm64 lower 0 66
+python3 research/ios26/tools/lower-dsc.py research/ios27.2/dsc-driverkit research/ios27.2/dsc-driverkit-arm64 sign
+python3 research/ios26/tools/dsc-overlay.py research/ios27.2/systemos-cryptex.tar research/ios27.2/dsc-system-arm64 research/ios27.2/overlay/dsc-lowered
+```
+
+Results:
+- OS root: 3,744 Mach-Os inspected, 3,545 changed, 11,178,604 PAC instructions lowered, 0 refused.
+- SystemOS standalone: 50 inspected, 45 changed, 156,152 lowered, 0 refused. AppOS: 17 inspected/changed,
+  21,100 lowered, 0 refused. A second lower pass over all three overlays found 0 additional PAC words
+  and 0 refused instructions.
+- System dyld cache: 34,305,298 PAC instructions lowered across 9,569 code sections / 4,772 images. The
+  separate stub-island pass rewrote 10,310 `BRAA X16,X17` stubs in 36 subcaches. Post-lowering census:
+  0 PAC instructions and 0 remaining stub matches.
+- DriverKit cache: 191,811 PAC instructions lowered across 130 code sections / 66 images; post-lowering
+  census: 0 PAC instructions and 0 stub matches.
+- One exact same `LDRAB` form remains in each cache's `/usr/lib/system/libsystem_m.dylib` (`offset -3640`);
+  the existing kernel trap fallback is still required. These were reported by the tool, not silently changed.
+- CodeDirectory page hashes were refreshed: 82 system-cache files and the DriverKit cache. Apple CMS
+  signatures are not re-signed; trust handling/cdhash installation remains a separate rootfs step.
+
+Overlay outputs: `research/ios27.2/overlay/{os-root,systemos-cryptex,appos-cryptex}-lowered.tar`,
+`dsc-lowered-0.tar` through `dsc-lowered-4.tar`, and `driverkit-dsc-lowered.tar`. Verification indexes and
+reports are under `research/ios27.2/verify-*` and `research/ios27.2/dsc-*-arm64/`. No combined rootfs was
+assembled or booted.
+
+What is fixed in the tree (do not pass these on the command line, they are already in the sources):
+- Board: `MACHINE_CONFIGS=SWEET`, added to `SUPPORTED_ARM64_MACHINE_CONFIGS` in `makedefs/MakeInc.def`;
+  `MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -march=armv8.2-a+crypto` (plain arm64, no PAC, no
+  `ptrauth_calls`). Board header `pexpert/pexpert/arm64/SWEET.h` via `board_config.h` (defines `SWEET`).
+- Config: `config/MASTER.arm64.sweet` (iOS/embedded base + `nos_arm_asm nos_arm_pmap`, FILESYS adds
+  `sweet_hfs`), `config/MASTER` has the `SWEET_HFS` option.
+- SDK: `KERNEL_SDKROOT ?= $(SDKROOT)`; headers/libs come from `$(KERNEL_SDKROOT)/usr/local/{include,lib}/kernel`.
+  The KDK `lib$(MACHINE).os.$(CONFIG).a` is only force-loaded if it exists (it does not for SWEET).
+- Per-object flags (in `*/conf/Makefile.template`): built-in pthread `-I bsd/pthread/sweet_libpthread{,/private,
+  /include}`; built-in HFS `-include bsd/sweet_hfs/sweet_hfs_compat.h -I bsd/sweet_hfs -I bsd/sweet_hfs/core`,
+  `hfs_encodings.o/hfs_encodinghint.o -Dhfs_allocated=hfs_encodings_allocated`; BearSSL AES
+  `-mgeneral-regs-only` + its include dir. Some legacy warning-as-error categories are demoted (Codex,
+  "HFS record-copy fix" handoff).
+
+Command (reconstructed; Codex: REPLACE it with the exact line you run). Confirmed from the build logs and tree:
+SDKROOT (ld searches BUILD/sdk-ios26/usr/local/lib/kernel/...), OBJROOT/SYMROOT, KERNEL_CONFIGS, ARCH_CONFIGS,
+MACHINE_CONFIGS. Not confirmed: BUILD_WERROR=0 and the -j value.
+```
+cd work/xnu-12377
+make -j"$(sysctl -n hw.ncpu)" \
+  SDKROOT="$PWD/BUILD/sdk-ios26" \
+  OBJROOT="$PWD/BUILD/obj-ios26-sweet" SYMROOT="$PWD/BUILD/obj-ios26-sweet" \
+  KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=SWEET \
+  BUILD_WERROR=0 \
+  2>&1 | tee ../xnu12377-<what>-build.log
+```
+- Output: `BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet` (+ `.unstripped` for
+  symbolising panics). Must be DEVELOPMENT: the `bingrade` boot-arg only exists in DEVELOPMENT/DEBUG.
+
+Boot image (iOS 26):
+1. ADT: `python3 tools/mkadt.py work/guacamole-ios26-<name>.adt --highmem --guacamole` (current one:
+   `work/guacamole-ios26-ctrr-disabled.adt`, has the 256-byte random-seed and `kernel-ctrr-to-be-enabled`=0).
+2. Payload: `python3 tools/mkpayload.py <kernel> <adt> work/payload-guacamole-ios26-<name>.bin --cmdline "<args>"`.
+3. Boot image: shim `shim/out/shim-guacamole.Image` (or the selector shim) + payload as ramdisk, wrapped with
+   `tools/mkguacboot.py STOCK_boot.img <shim> outputs/guacamole-ios26-<name>.img --ramdisk <payload>`.
+4. Boot args (current; refresh `sweettime`; `cpus=8` (SMP works since 2026-11-13 04:43), `bingrade=0x100000c:2` (until
+   the kern_machdep.c arm64e grading is in the build), `ufsroot=ios26`):
+   `debug=0xc serial=3 cpus=1 keepsyms=1 bingrade=0x100000c:2 sweettouch=1 sweetkeys=1 sweetusb=1 wdt=-1
+   sweettime=<now> rd=ufsroot0 ufsroot=ios26 unentitled_ios_sim_launch=1 ignition_level=1
+   wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 sweetgpu=11 sweetgl=1 sweetglfn=1
+   sweetbbd=1 sweetbattery=2 sweetpmem=1 sweetwifid=1 guacwifi=wlfw sweetfb_hz=60 sweetfb_noconsole=1
+   sweetglwait=5 sweetmtl=2 sweetcpufreq=2 sweetfbgpu=1 sweetfbatswap=1 sweetfb_hwvsync=1 sweetfbsync=1
+   sweetfbcompose=1 sweetfbopaqueflag=1 sweetgpuhangms=150 sweethaptic=2 sweetaudio=0`
+5. Boot: `fastboot boot outputs/guacamole-ios26-<name>.img`.
+
+# Active handoff — iOS 26 Metal (UniXNU AdrenoMetal on our A640 kernel) (2026-11-13 16:20)
+
+User: attempt Metal before booting the migration image. iOS 26 has no software renderer (OpenGLES = GLEngine +
+AppleMetalGLRenderer only), so the UI needs a Metal device. iOS 26 Metal discovery is unchanged from iOS 16/27:
+IOServiceMatching("IOAcceleratorES") -> MetalPluginName -> /System/Library/Extensions/<name>.bundle -> principal class
+-initWithAcceleratorPort: (strings in the 23F84 dyld cache). Plan: UniXNU's AdrenoMetal plugin (iPadOS 27 / xnu-12377
+target "ios27", arm64e) + their Turnip darwin backend, on OUR kernel GPU (0144 user client) instead of their Adreno740.
+Sources read (read-only clones in the cloud session): github.com/UniXNU/AdrenoMetal, github.com/UniXNU/Adreno740.
+
+Kernel (source done, needs a build; diff research/ios26/xnu12377-metal26-kernel.diff, backups *.before-metal26):
+- SweetFramebuffer.cpp: sweetmtl=3 publishes the accelerator as class AGXAccelerator : IOAcceleratorES (as UniXNU's
+  NativeAdrenoAccelerator.cpp; backboardd looks up IOProviderClass AGXAccelerator, sandbox profiles name it) with
+  MetalPluginName/IOGLBundleName NativeAdrenoMetal, MetalPluginClassName NativeAdrenoMetalDevice, user client
+  SweetAcceleratorUserClient. sweetmtl=2 (SweetMetal2, iOS 16) and 0 unchanged.
+- SweetAccelerator.cpp: NativeAdreno ABI 2 = ABI 1 + SetPriority (17) + Note (18) with identical record layouts
+  (compared Adreno740/NativeAdrenoABI.h with our SweetGPUABI.h). Query answers abi_version 2 with sweetmtl=3 (or
+  sweetgpuabi=2); 17/18 accepted. Their Turnip opens type 0x4147 and tunnels 'NTNL' through the selector that
+  answers a method-0xffffffff probe: we already do both.
+- sweet_mailbox.c: ROOT/ installs make missing parent directories (root 0755), so a bundle directory can be dropped.
+Tool: research/ios26/tools/lower-macho.py FILE... lowers arm64e PAC words in place + refreshes page hashes (the
+lower-tar.py code), for the plugin and Turnip (our CPU has no FEAT_PAuth).
+
+Codex, userland (macOS, Xcode with the iOS 26 SDK):
+1. git clone --recursive https://github.com/UniXNU/UniXNU (needs drivers/AdrenoMetal, drivers/Adreno740 and the pinned
+   Mesa / metal2vulkan inputs); follow docs/building.md and docs/porting/gpu.md "Build and stage Metal" for the ios27
+   target: scripts/build-turnip-darwin.py --target ios27, scripts/build-adreno-metal-bridge.py (if separate),
+   scripts/build-adreno-metal-plugin.py --target ios27. Change the triples arm64e-apple-ios27.0 -> arm64e-apple-ios26.0
+   and use the iOS 26 SDK. Turnip is generic freedreno: the A640 comes from our GetDeviceInfo (chip_id), no A740 build
+   switch should be needed (report any). Their -Dtu-darwin-abi-dir points at drivers/Adreno740 (ABI 2): keep it.
+2. The bundle: NativeAdrenoMetal.bundle/{Info.plist, NativeAdrenoMetal, libvulkan_freedreno.dylib} (Turnip is looked up
+   beside the plugin executable). Run python3 research/ios26/tools/lower-macho.py on every Mach-O in it; it must report
+   0 refused. Keep the ad-hoc signatures (our AMFI trusts any cdhash).
+3. Pack (tools/sweet-mailbox.py pack outputs/ios26-metal-box.img ...) with ROOT/ names:
+   ROOT/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist, .../NativeAdrenoMetal,
+   .../libvulkan_freedreno.dylib, and ROOT/System/Library/Extensions/NativeAdrenoMetal.publish (empty file: without it
+   the plugin only runs its self-test and returns nil). Under 64 MB. User flashes it in Android:
+   adb push outputs/ios26-metal-box.img /sdcard/ && adb shell su -c "dd if=/sdcard/ios26-metal-box.img
+   of=/dev/block/by-name/rawdump bs=65536" (rawdump, LUN 0; NOT logdump).
+4. Kernel: build (tree has every fix: check-in, AMFI op 102, migration skip, Metal 26), wrap with
+   work/guacamole-ios26-maxvnodes.adt as outputs/guacamole-ios26-metal.img, boot args
+   outputs/guacamole-ios26-metal-boot-args.txt (sweetgpu=11 sweetmtl=3 sweetfbgpu=1, accelerator on, sweetmailbox=1
+   sweetboxroot=1 sweetboxpart=rawdump; 602 of 607 chars; refresh sweettime).
+Expect: "SWEET BOX: installed /System/Library/Extensions/NativeAdrenoMetal.bundle/..." lines, "SWEET FB: AGXAccelerator
+(IOAcceleratorES) published (Metal: NativeAdrenoMetal, ABI 2)", "SWEET MTL: method N first used by backboardd",
+then swaps with layers. Known risks: AIR of iOS 26 vs their 27 frontend; iPadOS-27-only QuartzCore pokes are behind
+boot-args we do not set (fb-bgra, ca-*); 10-bit/compressed framebuffer formats (iOS 16 needed CAEnableDeepFramebuffer /
+CAEnableFramebufferCompression / CAEnableIOSurfaceCompression = NO and SweetSurface's b3a8 -> BGRA, which is still in
+the kernel); their GPU-scanout hand-off (methods 0x7000+) is refused by our user client and falls back to our own
+present path.
+
+## Build result (2026-11-13)
+
+- The user approved the iOS 27.2 SDK, provided deployment stays 26.0. Both plugin Mach-Os report `minos 26.0`,
+  `sdk 27.2`; `Info.plist` has `MinimumOSVersion=26.0`.
+- Built XNU with the iOS 27.2 SDK and the iOS 26 Sweet settings. Kernel:
+  `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256
+  `87397a8413ca1f303362b0bb687bcb9392877d07e53ea2240bfe792f7dd1236a`.
+- Built UniXNU Turnip and `NativeAdrenoMetal.bundle` from the pinned sources, using the `ios27` ARM64e build
+  retargeted to iOS 26.0. `lower-macho.py` reported **0 refused** for both the plugin and Turnip; ad-hoc bundle
+  signature verifies after re-sealing the bundle. Bundle size is 38 MiB.
+- SWEETBOX image `outputs/ios26-metal-box.img` is 37 MiB (<64 MiB), includes the bundle files and empty publish
+  marker. SHA-256 `e5fdbfdee21b3804415ded15a8138a3ab08cbe48c1c3a8abb2c3eca77703086c`.
+- Boot image `outputs/guacamole-ios26-metal.img` uses `work/guacamole-ios26-maxvnodes.adt`, refreshed boot args
+  saved in `outputs/ios26-metal-boot-args-used.txt` (`sweettime=1794604809`), kernel above, and shim
+  `shim/out/shim-guacamole.Image`. SHA-256
+  `7b230c29e36f1729d8f493068019f3e45f6fb0641ad90a08bbde0396a524c115`.
+- Built only; neither image has been flashed or booted.
+
+### Kernel-only rebuild — GPU-ready wait (2026-11-13 16:32)
+
+- Rebuilt the kernel with the new `SweetAcceleratorUserClient::initWithTask` wait for `redwood_gpu_ready()`;
+  the built kernel contains the wait and timeout log strings. Build log: `work/xnu12377-metal-wait-build.log`.
+- Kernel SHA-256: `26ac460a52f5667f886bf706af72174c402b85c60e28c24bce178907333ac102`.
+- Rewrapped `outputs/guacamole-ios26-metal.img` with the same `work/guacamole-ios26-maxvnodes.adt`, shim, and
+  boot arguments; only `sweettime` was refreshed to `1794605540`. Image SHA-256:
+  `58f4c7823d0efc6339d77e3e1839fc7bd00ad33534e6162f747372f2429ef77e`.
+- `outputs/ios26-metal-box.img` was not rebuilt or rewritten; its SHA-256 remains
+  `e5fdbfdee21b3804415ded15a8138a3ab08cbe48c1c3a8abb2c3eca77703086c`.
+- Not booted.
+
+### Metal4 stackshot-abort build (2026-11-13 16:56)
+
+- Rebuilt the current kernel (including the 128-buffer submit fix and stackshot abort change); build log:
+  `work/xnu12377-metal4-build.log`.
+- Packaged with `work/guacamole-ios26-debugack.adt` and the same Metal boot arguments, refreshing only `sweettime`.
+  Exact arguments: `outputs/ios26-metal4-boot-args.txt`.
+- Output `outputs/guacamole-ios26-metal4.img`, SHA-256
+  `3a54c5161a35bedd26d1270835902787017cd06179f9de8f45ac90432374138a`.
+- SWEETBOX was not changed; its SHA-256 remains
+  `e5fdbfdee21b3804415ded15a8138a3ab08cbe48c1c3a8abb2c3eca77703086c`. Not booted.
+
+### Metal3 debug-ack build (2026-11-13 16:51)
+
+- Rebuilt the kernel and wrapped it with `work/guacamole-ios26-debugack.adt` (SHA-256
+  `bb2d1e3f903f0993476edb988f407bf87c61ba524eb2679bb41ae91d3aa0c9c8`). Build log:
+  `work/xnu12377-metal3-build.log`.
+- Output: `outputs/guacamole-ios26-metal3.img`, SHA-256
+  `04a702701ff9784c876b5f6c6e23f7dc380548a61c8d86ff473de36adb3fe807`. Boot arguments are unchanged from the prior
+  Metal image except refreshed `sweettime`; exact string is in `outputs/ios26-metal3-boot-args.txt`.
+- SWEETBOX image was unchanged (SHA-256 `e5fdbfdee21b3804415ded15a8138a3ab08cbe48c1c3a8abb2c3eca77703086c`).
+- Not booted.
+
+- 2026-11-13 16:30 (Claude) Codex built it (iOS 27.2 SDK, minos 26.0): outputs/guacamole-ios26-metal.img (kernel
+  has the Metal-26, migration-skip, AMFI 102, check-in fixes; maxvnodes ADT; args ios26-metal-boot-args-used.txt) and
+  outputs/ios26-metal-box.img (6 ROOT/ entries: bundle Info.plist, NativeAdrenoMetal, libvulkan_freedreno.dylib,
+  gpu-build.json, _CodeSignature/CodeResources, NativeAdrenoMetal.publish; 39 MB; box copies = bundle files by sha256).
+  New research/ios26/tools/check-imports.py DSC MACHO...: every non-weak import of both binaries resolves in the
+  23F84 cache (468 + 5848 imports, 0 missing; all load commands are cache images); exports cached in
+  dsc-arm64/exports.pickle. Both binaries carry no BRAA/BLRAA/RETAB words (lowered / built without).
+
+- 2026-11-13 16:35 (Claude) MISSING GPU WAIT (user asked): the GPU backend is ready ~95 s after boot (sweet_gpu.c
+  starts at sweetgpudelay=60 s), backboardd's Metal discovery opens the accelerator at ~20-40 s; the user client
+  refused ("SWEET MTL: GPU not ready: no client") and the plugin then returns nil for good. iOS 16 waited in
+  libsweet-bbd (sweetglwait 120 s), which the iOS 26 root does not have. FIX (source): SweetAccelerator.cpp
+  initWithTask waits for redwood_gpu_ready() up to sweetmtlwait s (default 150) when sweetgpu != 0, logging
+  "SWEET MTL: <proc> waits for the GPU" / "GPU ready". Included in research/ios26/xnu12377-metal26-kernel.diff.
+  Codex: rebuild the kernel only and re-wrap as outputs/guacamole-ios26-metal.img (same ADT, same boot args with a
+  fresh sweettime); the SWEETBOX image is unchanged (already on rawdump).
+
+- 2026-11-13 16:45 (Claude) metal image boot (16:38 photo): backboardd sat ~1 min (the GPU wait), then panic in
+  ReportCrash[278]: "vm_map.c:13413 Assertion failed: not_in_kdp" in vm_map_region_recurse_64 <- mach_vm_region_recurse
+  (symbolized with BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet.unstripped); then "debugger
+  synchronization failed, no stackshot", core 2 still in user mode. Reading: another CPU was taking a stackshot
+  (handle_debugger_trap sets not_in_kdp = 0) after DebuggerXCallEnter timed out waiting for SIGPdebug acks and went on
+  (stackshot proceeds on sync failure; dbgwrap cannot halt cores here), so CPU 0 kept running user calls. The ack
+  timeout is MACHINE_TIMEOUT debug-ack = 240000 ticks = 12.5 ms at our 19.2 MHz timebase: too short when a core has
+  interrupts masked for a while (likely candidates: the GPU bring-up at 60-95 s, CPU framebuffer copies).
+  Fix without a rebuild: ADT node /machine-timeouts {debug-ack = u64 19200000 (1 s)} (new tools/adt-addnode.py;
+  machine_timeout_init_with_suffix reads /machine-timeouts/<name>). ADT work/guacamole-ios26-debugack.adt
+  (= maxvnodes ADT + that node). Image outputs/guacamole-ios26-metal2.img = metal image with only the ADT
+  replaced, SHA-256 d73512bd0ad3809d0290a44691c50f7ab66d151d90e383e0a16e7c202980f81c. If it still panics this
+  way: find the core that holds interrupts masked (SIGPdebug not acked), or make SWEET stackshots abort on a sync
+  timeout (DebuggerXCallEnter) instead of proceeding.
+
+- 2026-11-13 16:55 (Claude) metal image log (user booted metal.img before metal2; power button blanks the screen):
+  big progress. Box already installed (SWEETDNE), migration plists "already there", AGXAccelerator published, Metal
+  discovery matches IOAcceleratorES -> AGXAccelerator, backboardd waited in the open ("waits for the GPU"), RedwoodGPU
+  up, "backboardd: GPU ready", Turnip opens type 0x4147 (16711), methods 1/15/17/2/3/13 work. Then EVERY first submit
+  fails: "method 5 failed: 0xe00002c2" (in 3104 bytes) -> device lost, backboardd and cameracaptured reopen in a loop.
+  Cause: ABI 2 is NOT identical to ours: NativeAdrenoAbiMaxBuffers is 128 there (16 here), so Submit is 32 + 24*128 =
+  3104 bytes (my earlier "same layouts" was wrong for this one record). FIX (source, needs a build):
+  SweetAccelerator.cpp Submit takes 416-byte (ABI 1) or 3104-byte (ABI 2) records, up to 128 buffers; sweet_gpu.c
+  sweet_gpu_submit_v2 takes up to 128 IBs (4 dwords each; ring 8192 dwords). Diff
+  research/ios26/xnu12377-metal26-kernel.diff (+ sweet_gpu.c one line). Also seen once: backboardd[63] SIGBUS at
+  far 0x1eafed7f4 (shared-cache read-only mapping, tag 35) from pc 0x119107f58 (outside the cache: plugin or Turnip),
+  right after Apple-style opens (types 0x4147xxxx, refused 0xe00002c2); the restarted backboardd did not repeat it.
+  Codex: rebuild the kernel, wrap with work/guacamole-ios26-debugack.adt (maxvnodes + debug-ack 1 s) as
+  outputs/guacamole-ios26-metal3.img, boot args unchanged (fresh sweettime). Box unchanged.
+
+- 2026-11-13 17:00 (Claude) metal3 boot: the same panic (ReportCrash, vm_map.c:13413 not_in_kdp in
+  mach_vm_region_recurse) even with debug-ack = 1 s in the ADT, and at panic time one core (core 1 now, core 2
+  before) is still in user mode while the others halted: some core does not take SIGPdebug at all, it is not slow.
+  No SWEET code touches not_in_kdp (checked: the sampler reads with vm_map_read_user). Mitigation (source, needs a
+  build): osfmk/arm/model_dep.c DebuggerXCallEnter, under ARM64_BOARD_CONFIG_SWEET, gives a timed-out STACKSHOT up:
+  takes back each SIGPdebug not yet taken (andnot on cpu_signal, so that core never enters DebuggerXCall), drops
+  debugger_sync/debug_cpus_spinning for it, DebuggerXCallReturn() to release the cores that did take it, returns
+  KERN_OPERATION_TIMED_OUT (handle_debugger_trap unlocks and the stackshot syscall fails). Logs
+  "SWEET DBG: stackshot sync timed out, cores 0x.. never took SIGPdebug" (first 20). Panics unchanged. Diff
+  research/ios26/xnu12377-stackshot-abort.diff. Root cause (an IPI that never lands on a core in user mode) still
+  open: the logged core masks say which.
+  Codex: rebuild (tree has every fix incl. the 128-buffer submit), wrap with work/guacamole-ios26-debugack.adt as
+  outputs/guacamole-ios26-metal4.img, same boot args, fresh sweettime. Box unchanged.
+
+- 2026-11-13 17:10 (Claude) metal4 log: SUBMITS WORK now (methods 5/6/8/14/4; backboardd, cameracaptured and
+  SpringBoard each hold 36-56 MB of GPU pool; SpringBoard opens Metal; framebuffer swaps 0.1-3.7/s). No SWEET DBG
+  lines (no stackshot timeout this boot). Blocker: backboardd dies ~30 s after each start with SIGBUS, far - slide =
+  0x1e8a857f4 both times (in the 23F84 cache's unmapped gap 0x1e745c000-0x1e945c000), then SpringBoard is killed.
+  Cause: NativeAdrenoMetalPlugin.mm pokes iPadOS 27 (24A446) QuartzCore addresses: slide = CARenderServerStart -
+  0x1846dce88, vm_write of 3 option values, and a backboardd thread that sleeps 30 s and reads
+  0x1e7021014 + slide (= exactly the fault). On 23F84 the slide is meaningless. FIX (plugin source, Mac tree
+  work/UniXNU/drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm): the whole block runs only when kern.osversion is
+  24A446. Diff research/ios26/adrenometal-24A446-guard.diff (backup *.before-24A446-guard).
+  Codex: rebuild the plugin only (same ios26.0 deployment, iOS 27.2 SDK), lower-macho.py (0 refused), check-imports
+  (research/ios26/tools/check-imports.py dsc-arm64 ...), repack outputs/ios26-metal-box.img the same way; the user
+  dd's it to rawdump again (overwrites SWEETDNE, so it reinstalls). Kernel stays metal4.
+
+  BUILD RESULT (2026-11-13 17:07): rebuilt only the plugin/bundle, keeping the iOS 26 deployment target and SDK 27.2.
+  `lower-macho.py`: plugin 0 refused; Turnip 0 refused. `check-imports.py`: plugin 468 imports, Turnip 5848;
+  zero missing dylibs or symbols. The ad-hoc signature verifies. Repacked `outputs/ios26-metal-box.img`
+  (6 files, 39,244,800 bytes), SHA-256 `57dfea4c9119692f0f57b41bf365ee848e2ae12579ea6ac5c1c0154b2284b2ed`.
+  Updated `outputs/NativeAdrenoMetal.imports.txt`, `outputs/libvulkan_freedreno.imports.txt`, and
+  `outputs/ios26-metal-plugin-check-imports.txt`. `outputs/guacamole-ios26-metal4.img` was not changed.
+
+- 2026-11-13 17:20 (Claude) plugin-guard boot (17:12 log): new box installed (6/6), GPU up (all 10 stages,
+  RedwoodGPU), backboardd/cameracaptured/SpringBoard/Setup all on Metal, NO backboardd crash; SpringBoard runs
+  (cover sheet logs), Setup.app launched; frames swap at ~8/s. Screen still the console: every swap took the CPU path
+  with "none" layers (gpu_skip[2]): our AppleCLCD parses SwapEnd as iOS 16's 0x46c record (ids at +0x54); iOS 26
+  sends 0x588 bytes (IOMobileFramebufferSwapEnd -> IOConnectCallStructMethod(5, swap+0x18, 0x588)) with the same
+  fields 0x48 later (from 23F84 IOMobileFramebuffer: SwapBegin stores the id at swap+0xb0 = rec+0x98, SwapSetLayer
+  ids at swap+0xb4 = rec+0x9c, rects rec+0xac/+0x10c, set/clear masks rec+0x14c/+0x150, flags rec+0x15c).
+  FIX (source): SweetFramebuffer.cpp kSweetFBSwapEnd folds a 0x588 record into the 0x46c layout (first 0x50 bytes,
+  then in+0x98 -> rec+0x50). Diff research/ios26/xnu12377-swap26.diff. Also seen: one "backboardd method 3 failed
+  0xe00002c2" (BoMap, once), SpringBoard "IOSurfaceSharedEventAddEventListener failed: 10000003".
+  Codex: rebuild the kernel, wrap with work/guacamole-ios26-debugack.adt as outputs/guacamole-ios26-metal5.img,
+  same boot args (fresh sweettime). Box unchanged (already installed).
+
+  BUILD RESULT (2026-11-13 17:16): kernel rebuilt successfully; log `work/xnu12377-metal5-build.log`. Wrapped with
+  `work/guacamole-ios26-debugack.adt` and the same boot arguments except refreshed `sweettime`; exact args are in
+  `outputs/ios26-metal5-boot-args.txt`. Image SHA-256
+  `a6237d38bd1801751a9eb43c23fd2e2ec1d9d82e613b54a417d00755a63767b2`. SWEETBOX unchanged
+  (`57dfea4c9119692f0f57b41bf365ee848e2ae12579ea6ac5c1c0154b2284b2ed`). Not booted.
+
+- 2026-11-13 17:30 (Claude) metal5 log: the 0x588 fold works (swap ids sane, SwapWait no longer times out, 72
+  swaps/s), but CoreAnimation sends EVERY swap with no surfaces: "swap N sets 0x1, off 0x1 ... surfaces 0 0 0 0"
+  (first: sets/off 0x80000007): IOMobileFramebufferSwapSetLayer with a NULL surface sets the layer's bit in both the
+  set and the clear mask (23F84 code at 0x228c5e290), i.e. CA disables its layers each frame: it has no framebuffer
+  surface to show. Also: one BoMap refused (0xe00002c2) in backboardd and cameracaptured at device creation ->
+  Turnip "BO init (VK_ERROR_OUT_OF_DEVICE_MEMORY)"; backboardd "Failed to set client property for:
+  AppleM2ScalerCSCDriver"; SpringBoard "IOSurfaceSharedEventAddEventListener failed: 10000003". Next: QuartzCore's own
+  log lines from the Persist tracev3 (research/ios26/tools/tracev3.py) to see why the render server has no surface.
+
+- 2026-11-13 17:45 (Claude) iOS's own log (Persist 4b, research/ios26/tools/tracev3.py): 101k "IOSurface creation
+  failed. IOSurface open failed", 53k QuartzCore "CAIOSurfaceCreate: failed to allocate IOSurface", and "IOSurface.
+  framework versus IOSurface.kext version mismatch": THE reason CoreAnimation has nothing to show. 23F84
+  IOSurface.framework (__iosConnectInitialize, 0x1b1c012c0): sel 13 with a 0x28-byte output, requires u16 +0x22 == 1
+  (our iOS 16 answer is 0x18 bytes, version at +0x16), else it closes the connection. And the lock result (sel 0
+  create / 4 lookup / 34 port lookup) is now 0xc68 bytes with 64-bit fields and 0x98-byte plane records (layout
+  from the 23F84 IOSurfaceClientGet* accessors; client copy at +0x70). FIX (source): SweetSurface.cpp answers sel 13
+  with the 0x28 layout when the caller asks for >= 0x28 bytes, and fills an iOS 26 lock result
+  (sweet_surface_fill_result26) when the output buffer is >= 0xc68; iOS 16 sizes keep the old layouts. Diff
+  research/ios26/xnu12377-iosurface26.diff. Codex: rebuild, wrap with work/guacamole-ios26-debugack.adt as
+  outputs/guacamole-ios26-metal6.img, same boot args (fresh sweettime). Box unchanged.
+
+  BUILD RESULT (2026-11-13 18:28): rebuilt xnu-12377 with the HID event layout change; `IOHIDEvent.cpo` recompiled.
+  Build log: `work/xnu12377-hid26-build.log`. Wrapped with `work/guacamole-ios26-debugack.adt` and metal6 boot
+  arguments, refreshing only `sweettime`; exact args are in `outputs/ios26-hid26-boot-args.txt`. Image
+  `outputs/guacamole-ios26-hid26.img`, SHA-256
+  `9f62e928eefc346db8a1eaadfd791dc506000ed8821ce32f4fae64568078a402`. SWEETBOX unchanged (SHA-256
+  `57dfea4c9119692f0f57b41bf365ee848e2ae12579ea6ac5c1c0154b2284b2ed`). Not booted.
+
+  BUILD RESULT (2026-11-13 17:31): kernel rebuilt successfully; build log `work/xnu12377-metal6-build.log`.
+  Wrapped with `work/guacamole-ios26-debugack.adt`, same boot arguments except refreshed `sweettime`; exact args
+  are in `outputs/ios26-metal6-boot-args.txt`. Image SHA-256
+  `8179e2fca82e01ca3a8fba1dd8c69fcf5de183a1d4fa63f3a58183c03246baf4`. SWEETBOX was not changed
+  (SHA-256 `57dfea4c9119692f0f57b41bf365ee848e2ae12579ea6ac5c1c0154b2284b2ed`). Not booted.
+
+- 2026-11-13 18:40 (Claude) metal6 BOOTS TO UI (user), buttons work, touch does not. Log: the panel works
+  (`SWEET HID: touch 0 down at 634,1620` etc.), backboardd opened SweetHIDTouch's IOHIDEventServiceUserClient,
+  so the kernel delivers touches and backboardd discards them. Cause (23F84 IOKit.framework): the event-service
+  queue is read by 0x197e52e40 -> _IOHIDEventCreateWithBytesInternal (no conversion), and iOS 26 stores
+  Translation/Digitizer/Pointer events with DOUBLE coordinates: Digitizer 0xa0 bytes (ours 0x68), Translation
+  0x28 (0x1c), Pointer 0x30 (0x20). Only the public _IOHIDEventCreateWithBytes converts old records (converter at
+  0x197e8ec04; type check 0x197e8bc70 = types 4/0xb/0x11). Keyboard records are unchanged, hence buttons work.
+  New digitizer layout: +0 size, +4 type, +8 options (low 20 bits), +12 depth/res, +16/+24/+32 x/y/z (double),
+  +40 index/transducerType/identity/eventMask/childEventMask/buttonMask (u32 x6), +64 pressure, +72 auxPressure,
+  +80 twist (double), +88 orientationType, +96.. orientation doubles (tilt 2, polar/quality 6), +144
+  generationCount+willUpdateMask, +152 didUpdateMask. FIX (source): IOHIDEvent.cpp getLength/appendBytes/
+  createBytes write these layouts (integer-only IOFixed->double; 0x80000000 -> NaN as IOKit does). Boot-arg
+  `sweethidabi=16` = old layouts. Diff research/ios26/xnu12377-hid26-events.diff (backup
+  research/ios26/IOHIDEvent.cpp.before-hid26). Codex: rebuild, wrap with work/guacamole-ios26-debugack.adt as
+  outputs/guacamole-ios26-hid26.img, same boot args as metal6 (fresh sweettime). Box unchanged.
+
+- 2026-11-13 18:50 (Claude) hid26 booted (sweethidabi string present), still no touch. iOS log Persist 4d (pulled via
+  catalog: outputs/ios26-trace-4d.bin; decoder fix: main-exe tracepoints (flags&0xe==2) carry 4 extra bytes before
+  the items, see /tmp tv2 change, args then decode; backboardd format strings from research/ios26/os-root.tar
+  usr/libexec/backboardd). backboardd sets the touch screen up fully: "digitizer attached (sender 0x10000014C)
+  ... SweetHIDTouch ... builtIn: YES", "*** acquired main display digitizer", BKDirectTouchState touchScreen
+  builtin, SpringBoard touch stream, modes pocketTouchesExpected / wakeOnTouch sent to the service. No error lines
+  for the touches. backboardd reads event field 0xB0019 (DigitizerIsDisplayIntegrated) from each digitizer event
+  and copies it into the touches it delivers (0x10000eb08 -> obj+206, then 0x10000465c/0x100005cd8); we never set
+  it (only the service property). FIX (source, test): SweetHID.cpp sets IsDisplayIntegrated=1 on the collection
+  and on every finger child, as IOHIDEventDriver does for touch screens. Diff
+  research/ios26/xnu12377-touch-displayintegrated.diff. Codex: rebuild on top of hid26, wrap as
+  outputs/guacamole-ios26-hid26b.img, same boot args (fresh sweettime). Box unchanged.
+  (Claude, second look at the same log, 19:00) Confirmed the source above is in the tree (nothing else changed).
+  If hid26b still has no touch, next suspect: with the display on, backboardd only ever sends the touch service
+  mode "pocketTouchesExpected" (1), never a normal mode; SpringBoard keeps "pocketTouches" in its UISensor request
+  because nothing reports a pocket state (no proximity/ALS service; CoreMotion "[CLIoHidInterface] Service ... is
+  not ready" x33). Next step then: a proximity HID service reporting "no object" (or info-level backboardd logs).
+
+- 2026-11-13 19:02 (Codex) hid26b still has no touch. Test implementation: `SweetHIDProximity` now publishes a HID
+  human-proximity sensor (usage page 0x20, usage 0x12) and sends a zero-detection, level-0 proximity event on start
+  and once per second. This is intended to represent no object near the screen; whether iOS 26 CoreMotion consumes
+  this HID event as the pocket-state input still needs device testing. Added its IOResources personality in
+  `KernelConfigTables.cpp`. Kernel build succeeded (build log `work/xnu12377-hid26c-proximity-build.log`); image
+  `outputs/guacamole-ios26-hid26c-proximity.img`, based on `work/guacamole-ios26-debugack.adt` and the hid26b boot
+  arguments with fresh sweettime. Kernel SHA-256 `19476cbf1952fa7b1d785e4c1c1f2155263f7691fae868f8236c6b789aeb0097`,
+  image SHA-256 `dd7b1be71c132d4e5ec4c0a14b9607fd642a90ac18c175c3e58f1d12b3cc268e`. SWEETBOX unchanged (hash
+  `57dfea4c9119692f0f57b41bf365ee848e2ae12579ea6ac5c1c0154b2284b2ed`). Not booted. After test, check for
+  `SWEET HID: no-object proximity sensor registered` and whether touch now reaches SpringBoard; if not, inspect
+  backboardd/CoreMotion logs to confirm the sensor match/consumption rather than assuming proximity was causal.
+
+- 2026-11-13 19:10 (Claude) Proximity is a guess: backboardd only SETS a mode property on the touch service; no log
+  line shows it dropping touches for pocket mode. To see what backboardd does with the touches, new SWEETBOX
+  outputs/ios26-logprefs-box.img (2048 bytes, SHA-256 bda76a97185d790a68458ce06df1ab8d2d2a1641a09e969a10c9bf81ddb7120e):
+  ROOT/Library/Preferences/Logging/Subsystems/{com.apple.BackBoardServices,com.apple.backboardd,com.apple.iohid,
+  com.apple.UIKit}.plist = DEFAULT-OPTIONS Level Enable/Persist Info (source outputs/ios26-logprefs/level.plist), so
+  info-level touch messages (e.g. backboardd "%llX ignoring touch event ... prevHadTouches/nowHasTouches") reach
+  Persist. Test plan: flash this box + boot hid26c-proximity, tap/swipe, then pull kernel log + catalog + newest
+  Persist. Undo: delete those 4 plists (or a box with empty files at the same paths).
+
+- 2026-11-13 19:35 (Claude) hid26c-proximity + logprefs box booted (box installed 4/4, proximity sensor opened by
+  backboardd; backboardd logs "Proximity [locked]: (<none>) sender:100000145" so prox events ARE received; mode still
+  pocketTouchesExpected). 73 touch-downs in the kernel log, but in Persist 50 (info level on) backboardd logs
+  NOTHING per touch: no "%llX ignoring touch event" (default level, os_log type 0, backboardd 0x10000f3a0), no
+  touch processor activity for sender 0x100000144; button events log "0xC/0x30 began/finished". So digitizer
+  events never reach BKHIDDirectTouchEventProcessor. (eventsDisabled/"disabled by policy: SpringBoard" lines are the
+  mouse-pointer display link, not touch.) Open question: are they read from the kernel queue at all?
+  DIAGNOSTIC (source): SweetHID touch down/up line now appends, per open client, the queue head/tail after the event,
+  notifications sent, events enqueued, enqueue failures and open state:
+  "SWEET HID: touch 0 down at x,y [q h=.. t=.. notes=.. ev=.. drop=.. st=..]". head following tail on the next line
+  = backboardd drains the queue (then a userland filter drops them); head stuck = it never reads (notification /
+  port problem). Files: IOHIDEventServiceQueue.h (sweetStats), IOHIDEventServiceUserClient.h/.cpp
+  (sweetQueueStats), SweetHID.cpp. Diff research/ios26/xnu12377-hid-qstats.diff (backups *.before-qstats).
+  Codex: build on top of hid26c-proximity, wrap as outputs/guacamole-ios26-hid26d.img, same boot args (fresh
+  sweettime). Box: leave rawdump as is (SWEETDNE).
+
+- 2026-11-13 19:45 (Claude) hid26d log: backboardd DRAINS the touch queue (each line's head = previous tail, 352-byte
+  entries = 0x1c header + 2 x 0xa0 digitizer records, notes = events, drop=0). So the kernel side is done; the touch
+  is lost inside backboardd/IOKit after dequeue. backboardd's error-level drop messages ("ignoring digitizer event
+  from non-digitizer sender" 0x10001465c, "... from unsupported service" 0x1000147cc, both os_log type 0x10) and
+  the default-level "ignoring touch event" never appear; "touch %X sent to destination pid" is DEBUG (type 2).
+  The 19:10 logprefs box used the wrong subsystem names: Persist catalog shows backboardd logs under
+  com.apple.BackBoard (and com.apple.backboard.hid). New box outputs/ios26-logprefs2-box.img (1536 B, SHA-256
+  e78e0cd4bdcb5ed592127b3181a54d46cd33554050630f3634e08c850cf2f2ae): com.apple.BackBoard, com.apple.backboard.hid,
+  com.apple.iohid at Enable/Persist Debug (outputs/ios26-logprefs/debug.plist). Same hid26d kernel.
+
+- 2026-11-13 20:10 (Claude) ROOT CAUSE (likely) of no touch: the iOS 26 queue record format. Debug logs (Persist
+  51/52, BackBoard at Debug) show backboardd's direct-touch processor never logs a single contact (no "new contact
+  for pathIndex", no "ignoring touch event"), while the queue is drained. IOHIDEventServicePlugin (userland side of
+  our IOHIDEventServiceUserClient; /System/Library/HIDPlugins/ServicePlugins) dequeues each entry and calls
+  _IOHIDEventCreateWithBytesInternal (IOKit 0x197e52518 -> 0x197e51ff4 with flag w3=0). With w3=0 the loop re-reads
+  a 0x1c-byte IOHIDSystemQueueElement header before EVERY event record (cbz w3 -> 0x197e52058: x22 = bytes+off,
+  attributeLength [x22+20], record at off+0x1c+attr); only the legacy public reader (w3=1) skips headers after the
+  first. Children are attached by the depth byte (+12). Our kernel writes one header then contiguous records, so
+  the finger child is parsed as a header (garbage attributeLength -> loop exits): backboardd gets a hand
+  collection with NO fingers. Keyboard/proximity events are single records, hence they work.
+  FIX (source): IOHIDEvent::sweetAppend26 writes header+record per event (children inherit the root senderID when
+  theirs is 0, same eventCount), getLength counts a header per child, readBytes/createBytes use it, appendChild sets
+  child depth = parent depth + 1 (all only when sweethidabi >= 26, the default). Diff
+  research/ios26/xnu12377-hid26-perevent.diff (backups IOHIDEvent.{h,cpp}.before-perevent). Queue diagnostic stays.
+  Expected: queue entries for a 1-finger event become 2 x (0x1c + 0xa0) = 376 bytes (+4 entry header).
+  Codex: build on top of hid26d, wrap as outputs/guacamole-ios26-hid26e.img, same boot args (fresh sweettime).
+  Box unchanged (debug logging prefs stay installed; remove later).
+  RESULT (user, 19:48): hid26e TOUCH WORKS on iOS 26; Setup completed normally on the device (no skip needed).
+  Cleanup box outputs/ios26-logprefs-off-box.img resets the 6 logging plists from the 19:10/19:45 boxes to
+  Enable/Persist Inherit (source outputs/ios26-logprefs/inherit.plist).
+
+- 2026-11-13 20:30 (Claude) Identity -> iPhone 14 Pro (user: Settings still says iPhone X). tools/mkadt.py gains
+  `--identity d73` (default d22 = unchanged output, verified byte-identical apart from the random seed):
+  root compatible/model/target D73AP / iPhone15,2 / D73 (hw.model, hw.machine, MobileGestalt ProductType ->
+  marketing name), /product + /product/{audio,haptics} taken from the real D73AP tree (artwork-display-gamut still
+  forced to sRGB), /arm-io/disp0 canvas 1179x2556 (393x852 pt @3x, the 14 Pro's; panel aspect matches). chip-id,
+  ECID and /chosen/manifest-properties are NOT changed: IOPlatformUUID (ByHost prefs, the kernel's migration-skip
+  ByHost plist A9683613-...) derives from chip-id + ECID. mkadt prints the /product keys it used to stderr.
+  Needs research/ios26/d73ap.adt: the IPSW's DeviceTree.d73ap.im4p was extracted to
+  research/ios26/DeviceTree.d73ap.im4p; its payload is LZFSE (bvx2) and the VM has no decoder
+  (research/ios26/d73ap.adt.lzfse = raw payload). Codex (Mac):
+    ipsw img4 im4p extract research/ios26/DeviceTree.d73ap.im4p -o research/ios26/d73ap.adt
+    (or: compression_tool -decode -a lzfse -i research/ios26/d73ap.adt.lzfse -o research/ios26/d73ap.adt)
+    python3 tools/mkadt.py work/guacamole-ios26-d73-base.adt --highmem --guacamole --identity d73   (save stderr)
+    python3 tools/adt-addnode.py work/guacamole-ios26-d73-base.adt work/guacamole-ios26-d73.adt machine-timeouts \
+        debug-ack=u64:19200000        (same node as work/guacamole-ios26-debugack.adt; check adt-addnode usage)
+  Wrap the hid26e kernel with work/guacamole-ios26-d73.adt as outputs/guacamole-ios26-d73.img, hid26e boot args
+  (fresh sweettime). Box unchanged. Fallback = hid26e image (iPhone X ADT).
+  If Settings still says iPhone X (stale MobileGestalt cache): outputs/ios26-mgcache-reset-box.img overwrites
+  .../systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist with an empty plist so
+  MobileGestalt rebuilds it. Risks: device-specific D73 configs (camera/audio plists keyed by product) may now be
+  picked; Dynamic Island UI may draw at the top.
+
+- 2026-11-13 20:45 (Claude) User wants DataMigration back (home screen has only Settings and Phone: system apps are
+  registered by the migration plugins, which the kernel's migration skip suppresses; same as iOS 16 v14 "a few apps").
+  Box outputs/ios26-migrate-box.img (3584 B, SHA-256 41ecaaf7c78d5a76cae0ac413d08a17843f836d067985954bc44db01ec73b5cf):
+  overwrites /private/var/mobile/Library/Preferences/com.apple.migration.plist and both ByHost
+  com.apple.migration.A9683613-...(upper/lower).plist with an empty plist (no LastSystemVersion -> migration runs
+  once), plus the 6 logging plists back to Inherit (replaces ios26-logprefs-off-box.img).
+  Kernel: boot-arg sweetmigrate=1 (bsd_init leaves migration alone, does not rewrite LastSystemVersion). Args are
+  at 603/607, so drop sweetsample=backboardd,SpringBoard and add sweetmigrate=1. Codex: wrap the hid26e kernel
+  twice: outputs/guacamole-ios26-hid26e-migrate.img (work/guacamole-ios26-debugack.adt) and, if the d73 ADT is
+  built, outputs/guacamole-ios26-d73-migrate.img (work/guacamole-ios26-d73.adt); same args otherwise, fresh
+  sweettime. After migration has finished once, go back to images WITHOUT sweetmigrate=1 (the kernel then writes
+  LastSystemVersion only if it is missing, so later boots do not migrate again).
+  Build result (2026-11-13 19:23): diagnostic sources were already present; the first compile exposed that
+  IODataQueueMemory is forward-declared in IODataQueue.h, so queue field access needs IODataQueueShared.h included
+  in IOHIDEventServiceQueue.h. Added that include; rebuild succeeded. Image SHA-256
+  `de9f61f4798250ea01a9933758262b89fc6ac7c070c651978bd45b9021b67e94`, kernel SHA-256
+  `3bb88098ac8eee9782128282cad02249c36f4450fb659d972a3d1f1f05cb76b2`; build log
+  `work/xnu12377-hid26d-qstats-build.log`, boot args `outputs/ios26-hid26d-boot-args.txt`. SWEETBOX unchanged,
+  SHA-256 `57dfea4c9119692f0f57b41bf365ee848e2ae12579ea6ac5c1c0154b2284b2ed`. Not booted.
+  Build result for hid26e (2026-11-13 19:44): the per-event serialization changes were already present in
+  IOHIDEvent.h/.cpp; kernel rebuild succeeded. Image SHA-256
+  `64f537150be5a5827d124faea25cb3428b62402a3905616a08550cbf103281fa`, kernel SHA-256
+  `39493f99cc6b73e96e3bbb03ad3c6f5c10a7cdd8dabb5d56cdde23ac89d694e6`; build log
+  `work/xnu12377-hid26e-perevent-build.log`, args `outputs/ios26-hid26e-boot-args.txt`. SWEETBOX unchanged,
+  SHA-256 `57dfea4c9119692f0f57b41bf365ee848e2ae12579ea6ac5c1c0154b2284b2ed`. Not booted.
+  Build result for D73 identity image (2026-11-13 19:56): decoded `research/ios26/DeviceTree.d73ap.im4p` to
+  `research/ios26/d73ap.adt`; generated `work/guacamole-ios26-d73-base.adt` with `--identity d73` and saved mkadt
+  stderr to `research/ios26/d73ap-mkadt.stderr.txt`; added the `machine-timeouts/debug-ack=19200000` node as
+  `work/guacamole-ios26-d73.adt`. Wrapped the existing hid26e kernel with refreshed arguments in
+  `outputs/guacamole-ios26-d73.img`. Image SHA-256 `1c1e7e860ca4483f03c68c48ceb3b99f103738fb627602fb625e3c05532db39f`,
+  ADT SHA-256 `3be35b39a515cbdba26a7b686ea311badf097934e4793f9400c1c799eb059398`, kernel SHA-256
+  `39493f99cc6b73e96e3bbb03ad3c6f5c10a7cdd8dabb5d56cdde23ac89d694e6`; boot args
+  `outputs/ios26-d73-boot-args.txt`. SWEETBOX unchanged (hash above). Not booted.
+
+  Build result (2026-11-13 19:57): wrapped the existing hid26e kernel in both requested ADTs. Boot arguments
+  are in `outputs/ios26-migrate-boot-args.txt`; removed `sweetsample=backboardd,SpringBoard`, added
+  `sweetmigrate=1`, and refreshed `sweettime=1794617856`. iPhone X ADT image
+  `outputs/guacamole-ios26-hid26e-migrate.img`, SHA-256
+  `9648158f4caeb9c2a4885cace187bda9b5bdd6dd14d04c73977d42488508c306`; D73 ADT image
+  `outputs/guacamole-ios26-d73-migrate.img`, SHA-256
+  `809033c1ab2f2a50c2f17eb7b717181ea684f961436539b63a62ae71861b30b3`. Kernel SHA-256
+  `39493f99cc6b73e96e3bbb03ad3c6f5c10a7cdd8dabb5d56cdde23ac89d694e6`. SWEETBOX unchanged
+  (`57dfea4c9119692f0f57b41bf365ee848e2ae12579ea6ac5c1c0154b2284b2ed`). Not booted.
+
+  Follow-up mailbox (2026-11-13): combined the 9 entries from `ios26-migrate-box.img` with the MobileGestalt
+  cache reset from `ios26-mgcache-reset-box.img`, so a single rawdump flash can trigger first-boot migration and
+  clear the stale iPhone X identity cache. `outputs/ios26-migrate-d73-box.img` (10 entries, 3584 bytes), SHA-256
+  `144b3f978635172fd80f9f6a878a9a9adeaa29e887f7e821a7160e93408ac4ac`. Use with the D73 migration boot image;
+  this mailbox does not include or alter the installed Metal bundle.
+
+# Pending (same build) — iOS 26 skip first-boot data migration (2026-11-13 15:50)
+
+lwcr image boot (log 15:44): no backboardd/familycircled aborts (op 102 fix works). backboardd main thread idle
+in its run loop, ~10 swaps/s (render thread in IOMobileFramebufferSwapWait, SwapWait timing out), but its t3 is in
+DataMigration _DMPerformMigration -> sync XPC to datamigrator, and SpringBoard sits in _FBSystemShellInitialize
+(BKSSystemShell check-in) waiting for it: the iOS 16 first-boot migration wait (hours on one CPU, NOTES 2026-10-17
+v10-v12). User chose the fallback: skip it.
+FIX (source, needs a build), research/ios26/xnu12377-migration-skip.diff (backups *.before-migration):
+- bsd/vfs/vfs_syscalls.c: sweet_create_file_path() (vnode_open O_CREAT|O_EXCL, vn_rdwr, owner/mode via
+  vnode_setattr) and sweet_read_file_path().
+- bsd/kern/bsd_init.c (after the container mkdirs, before launchd): reads ProductBuildVersion from
+  /System/Library/CoreServices/SystemVersion.plist (fallback 23F84), removes /private/var/datamigrator/migrate
+  (sentinel), writes {LastSystemVersion: <build>} XML plists, 501:501 0600, to
+  /private/var/mobile/Library/Preferences/com.apple.migration.plist and ByHost/com.apple.migration.<IOPlatformUUID
+  A9683613-3704-53F2-95D0-98A8FB574E78, upper and lower>.plist; an existing file without LastSystemVersion is
+  replaced. Prints "SWEET root: ... LastSystemVersion <build>: written/already there/failed (errno)".
+  Boot-arg sweetmigrate=1 leaves migration alone.
+Codex: build (tree also has the mach_port.c and AMFI op 102 fixes), wrap with work/guacamole-ios26-maxvnodes.adt as
+outputs/guacamole-ios26-migrated.img, boot args = outputs/guacamole-ios26-nogpu-boot-args.txt (refresh sweettime).
+Expect the SWEET root lines, backboardd without a DataMigration thread, SpringBoard past _FBSystemShellInitialize.
+Then the open question is rendering: swaps carry no layers yet ("display-time samples ... 0 frames"); iOS 26 has
+no Metal device here and no software GL.
+
+BUILD RESULT (2026-11-13 15:50): kernel built successfully; `vfs_syscalls.o` and `bsd_init.o` recompiled,
+including migration skip plus the existing XPC and AMFI fixes. Build log `work/xnu12377-migrated-build.log`.
+Kernel SHA-256 `b29044d202df05187b74a0b0a83f3a5cc70d5f77a84d939edf49863d8f0bdabc`. Packaged with
+`work/guacamole-ios26-maxvnodes.adt` and no-GPU arguments, refreshed `sweettime=1794603002`. Image
+`outputs/guacamole-ios26-migrated.img`, SHA-256
+`0767b4e195c921be3d5cd67705437fabc21152928c667b0e7ff57554feae5f91`; exact arguments saved in
+`outputs/guacamole-ios26-migrated-boot-args.txt`. Not booted yet.
+
+# Previous handoff — iOS 26 AMFI LWCR match (op 102) (2026-11-13 15:45)
+
+nogpu boot log (sweetgpu=0, sweetaccel=0, sweetbacklight=0): backboardd now goes past the AGXAccelerator query
+and draws (FB: 2 swaps), but aborts every ~minute (pids 63, 330, 368, 401, 444): libxpc
+xpc_peer_requirement_match_received_message assertion "matched == (match_result.error_code == AICMR_MATCH)",
+called from LightSourceSupport (_LSSStartServer) when powerd connects. Same crash as familycircled. SpringBoard
+waits in _FBSystemShellInitialize on the backboardd check-in (BackBoardServices) and never gets further.
+Cause: libxpc +0x3bb8c calls __mac_syscall("AMFI", 102, {audit_token[32], u64 lwcr, u32 size, u64 out,
+u32 out_size=1028}) with a zeroed out; our AMFI returned ENOSYS -> "not matched" with error_code 0 -> abort.
+FIX (source, needs a build): bsd/kern/sweet_amfi.c answers op 102 with error_code 0 = AICMR_MATCH (every
+requirement matches; no CoreEntitlements evaluator). Diff research/ios26/xnu12377-amfi-lwcr-match.diff (backup
+research/ios26/sweet_amfi.c.before-lwcr). Ops 103/104 (no args) stay ENOSYS.
+
+Codex: build (Build reference command; tree also has the mach_port.c check-in fix), wrap with ADT
+work/guacamole-ios26-maxvnodes.adt (kern.maxvnodes 65536; tools/mkadt.py now emits it) as
+outputs/guacamole-ios26-lwcr.img, boot args = outputs/guacamole-ios26-nogpu-boot-args.txt (refresh sweettime).
+Expect: no backboardd/familycircled aborts, SpringBoard past _FBSystemShellInitialize, screen drawn by the CPU.
+
+BUILD RESULT (2026-11-13 15:39): built successfully; `sweet_amfi.o` recompiled and kernel linked. Log:
+`work/xnu12377-lwcr-build.log`. Kernel SHA-256:
+`64b49cfb05799887b87b5f2535062e7092e36d24078ac2cd210dc8414685a80e`. Packaged with
+`work/guacamole-ios26-maxvnodes.adt` (SHA-256
+`f529ccfdcb3cd4afd09d8e52c6a1fe26d83e2ab04b2066cd4e6388d5ad910daf`) and no-GPU args, refreshing
+`sweettime` to `1794602349`. Image `outputs/guacamole-ios26-lwcr.img`, SHA-256
+`17025976561df9081dc770bc4be70a1a8230ec85bda5ec7d8f368e325cb7b21d`; args saved in
+`outputs/guacamole-ios26-lwcr-boot-args.txt`. Not booted yet.
+
+# Previous handoff — iOS 26 XPC check-in fix (2026-11-13 15:10)
+
+ROOT CAUSE of the black screen / lsd / containermanagerd chain (from iOS's own log, Persist tracev3, read with
+the new research/ios26/tools/tracev3.py using our dyld cache for format strings): libxpc logged 78,000x
+"[%p] Failed to verify check-in connection port was derived from the listener connection port (kr=46, ...)"
+and "Bogus check-in attempt. Ignoring." kr 46 = KERN_NOT_SUPPORTED from mach_port_is_connection_for_service()
+(libxpc ___xpc_connection_set_logging+0x2398 accepts only 0 or 20): xnu-12377 returns NOT_SUPPORTED when no
+mach_msg filter callbacks are registered (the Sandbox kext does that; we have none). So every check-in to a
+new-style XPC listener is dropped -> clients get XPC_INTERRUPTED_REPLY = container error 52 (appprotectiond,
+deviceaccessd, ManagedSettings "Error: 52", mobileactivation, lsd "Could not get user container URL") ->
+lsd abort loop -> runningboardd stuck -> backboardd/SpringBoard stuck. iOS 16's libxpc never called this.
+
+FIX (source edited, needs a build): osfmk/ipc/mach_port.c, under SWEET the early KERN_NOT_SUPPORTED return
+is skipped; without callbacks service ports have no sandbox label (ipc_service_port.c allocates one only with
+callbacks), so the function answers KERN_SUCCESS, filter_policy_id 0. Also includes
+<pexpert/arm64/board_config.h>. Diff: research/ios26/xnu12377-connport-nofilter.diff (backup
+research/ios26/mach_port.c.before-sweet-connport).
+
+Codex: build with the Build reference command, wrap as outputs/guacamole-ios26-xpcfix.img, boot args =
+outputs/guacamole-ios26-swrender-boot-args.txt (cpus=8, sweetmtl=0, sweetsample=backboardd,SpringBoard;
+refresh sweettime). Expect: no lsd/appprotectiond/deviceaccessd/ManagedSettingsA/mobileactivation crash loops,
+"HID clients" > 0, and SpringBoard drawing (CPU path). If the screen stays black but HID clients > 0,
+next is rendering (no Metal device on iOS 26).
+
+- 2026-11-13 15:20 (Claude) xpcfix boot photo: screen fills with "vnode: table is full, 1024 desired, 1025
+  numvnodes, 0 free, 1 dead". MASTER.arm64.sweet is <xsmall>, CONFIG_VNODES=1024 caps desiredvnodes
+  (unix_startup.c bsd_startupearly: sane_size/64K+1024, clipped to CONFIG_VNODES) unless the ADT /defaults
+  has kern.maxvnodes (PE_get_default, not clipped). iOS 26 opens far more files than iOS 16 did. Fix without a
+  rebuild: ADT /defaults kern.maxvnodes = 65536 (new tools/adt-addprop.py; tools/mkadt.py now emits it too).
+  Image outputs/guacamole-ios26-maxvnodes.img (xpcfix image with only the payload ADT replaced: +40 bytes,
+  fits the ramdisk page padding, header ramdisk_size and payload adt_size updated), SHA-256
+  26687fb7b83d0783e69652d633721947537f37b252c36cf712f28f2a344de8e7, ADT work/guacamole-ios26-maxvnodes.adt,
+  boot args = xpcfix's. familycircled also asserted (matched == (match_result.error_code == ATCMR_MATCH)):
+  separate, later.
+- 2026-11-13 15:24 (Claude) maxvnodes boot photo: no vnode messages, lsd[110] stays up (XPC fix works).
+  backboardd now reaches CoreBrightness: matches backlight-control (our AppleARMBacklight, 0197, iPhone X
+  backlight props) -> SIGSEGV in CoreBrightness +0x169924 (ldr s0,[x8] with x8 = [obj+72] = NULL: a brightness
+  curve array the iPhone X property set does not give iOS 26; called from +0x165298 after setting obj+1300..1320
+  defaults). SpringBoard exits -1 after backboardd dies. Test image outputs/guacamole-ios26-nobl.img = maxvnodes
+  + sweetbacklight=0 (payload cmdline), SHA-256 c36c6467b5c6d186c0b5ff7765fd059a479f513550b4952064308fcf721d82d9.
+  If OK: later give AppleARMBacklight the iPhone15,2 (iOS 26-era) backlight props. Other: familycircled asserts in
+  libxpc xpc_peer_requirement (LWCR match: "matched == (match_result.error_code == AICMR_MATCH)") -> our AMFI
+  answers the code-requirement match inconsistently; lsd's "denied attempt to escape CPU monitor" is harmless spam.
+- 2026-11-13 15:29 (Claude) nobl boot: no backboardd crash; it opens the framebuffer (display on, sel 12/79/6/27/
+  17/84/50), opens IOCoreSurfaceRoot, then repeatedly matches IOProviderClass AGXAccelerator -> none (iOS 26 looks
+  for Apple's GPU class, not IOAcceleratorES; sweetmtl=2 would not help). User asked to disable the GPU entirely:
+  outputs/guacamole-ios26-nogpu.img (nobl + sweetgpu=0, sweetfbgpu=0, sweetaccel=0; iOS 16-only sweetgl/sweetglfn/
+  sweetbbd/sweetglwait dropped for room), SHA-256 956b069c0e0b771f2bf0701826e7f7ea4ca93df8191ecfd5637d4ae5623688d0.
+  Still samples backboardd,SpringBoard: pull the log after 5+ min.
+
+BUILD RESULT (2026-11-13 15:12): built successfully from `work/xnu-12377` (the `mach_port.o` compile
+completed; build log `work/xnu12377-xpcfix-build.log`). The environment's `sysctl hw.ncpu` was denied, so the
+known working `-j4` command was used with `SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)` and
+`KERNEL_SDKROOT=$PWD/BUILD/sdk-ios26`; no compile/link errors. Kernel:
+`work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256
+`e357eddaf14a6dd83d1b239a7d20f28a4da9e3f26d8c8764cc77308d23098d6e`. Packaged using current
+`work/guacamole-ios26-manifestprops.adt` (SHA-256 `afc074eb54f2827ae824e7ac6a30d89a011c087a121a01363fdbd86ef3f13ea8`),
+`dtb/android-boot_a.img`, and `shim/out/shim-guacamole.Image`. Image
+`outputs/guacamole-ios26-xpcfix.img`, SHA-256
+`9dbc6eb067bdf0e3a611a1c91f1304bd83e3f596d2c5450992751dc306b65e9b`; boot args copied to
+`outputs/guacamole-ios26-xpcfix-boot-args.txt` with `sweettime=1794600758`. Not booted yet.
+
+# Previous handoff — iOS 26 SMP trial images (2026-11-13)
+
+- Built the current xnu-12377 kernel with the SMP port and retained container-directory creation, process-exit
+  diagnostics, dyld pager, decmpfs, and quiet HID changes. Build log: `work/xnu12377-smp-build.log`.
+  Kernel SHA-256: `34a6a2113c37781320dbca27015e8f91b005c60eb451dfcdb8f8b052ac824aa9`.
+- Built two images from `work/guacamole-ios26-manifestprops.adt` and the umsample image's boot args, refreshing
+  `sweettime` and keeping `sweetsample=usermanagerd,containermanager`:
+  * Try first: `outputs/guacamole-ios26-smp-cpus8.img` (`cpus=8`), SHA-256
+    `ec76a8e2384036d0931b3b4b7e561e02ee56777b30f1dc77b4de24f09463efee`.
+  * Fallback: `outputs/guacamole-ios26-smp-cpus4.img` (`cpus=4`), SHA-256
+    `c3a10bdd6eb8232c1919c18880f898562562d65f3897fb9a55612bdf4e34c3e1`.
+- Exact args: `outputs/guacamole-ios26-smp-cpus8-boot-args.txt` and
+  `outputs/guacamole-ios26-smp-cpus4-boot-args.txt`. Both preserve `bingrade=0x100000c:2` and `ufsroot=ios26`.
+- Not booted yet. On the 8-core trial, look for `SWEET CPU: cpu=N ... PSCI CPU_ON ... rc=0`,
+  `came alive; SGI1 OK`, and `SWEET CPU: 8 CPU(s) running`; if it fails, use the 4-core image.
+
+# Previous handoff — iOS 26 container directories + process-exit diagnostics (2026-11-13)
+
+- Rebuilt with SWEET early-boot creation of `/private/var/containers` and its Bundle, Data/System,
+  Shared/SystemGroup, and Temp subdirectories. The prior `kern_exit.c` exit and SIGKILL-reason logging remains
+  included, along with the dyld pager, decmpfs, and quiet HID changes. Build log:
+  `work/xnu12377-containers-exitlogs-build.log` (`vfs_syscalls.o`, `bsd_init.o`, and `kern_exit.o` recompiled).
+- Image: `outputs/guacamole-ios26-containers-manifestprops.img`, SHA-256
+  `5d17a34c6b6889b526339efe0c0858bdd7c3a7e6b7485058e0380a1eb14518be`. Kernel SHA-256:
+  `aaed84c4f08d7f4db0d8fe256ba36b51d6804e3404790bd5e3341547355a6376`.
+- Packaged with `work/guacamole-ios26-manifestprops.adt` and the previous image's boot settings, refreshing
+  `sweettime` only. This keeps `cpus=1`, `bingrade=0x100000c:2`, `ufsroot=ios26`, and the `sweetnull` list.
+  Exact args: `outputs/guacamole-ios26-containers-manifestprops-boot-args.txt`.
+- Not booted yet. The container directory creation logs only failures as `SWEET root: mkdir ...`; check whether
+  container-related daemon failures change. The extra `EXIT` lines remain available for diagnosis.
+
+- 2026-11-13 03:30 (Claude) persistent log pulled (outputs/ios26-log.txt; ring at the end of ios26 =
+  block 12057599 of sda21, 1025 blocks). containermanagerd_system and containermanagerd both start ("SWEET
+  Sandbox: containermanager op 15/16", AKS sel 0/17) and then never print, exit or crash; clients still get
+  XPC_INTERRUPTED_REPLY. Their own diagnostics only go to os_log. Root-side change, no kernel build:
+  /System/Library/xpc/launchd.plist (the unsecure cache launchd loads; HFS+ extent block 593283, 556 blocks,
+  2,274,643 bytes) re-written with plistlib, padded to the same size (zeros between objects and the offset
+  table, trailer offset adjusted): both containermanagerd jobs get EnvironmentVariables OS_ACTIVITY_DT_MODE=YES
+  (os_log also to stderr), job com.apple.fairplayd.H2 removed (exits -42306 forever; iOS 16 removed it too).
+  research/ios26/launchd-plist-fix/launchd.plist.{orig,new}; phone patch outputs/ios26-plistfix/apply.sh
+  (old/new SHA-256 checked), undo.sh restores the original. Image outputs/guacamole-ios26-containers-cmlog.img
+  (SHA-256 ad60b4b139449adff6d537342c8d8fa318b2149c9b2df605da5614a173557678) = containers image with args
+  " sweetgpuhangms=150" dropped and sweetnull=containermanagerd,containermanagerd_system,lsd. New tools:
+  research/ios26/tools/{hfsfind,hfspath,cs-slots,dscwhere,dscdis,dscexports,hfs-decmpfs-census,
+  check-decmpfs,lower-stubs}.py. ios26-root.cdr NOT updated for the plist (keep it = the original).
+
+- 2026-11-13 04:31 (Claude) sampler results (sweetsample=containermanager / usermanagerd; boot-arg names must be
+  the 16-char p_comm "containermanager"). Earlier boot: containermanagerd_system's t3 blocked in a sync XPC from
+  ContainerManagerCommon +0xc2870 -> UserManagement +0x5a88 -> libxpc (waiting on usermanagerd). This boot (one
+  sample at 90 s): usermanagerd idle in its run loop; both containermanagerd processes RUNNING in
+  ContainerManagerCommon (+0x5de78.. / +0x6c574.. +0xdf470..), i.e. busy, not hung. No SWEET EMUL/UNDEF lines at
+  all (no instruction emulation is happening). appprotectiond / ManagedSettingsAgent / lsd keep crashing.
+  launchd.plist edit (outputs/ios26-plistfix) is applied: fairplayd.H2 gone; OS_ACTIVITY_DT_MODE produced no
+  stderr. Open question: is containermanagerd slowly doing first-boot container work on one CPU (clients give
+  up) or looping? Next: run the umsample image 10+ min, then pull the log (samples every 120 s).
+
+- 2026-11-13 04:40 (Claude) SMP for iOS 26 (user: get multicore working first). Ported the iOS 16 0065/0078
+  bring-up to xnu-12377's boot-on-register model. NOT BUILT.
+  * iokit/Kernel/arm/SweetCPU.cpp rewritten (single-CPU version kept in research/ios26/SweetCPU.cpp.single-cpu-
+    backup): every selected CPU's nub starts; the boot CPU registers in start() (ml_processor_register boots it,
+    as before); a kernel thread waits for all nubs, then calls ml_processor_register for each secondary (12377:
+    processor_boot -> cpu_start -> startCPU = PSCI CPU_ON to sweet_secondary_entry), waits up to 5 s for its
+    initCPU + self-SGI (sweet_cpu_signal_is_enabled), then ml_cpu_init_completed / cpusRunning /
+    gIOAllCPUInitializedKey / ml_set_max_cpus once. signalCPU targets the target CPU's MPIDR (Aff1 = core).
+    With one CPU it completes immediately as before.
+  * osfmk/arm64/start.s: sweet_secondary_entry (PSCI entry, EL2 -> EL1 drop), reset vector matches Aff1:Aff0
+    for SWEET, dsb+isb before the MMU is enabled.
+  * osfmk/arm64/cpu.c: cpu_start cleans CpuDataEntries, cpu data, ResetHandlerData, BootArgs, cpu_ttep and
+    bootstrap_pagetables to PoC before CPU_ON; sweet_cpu_signal_is_enabled().
+  * GIC per-CPU setup was already per CPU (pe_init_fiq via PE_init_cpu; vtimer INTID read only on CPU 0).
+  FOR CODEX: rebuild; make TWO images from the current ADT/args (args of outputs/guacamole-ios26-umsample.img,
+  with sweetsample=- or as is): one with cpus=8 (all cores incl. the two A76), one with cpus=4 (A55 only) as the
+  fallback if the A76s misbehave. Expect "SWEET CPU: cpu=N ... PSCI CPU_ON ... rc=0" and "came alive; SGI1 OK"
+  per core, then "SWEET CPU: 8 CPU(s) running". A panic "cpu=N ... not alive after 5 s" says which stage failed.
+
+- 2026-11-13 04:43 user: the cpus=8 SMP image boots with all 8 cores started (iOS 26 SMP works).
+
+- 2026-11-13 (Claude) cpus=8 log (outputs/ios26-log.txt): the UI never came up. Evidence: "SWEET KEYS: slider
+  ... 0 HID clients" 158 times over the whole boot (backboardd never opened the HID button service, which it
+  does early), and no EXIT/CRASH line for backboardd or SpringBoard: backboardd is stuck before its HID
+  setup, or never started. The kernel published IOAcceleratorES with MetalPluginName SweetMetal2 (sweetmtl=2),
+  but the iOS 26 root has no /System/Library/Extensions/SweetMetal2.bundle (iOS 16 userland only). iOS 26's
+  dyld cache has no software GL (OpenGLES = GLEngine + AppleMetalGLRenderer, GL on Metal; no GLRendererFloat);
+  QuartzCore still has the OGL/GLES backend (CA_ENABLE_OGL, CA::OGL::GLESImage) and a Metal backend.
+  The daemon crashes (lsd, appprotectiond, ...) are unchanged by 8 cores.
+  Test image outputs/guacamole-ios26-swrender.img (byte-patched from smp-cpus8, payload cmdline at 0x2f048
+  and header copy at 0x40), SHA-256 adb101dbedf4515b0c645041490cd5acfd667ab45fc3ee62d0e0edc69217feef:
+  sweetmtl=0 (IOAcceleratorES published empty: no Metal device claimed, CPU copy at swap) and
+  sweetsample=backboardd,SpringBoard (existing sampler) to see where backboardd sits.
+- 2026-11-13 05:13 (Claude) swrender log: NOT Metal. With sweetmtl=0 (IOAcceleratorES empty) it is the same:
+  0 HID clients. Samples at 90 s and 210 s identical: backboardd[63] main thread in BoardServices dispatch_once
+  -> RunningBoardServices -> dispatch_async_and_wait; SpringBoard[28] main in _SBSystemAppMain ->
+  _FBSystemShellInitialize -> RunningBoardServices (same wait), its t1 in a sync XPC from ChronoServices.
+  Both wait on runningboardd (never crashed/exited). lsd's abort (CoreServices +0xfa358, symbolized with the
+  new research/ios26/tools/dscsym.py DSC SLIDE ADDR...) is "Could not get user container URL! Must abort."
+  (container lookup query failed or NULL path): the same containermanagerd failure as appprotectiond.
+  Likely chain: containermanagerd -> lsd dies -> runningboardd (needs LaunchServices) -> backboardd/SpringBoard.
+  Next image outputs/guacamole-ios26-rbsample.img (SHA-256 510175c6...9951e54): swrender +
+  sweetsample=containermanager,runningboardd.
+- 2026-11-13 14:54 (Claude) rbsample log, 3 identical samples: runningboardd[27] t1 blocked for good in
+  RunningBoard +0x60104 -> CoreServices (LaunchServices client) -> Foundation -> xpc_connection_send_message_
+  with_reply_sync, i.e. waiting on lsd (which aborts in a loop on "Could not get user container URL"). Both
+  containermanagerd (pids 73, 103) are now IDLE in their run loop (_containermanagerd_main -> CFRunLoopRun):
+  not busy, not hung, so they answer lsd's query (class 10, flags 0x900000001, CoreServices +0xfa0xx) with an
+  error. Chain confirmed: containermanagerd error -> lsd abort loop -> runningboardd stuck -> backboardd and
+  SpringBoard stuck (0 HID clients, black). Not Metal.
+  Next: read the root's HFS catalog (VH + catalog file; in ios26-root.cdr the catalog is one extent, block
+  183794, 40960 blocks) to see what containermanagerd made under /private/var/containers, the persona /
+  UserManagement state, and whether logd wrote tracev3 files (lsd/containermanagerd error text via log show).
+- 2026-11-13 14:57 (Claude) catalog pulled (outputs/ios26-vh.bin, ios26-catalog.bin; adb exec-out appends dd's
+  stderr text at the end: strip it). The catalog grew to 49152 blocks (one extent at 183794); the pull has the
+  first 40960 (24 used nodes missing). New research/ios26/tools/hfscat.py dumps it to outputs/ios26-catalog.tsv
+  (path, type, cnid, size, mtime, mode, uid, gid, first 8 extents). Found: containermanagerd works in part:
+  6 app data containers in /private/var/mobile/Containers/Data/Application, MobileContainerManager dirs in
+  /private/var/root and /private/var/mobile/Library, references.sqlite3; NO system containers (nothing in
+  /private/var/containers/Data/System, our kernel-made dirs empty). logd works: Persist/0001-000f.tracev3
+  (10 MB each), but /private/var/db/uuidtext is empty (format strings come from our own dyld cache;
+  string arguments are in the tracev3). Plan: pull the newest tracev3, LZ4-decode chunks (liblz4 via
+  ctypes in the VM), read lsd/containermanagerd error strings.
+
+# Previous handoff — iOS 26 process-exit logging + manifest properties (2026-11-13)
+
+- Rebuilt the current kernel with the SWEET `kern_exit.c` log for non-zero, non-signal process exits (first 400).
+  The kernel retains the dyld pager fix, decmpfs zlib support, and quiet-by-default HID key logs. Build log:
+  `work/xnu12377-exit-logging-build.log`; `kern_exit.o` was recompiled.
+- Packaged with `work/guacamole-ios26-manifestprops.adt` and the current manifestprops boot settings, refreshing
+  only `sweettime`: `outputs/guacamole-ios26-exitlogs-manifestprops.img`, SHA-256
+  `42c40590a3776a2419d1486c0c8b572340f0f99e25f6c37101830ff48481762b`. Kernel SHA-256:
+  `551feeca201da76eb0da667c660044916d4ab5d0ac6b5b60510ab824027e73c0`.
+- Boot args preserve `cpus=1`, `bingrade=0x100000c:2`, `ufsroot=ios26`, and `sweetnull=containermanagerd,cryptexd,lsd`.
+  Exact args: `outputs/guacamole-ios26-exitlogs-manifestprops-boot-args.txt`.
+- Not booted yet. On boot, check for `EXIT containermanagerd[…]` and recurring `EXIT` lines from other daemons.
+  This diagnostic logs non-zero normal exits; signal exits continue to use the `CRASH` logger.
+
+- 2026-11-13 03:08 (Claude) exitlogs image: no EXIT or CRASH line for containermanagerd. Two daemons exist:
+  /usr/libexec/containermanagerd (agent, --kernel-upcall=yes, RunAtLoad, MachServices containermanagerd +
+  .upcall) and /usr/libexec/containermanagerd_system (privileged, LimitLoadToSessionType System, launch on
+  demand); both EnablePressuredExit. p_comm of both is "containermanager" (16 chars), so the previous
+  sweetnull=containermanagerd may only match the agent. XPC_INTERRUPTED_REPLY = the server went away with the
+  request pending: exit(0) (not logged before), SIGKILL by jetsam/launchd (no CRASH line), or a failed spawn.
+  kern_exit.c logger extended (SWEET): every exit of p_comm "containermanage*" (also status 0), and every
+  SIGKILL exit with its reason namespace/code ("EXIT name[pid] signal 9 reason ns N code 0x..."; ns 1 =
+  jetsam). Also noted: every process "triggered unnest" of the shared region at the .33.dylddata __DATA_CONST
+  mapping (dyld makes cache __DATA_CONST writable -> private copies, more memory per process). Built into the
+  current kernel/image above.
+
+- 2026-11-13 03:11 (Claude) likely root cause of the container failures, no more logging: the iOS 26 root has
+  NO /private/var/containers (on iOS it lives on the data volume; os-root.tar has none). iOS 16 got
+  containers/{Bundle,Data/System,Shared/SystemGroup,Temp} from tools/sweet-root-tweaks.py, but
+  tools/mkios26root-mac.sh never applied any of those tweaks. Fix in the kernel (the flashed root cannot be
+  edited offline any more, rootrw has changed it since the .cdr): bsd/vfs/vfs_syscalls.c gains
+  sweet_mkdir_path() (mkdir1at, kernel context, UIO_SYSSPACE, owner/mode, EEXIST = ok), and bsd_init.c (SWEET,
+  right after sweet_mailbox_root_install, before launchd) creates /private/var/containers, .../Bundle (uid 33
+  _installd), .../Data, .../Data/System, .../Shared, .../Shared/SystemGroup, .../Temp (0755). Only failures
+  print ("SWEET root: mkdir ..."). The kern_exit.c EXIT logging from 03:08 stays in but is no longer the plan.
+  Built and packaged; see the active handoff above. Later: carry the other iOS 16 root tweaks
+  (Setup skipped, LastSystemVersion, SpringBoard BKNoWatchdogs, fairplayd/CommCenter jobs) into iOS 26.
+
+# Previous handoff — iOS 26 dyld fix + decmpfs + quiet HID logs (2026-11-13)
+
+- Rebuilt the current kernel with all three changes: dyld pager handling for chained pointer format 1,
+  built-in decmpfs zlib registrations for types 3/4, and opt-in SWEET HID key logging (`sweethidlog=1`).
+  The boot args explicitly set `sweethidlog=0`.
+- Kernel SHA-256: `bef2dd0c3720946cf4265cd524a13228e1694b896f17265a0abc27a24ff4ef91`.
+- Image: `outputs/guacamole-ios26-dyldfix-decmpfs-nohid-cpus1.img`, SHA-256
+  `1b8b6d7f6547271a6867f4fd43574f08d6e20254c023bfe187570ddd6a044dc9`. Payload:
+  `work/payload-guacamole-ios26-dyldfix-decmpfs-nohid-cpus1.bin`. Boot args preserve `cpus=1`,
+  `bingrade=0x100000c:2`, and `ufsroot=ios26`; `sweettime` was refreshed. Full args are in
+  `outputs/guacamole-ios26-dyldfix-decmpfs-nohid-cpus1-boot-args.txt`.
+- Not booted yet. Check for `SWEET decmpfs: built-in zlib decompressors for types 3/4 (0/0)` and confirm the
+  repeated unregistered-type-3 and SWEET HID key log lines are gone.
+
+- Previous image (before the dyld fix): `outputs/guacamole-ios26-decmpfs-nohid-cpus1.img` (SHA-256
+  `a23516cdbadddd9dbea679ba023d08186b4bfff946873efe4ac61a1283b95303`).
+
+- Previous decmpfs-only build remains available as `outputs/guacamole-ios26-decmpfs-zlib-cpus1.img`
+  (SHA-256 `fe7dbd3ccd2eaeac7bf1acaa3757488b84d68d5c3373ea3ddea504654fd1b72`).
+
+- 2026-11-13 02:29 (Claude) dyldfix image: no more fixup_page errors. Remaining daemon crashes (appprotectiond,
+  ManagedSettingsA, mobileactivationd, cryptexd: sig 5, pc == lr) are Swift runtime FATAL ERRORS, not
+  lowering faults: the pc (unslid 0x1803e3800) is the `brk #1` after `bl` to libswiftCore's fatal-error
+  reporter (0x1803e3ffc, an ordinary function that prints the message and returns). The message goes to stderr
+  (= /dev/null for launchd jobs). Claude byte-patched the image's payload cmdline (608-byte field; 601 used):
+  " sweethidlog=0" (already the default) -> " sweetnull=appprotectiond", so mem.c tees that daemon's stderr to
+  the console as "|appprotectiond| Fatal error: ...". outputs/guacamole-ios26-dyldfix-swifterr.img (SHA-256
+  6efb8dac1dc66feb730a163f03e39dc72208c541b876a55920c2783a115adf65), args in
+  outputs/guacamole-ios26-dyldfix-swifterr-boot-args.txt.
+
+- 2026-11-13 02:37 (Claude) swifterr image shows the message: "|appprotectiond| AppProtection/APContainer.swift:94:
+  Fatal error: Couldn't get main container: ContainerFetchError(query failed: ... (52) XPC_INTERRUPTED_REPLY)",
+  i.e. containermanagerd drops the connection (dies or exits). ManagedSettingsA / passd crash at the same
+  libswiftCore fatal-error site (likely the same container query). Also seen: lsd sig 6, cryptexd sig 5
+  (pc 0x2b845827c), "hfs_clonefile: cluster_write failed - 34". Next image (no kernel change):
+  outputs/guacamole-ios26-dyldfix-swifterr2.img (SHA-256
+  52fc8699e0eefbdffe51f0e452416b297ad174dd96bf221c0fce12e37f5f7e93): args drop " sweethidlog=0" and
+  " keepsyms=1" and add " sweetnull=containermanagerd,cryptexd,lsd" (606 of the payload's 607 usable bytes;
+  shim BOOT_LINE_LENGTH 608, kernel 1024).
+
+- 2026-11-13 02:45 (Claude) swifterr2 boot: "|cryptexd| objc: Class OS_cryptex_base is implemented in both ..."
+  (harmless), then cryptexd sig 5 at unslid 0x2a36f827c = libimage4.dylib +0x2827c, its panic routine; caller
+  +0x60b4 = "panic: failed to get manifest properties". libimage4 init does IORegistryEntryFromPath on
+  IODeviceTree:/chosen, IODeviceTree:/product, IODeviceTree:/chosen/manifest-properties (all required) and
+  /chosen/asmb (optional), then opens the AppleImage4 IOService ("IOServiceGetMatchingService failed" is only
+  logged). Fix: ADT /chosen/manifest-properties node (CHIP 0x8015, BORD 6, ECID, CPRO 0, CSEC 1, SDOM 1, EPRO 0,
+  ESEC 1, BNCH); tools/mkadt.py has it now. New ADT work/guacamole-ios26-manifestprops.adt (= the CTRR ADT +
+  that node). Image outputs/guacamole-ios26-manifestprops.img (SHA-256
+  8fc4a0bd1038152846e4bdf883f3370dd2104806241d00fafec7bb0e368faf72): swifterr2 image with the payload's ADT
+  replaced (ADT is the payload's last item; ramdisk still fits its pages, header ramdisk_size updated; kernel,
+  shim and DTB verified unchanged). Same args (sweetnull=containermanagerd,cryptexd,lsd). containermanagerd
+  printed nothing in that photo. NOTE: the iOS 26 ADT still carries the iPhone X identity (D22AP / iPhone10,3,
+  chip 0x8015), not iPhone15,2.
+
+- 2026-11-13 02:55 (Claude) manifestprops image: cryptexd no longer crashes. Still crashing: lsd (sig 6, abort
+  from CoreServices +0xfa358 on a dispatch queue; no stderr text), appprotectiond / ManagedSettingsA /
+  mobileactivationd (Swift fatal error: no container, see 02:37), and containermanagerd prints NOTHING and has
+  no CRASH line. To see whether daemons exit on purpose, bsd/kern/kern_exit.c (exit_with_reason, SWEET) now
+  prints "EXIT name[pid] status N" for the first 400 non-zero, non-signal exits. Built and packaged with
+  work/guacamole-ios26-manifestprops.adt; see the active handoff above.
+
+# Previous handoff — iOS 26 launchd container-init failure (2026-11-13)
+
+- The latest boot reached launchd, then panicked with `initproc failed to start` and
+  `_container_init(): sandbox_get_container_expected() failed: -1` (namespace 18, subcode 0x2).
+- Cause: `sweet_sandbox_container_expected()` returned `ENOENT` when a process had no registered container.
+  iOS 26 treats that as fatal during container initialization. It now returns success with `expected=0` and
+  the secondary flag set to 0 for a missing container. Copyin failures and non-ENOENT lookup errors still fail.
+- Rebuilt successfully with the established iOS 26 command (`SDKROOT` = iPhoneOS SDK,
+  `KERNEL_SDKROOT=BUILD/sdk-ios26`, `BUILD_LTO=0`, `BUILD_DSYM=0`, `DO_CTFMERGE=0`). Kernel:
+  `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256
+  `8ee88f85e9b166ff0ddea2466e1a4571f83441474ca817a6fee37ded010bd553`.
+- New image: `outputs/guacamole-ios26-containernone-cpus1.img`, SHA-256
+  `ddd9db8fa372eb516017864560f36bff9c90d7dd18e974174a6f3166142944ca`. It uses the current
+  CTRR-disabled ADT and the previous image's arguments with `sweettime` refreshed; `cpus=1`,
+  `bingrade=0x100000c:2`, and `ufsroot=ios26` are preserved. Exact args are in
+  `outputs/guacamole-ios26-containernone-cpus1-boot-args.txt`. Keep
+  `outputs/guacamole-ios26-format12-cpus1.img` as the fallback.
+- Boot result (photo, 2026-11-13): this exact image was booted (`sweettime=1794551781`); it passed the
+  container-init failure and reached launchd's `cc_flips_test` boot task. CoreCrypto's `FIPS_POST` returns
+  false and the required task exits `-2074`, causing launchd to panic. The individual visible `FIPSPOST_USER`
+  checks report PASS. `research/ios26/low-os/files/03295.bin` strings show `cc_flips_test` supports
+  `-N/--nointegrity` (“Bypass the integrity checks”) while still running POST tests. Likely cause: arm64e
+  lowering changed CoreCrypto code bytes covered by its FIPS integrity measurement. Next investigate adding
+  `-N` to the `fips` boot task while retaining POST tests; do not use `--disable`. No change made yet.
+- Launchd config inspection: the boot task is embedded in the `launchd` binary (`Boot.fips`), with
+  `RequireSuccess=true`, `RequireRun=true`, and `Program=/usr/libexec/cc_fips_test`; the built-in entry has no
+  `ProgramArguments`. The current on-disk `System/Library/xpc/launchd.plist` has no `Boot` override. Extracted
+  research copies are in `research/ios26/fips-investigation/`. The next change must make launchd invoke the FIPS
+  task with `-N` (or otherwise override the embedded task) without disabling POST tests; no kernel rebuild is
+  indicated by this failure.
+
+- 2026-11-13 01:50 (Claude) FIPS fix, no kernel change: /sbin/launchd's embedded Boot plist (__TEXT,__config,
+  11,489 bytes) re-indented (whitespace between tags removed; plistlib-equal apart from the change) and Boot.fips
+  given `ProgramArguments = (cc_fips_test, -N)`, padded with newlines to the same length; CodeDirectory page
+  hashes refreshed (cdhash 6144576d... -> bfea6ab8...). research/ios26/fips-fix/launchd; low-os/files/03002.bin
+  and ios26-root.cdr updated (overlay os-lowered.tar is STALE for launchd). The phone is patched in place by
+  outputs/ios26-fipsfix/apply.sh (HFS+ catalog: launchd = one extent, block 2543010, 152 blocks; old/new
+  SHA-256 checked). POST self-tests still run; only the integrity HMAC is skipped. A real fix later: recompute
+  CoreCrypto's FIPS integrity HMAC over the lowered code.
+
+- 2026-11-13 01:56 (Claude) FIPS-fixed boot loops on "decmpfs.c:257:_decmp_get_func: tried to access a compressed
+  file of unregistered type 3". The iOS 26 root keeps the IPSW's transparent compression (macOS tar onto HFS+):
+  census of ios26-root.cdr (research/ios26/tools/hfs-decmpfs-census.py) = 181,932 type-3 (zlib in the
+  com.apple.decmpfs xattr) + 16,392 type-4 (zlib blocks in the resource fork) files, no other types. iOS 16's
+  root came through apfs-fuse, uncompressed, so this never came up. On Apple the AppleFSCompressionTypeZlib kext
+  registers these. NEW bsd/kern/sweet_decmpfs_zlib.c (libkern zlib, already in the build): types 3 and 4
+  registered from decmpfs_init (bsd/kern/decmpfs.c, SWEET); listed in bsd/conf/files. Layout verified by
+  decompressing real files from the image with research/ios26/tools/check-decmpfs.py (bplist/XML out,
+  sizes match). The kernel is now built and packaged in `outputs/guacamole-ios26-decmpfs-zlib-cpus1.img`;
+  see the active handoff above. (Alternative for later: make
+  mkios26root-mac.sh write files uncompressed, e.g. extract with --no-mac-metadata, and reflash.)
+
+- 2026-11-13 02:12 (Claude) "SWEET HID: key 0xb:0x2e down (0 clients)" (Alert Slider / ringer, repeats) buried the
+  boot log: iokit/Kernel/arm/hid/SweetHID.cpp now logs keys only with boot-arg sweethidlog=1. NOT BUILT; goes
+  with the decmpfs rebuild.
+
+- 2026-11-13 02:20 (Claude) boot with decmpfs: SpringBoard and many daemons run (process sampler shows
+  SpringBoard threads). Daemons crash: cryptexd / appprotectiond / ManagedSettingsA sig 5 (pc == lr),
+  lockdownd sig 10, and the kernel prints "fixup_page(): unknown pointer_format 1". Cause: the dyld pager
+  (osfmk/vm/vm_dyld_pager.c, page-in linking: the kernel applies chained fixups for dyld) only handles
+  DYLD_CHAINED_PTR_ARM64E (1), ARM64E_USERLAND and ARM64E_SHARED_CACHE under HAS_APPLE_PAC; on our kernel those
+  pages kept raw chain words. Fix (SWEET): route the three formats to fixupPageAuth64 / fixupCachePageAuth64
+  (the latter now compiled for SWEET too); signPointer() already leaves the targets unsigned without PAC.
+  Built together with decmpfs + quiet HID logging in the active handoff above. If the sig 5 crashes remain,
+  capture the "CRASH ... pc" lines: pc == lr suggests a trap instruction right after a call.
+
+- Build reference (exact command used for this rebuild):
+  `make -j4 MAKEJOBS=-j4 SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" KERNEL_SDKROOT="$PWD/BUILD/sdk-ios26" OBJROOT="$PWD/BUILD/obj-ios26-sweet" SYMROOT="$PWD/BUILD/obj-ios26-sweet" KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=SWEET BUILD_WERROR=0 BUILD_LTO=0 BUILD_DSYM=0 DO_CTFMERGE=0 MEMORY_SIZE=34359738368 SYSCTL_HW_PHYSICALCPU=8 SYSCTL_HW_LOGICALCPU=8 RC_DARWIN_KERNEL_VERSION=25.5.0`
+
+# Previous handoff — iOS 26 user-mode instruction emulation built (2026-11-13)
+
+- The last boot reached launchd, then `initproc` exited with SIGILL. XNU's undefined-instruction handler now
+  emulates the instructions listed in this handoff's 00:38 entry in `osfmk/arm64/sleh.c` (LRCPC2 loads/stores,
+  selected flag instructions, SB, and DIT accesses), logs first emulations as `SWEET EMUL:`, and logs
+  unhandled instructions as `SWEET UNDEF:`. FCMLA/FCADD/FJCVTZS/FRINT remain unimplemented; use any `SWEET UNDEF`
+  lines to determine whether they are needed.
+- Rebuilt the current kernel successfully. Build log: `work/xnu12377-instruction-emulation-build.log`.
+  Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet` (20,397,296
+  bytes, SHA-256 `27da3d0cee2cd212d88edd89cd859a7dff81238bbc564bdd2b80dfd3dcbaf9ca`).
+- Kept the newer CTRR-disabled ADT unchanged: `work/guacamole-ios26-ctrr-disabled.adt` (106,172 bytes,
+  SHA-256 `85a5009ffb8d1e32d911b970bf9b16b8c0ac1d2d1e85b4cdabb9f419ab0fa451`). Payload:
+  `work/payload-guacamole-ios26-arm64-emulation-cpus1.bin` (20,397,296 bytes, SHA-256
+  `4ee65619f885cdb58f06a289be0c9fc14cdb23f8ac6349fc6b02261325296ecb`).
+- Boot image: `outputs/guacamole-ios26-arm64-emulation-cpus1.img` (24,846,336 bytes, SHA-256
+  `7288a017835af9fe3fd86ba956dd2228056f832a5bcfdf9cb7eee57393c0b1ea`). Args preserve `cpus=1`,
+  `bingrade=0x100000c:2`, and `ufsroot=ios26`; exact refreshed args are in
+  `outputs/guacamole-ios26-arm64-emulation-cpus1-boot-args.txt`. Not booted yet (`fastboot devices -l` found no
+  device). If it panics, record the screen through the panic and capture the lines immediately above it; a boot
+  video is useful because the diagnostic lines may scroll away.
+
+- 2026-11-13 00:16 (Claude) HFS-fix image boots to launchd: panic "Process 1 exec of /sbin/launchd failed,
+  errno 86" (EBADARCH) @kern_exec.c:8130. The lowered iOS 26 binaries keep CPU subtype arm64e and the host is
+  ARM64_V8, so ml_grade_binary returns 0. Fix in source: bsd/dev/arm/kern_machdep.c grades CPU_SUBTYPE_ARM64E
+  as 8 on a V8 host under ARM64_BOARD_CONFIG_SWEET (below arm64 slices; this kernel has no ptrauth_calls, so
+  kern_exec already uses shared-region subtype 0 and no auth pagers). NOT BUILT.
+  Meanwhile the DEVELOPMENT kernel's bingrade boot-arg does the same without a rebuild: Claude byte-patched the
+  HFS-fix image, replacing "-enable_kprintf_spam -noprogress" with "bingrade=0x100000c:2" + spaces (same
+  length): outputs/guacamole-ios26-bingrade.img (SHA-256
+  f3b39eecac96ca46158c0f38509658fa089f02a872daed845ed9f66931d59589), args in
+  outputs/guacamole-ios26-bingrade-boot-args.txt. FOR CODEX: next images keep cpus=1; bingrade no longer
+  needed once kern_machdep.c is built (harmless if kept).
+- 2026-11-13 00:22 (Claude) bingrade image: no panic text, the screen stays on the EARLY markers + red. Why no
+  logs at all: 12377's serial_init() returns 0 when /chosen has no serial-device phandle (our ADT has none),
+  before init()ing the registered sweet fbcon, so kprintf/printf never reached the screen (only sweet_early
+  draws markers and panics). Fix in pexpert/arm/pe_serial.c (SWEET): with the fbcon mapped and no
+  serial-device, init the registered serial functions, mark uart_initted and return 1 (then arm_init
+  disables the early console and serial=3 switches the console to it). NOT BUILT. FOR CODEX: rebuild with
+  this plus kern_machdep.c (arm64e grading); keep cpus=1 and bingrade.
+- 2026-11-13 00:29 (Claude) bingrade image again: arm64e grading works, launchd runs, then panic "initproc failed
+  to start -- exit reason namespace 2 subcode 0xb" = SIGNAL / SIGSEGV. Found a stock-xnu gap for our case:
+  vm_shared_region_slide_page_v3 and _v5 compute the rebased value of AUTHENTICATED slots but only store it
+  inside #if __has_feature(ptrauth_calls); on our non-ptrauth kernel every auth pointer in the arm64e shared
+  cache (vtables, __AUTH_CONST function pointers, ObjC/Swift metadata) kept its raw chained-fixup word, so the
+  first indirect call crashes. Fix in osfmk/vm/vm_shared_region.c: #else store the unsigned value (both v3 and
+  v5). NOT BUILT. FOR CODEX: rebuild with this + pe_serial.c fbcon + kern_machdep.c; keep cpus=1 and bingrade.
+- 2026-11-13 00:38 (Claude) image with on-screen log + slide fix: launchd now runs further, then "initproc failed
+  to start -- exit reason namespace 2 subcode 0x4" = SIGILL (also "launchd[1] triggered unnest of range
+  0x202000000->0x206000000 of DYLD shared region", harmless). The CRASH line with the pc scrolled off.
+  Cause (very likely): iOS 26 is compiled for apple-a13+ (ARMv8.4) and uses instructions the Cortex-A76/A55
+  (ARMv8.2 + LRCPC + DotProd) do not have. Scan of 3 text subcaches of the lowered cache: ~8000 LRCPC2
+  LDAPUR/STLUR, FCMLA/FCADD ~360, RMIF 18, FJCVTZS 3, SB, DIT. Claude added user-mode emulation in
+  osfmk/arm64/sleh.c handle_uncategorized (SWEET): LRCPC2 loads/stores (with DMB), CFINV/RMIF/SETF8/16/AXFLAG/
+  XAFLAG, SB, MSR/MRS DIT; first 32 emulations logged as "SWEET EMUL:", first 64 non-emulated undefined
+  instructions as "SWEET UNDEF: proc pc instr". NOT emulated yet: FCMLA/FCADD/FJCVTZS/FRINTnn (need the NEON
+  state) - add if SWEET UNDEF shows them. NOT BUILT. FOR CODEX: rebuild; keep cpus=1 and bingrade.
+- 2026-11-13 00:48 (Claude) instruction-emulation kernel: "SWEET UNDEF: launchd pc 0x2ae16abfc instr 0xd71f0a11"
+  = BRAA x16, x17 in a dyld STUB ISLAND. lower-dsc.py only lowered the images' code sections; the stub-island
+  subcaches (.02 .04 .06 .08 .10 .74 .76 .78 .80) belong to no image and kept 106,349 `ldr x16,[x17]; braa
+  x16,x17` stubs. New research/ios26/tools/lower-stubs.py rewrote them to `br x16` in research/ios26/dsc-arm64
+  and refreshed the page hashes (new cdhashes printed by the tool). Live copies located through the HFS+
+  catalog of ios26-root.cdr (hard-link iNodes, one contiguous extent each; the earlier cryptex copies are
+  freed blocks). ios26-root.cdr patched in place (ios26-root.simg / .sparseimage are now STALE; the overlay
+  dsc-lowered-*.tar too). The phone is fixed in place by outputs/ios26-stubfix/apply.sh (Android + Magisk;
+  checks each block range's old SHA-256 before writing, verifies after). No kernel change needed.
+- 2026-11-12 23:52 ninth boot (current-patches image): past IOKit CPU registration, then panic
+  "processor_boot() missing for cpu 1" @processor.c:1047 (sched_cpu_init_completed -> check_all_cpus_are_done_
+  starting). Cause: the boot args copied from iOS 16 say cpus=8, but the 12377 tree has no secondary-CPU
+  bring-up yet, so CPUs 1-7 are in the topology and never start. Claude byte-patched the image (one byte, the
+  shim has no checksum): outputs/guacamole-ios26-cpus1.img (SHA-256 fcfa461cf5966acfc1b68370be8295afa94d7528ed6bb38029c9dc88f9a82afc),
+  args in outputs/guacamole-ios26-cpus1-boot-args.txt. FOR CODEX: iOS 26 images must use cpus=1 until
+  SMP (0065/0078/0156) is ported.
+
+- 2026-11-12 23:55 tenth boot (cpus=1): data abort, write permission fault FAR 0xfffffff007276914 =
+  mac_policy_list+0x14 in mac_policy_register+0x528, from sweet_amfi_policy_register (bsd_init). On the iOS
+  config mac_policy_list is SECURITY_READ_ONLY_LATE and is locked by machine_lockdown(); the iOS 16 kernel was a
+  macOS config where it is writable. Claude moved the call to kernel_bootstrap_thread right after
+  mac_policy_initmach / vnguard_policy_init (osfmk/kern/startup.c, guard ARM64_BOARD_CONFIG_SWEET) and removed
+  it from bsd_init.c. NOT BUILT. FOR CODEX: rebuild the kernel; the image must use cpus=1.
+
+- 2026-11-13 00:08 (Claude) next boot with the CTRR ADT: "panic: string operation caused an overflow" at
+  buildrecord+0x54 <- cat_create+0x1f8 (built-in HFS creating its first catalog record on the rw root).
+  XNU 12377 fortifies bcopy/memcpy/memmove with the destination's MEMBER size; HFS copies 32 bytes of Finder
+  info through the 16-byte userInfo member (hfs_catalog.c 1627/1694/3737/3753/3939 and similar idioms
+  elsewhere). Fix in bsd/sweet_hfs/sweet_hfs_compat.h (force-included into every HFS object): after
+  <sys/systm.h>/<string.h>, bcopy/memcpy/memmove map to __nochk_bcopy/__nochk_memcpy/__nochk_memmove, which
+  still check against the whole object. NOT BUILT. FOR CODEX: rebuild the kernel, keep the CTRR ADT and cpus=1.
+
+## Previous handoff — iOS 26 ADT seed fixed; image rebuilt for arm_vm_init retry (2026-11-12)
+
+- The last iOS 26 boot stopped just before `arm_vm_init`: XNU 12377 panicked because the ADT `/chosen/random-seed`
+  contained only 64 bytes, while it requests 256 (`4 * SEED_SIZE`). `tools/mkadt.py` now provides 256 bytes; this
+  is compatible with XNU 8796, which consumes only the first 64.
+- Rebuilt only the ADT and kernel payload, reusing the existing kernel unchanged (19,087,848 bytes, SHA-256
+  `1bfed329ec7e206231b8aa6df7847710703176cc0e07bab8b5bf07494483b339`). ADT:
+  `work/guacamole-ios26-seed256.adt` (SHA-256 `38d87d54801c4a862b323fec9c839859664a06bda10bf7d392385215617108bb`);
+  payload: `work/payload-guacamole-ios26-seed256.bin` (SHA-256
+  `b58230d6d63acf522c57d7710b38db39b3cc141ea6f5ae91e134f6de2b28e62c`).
+- New image: `outputs/guacamole-ios26-seed256.img` (23,646,208 bytes, SHA-256
+  `31df8d5e38b5e278a3c3788b2b825e622494429b765872d18ca9900617d2f5e5`). Uses the same previous shim and boot
+  arguments as the platform/UFS image, with `sweettime` refreshed; exact args are in
+  `outputs/guacamole-ios26-seed256-boot-args.txt`. Built locally; not transferred or booted. Boot this image and
+  send the panic photo or last visible marker. The existing platform/UFS image remains available as fallback.
+
+## Previous iOS 26 platform build
+
+- Ported the SWEET machine/platform path to `work/xnu-12377`: device-tree `SweetPlatformExpert`, boot CPU
+  `SweetCPU`, GICv3 Group 1 IRQ handling, and the virtual-timer PPI read from `/arm-io/gic` in the ADT. The
+  generated Guacamole ADT already supplies the GIC, timer, CPU nodes, framebuffer, and UFS controller. The
+  boot CPU driver registers only the boot CPU and sets the kernel CPU limit to one; secondary CPU startup is
+  still deferred. The existing early framebuffer markers from 0010/0082/0012 remain in place.
+- Ported the 0003 framebuffer serial console to the current `pe_serial.c` layout; it reads the `sweet-fbcon`
+  ADT node and draws kprintf output to the ABL framebuffer. Ported 0028 plus the 64-bit DMA-address check from
+  0034 for `rd=ufsroot0`; the UFS driver reads the GPT partition selected by `ufsroot=ios26`.
+- Monitor-less VM support from the UniXNU work is retained/adapted: SWEET disables Apple SPTM/PPL; monitor
+  activation is guarded by `XNU_MONITOR`; code-signing lockdown becomes a no-op without a monitor; PPL/SART
+  bootstrap is conditional; and non-Apple cache-maintenance entry points are exported. These are source-level
+  adaptations because the UniXNU patch contexts do not apply directly to XNU 12377.
+- Build: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet` (19,087,848
+  bytes), SHA-256 `1bfed329ec7e206231b8aa6df7847710703176cc0e07bab8b5bf07494483b339`. Build log:
+  `work/xnu12377-platform-build-final.log`.
+- Image: `outputs/guacamole-ios26-platform-ufs.img` (23,646,208 bytes), SHA-256
+  `666e5f2d6fb5b3c118b4298dc10e2e73fe66ab10daeb4e649f64b7a496ae3477`. It uses the previous
+  `shim/out/shim-guacamole.Image` and `rd=ufsroot0 ufsroot=ios26`; exact refreshed arguments are in
+  `outputs/guacamole-ios26-platform-ufs-boot-args.txt`. ADT: `work/guacamole-ios26-platform.adt`.
+- Locally built only; not transferred or booted. Boot this image and report the last visible screen/marker. The
+  success criterion is reaching the UFS driver's root wait/mount path; if it stops earlier, the framebuffer
+  console should now expose the kernel log. The previous-shim image still lacks the Android selector.
+
+# Active handoff — iOS 26 bring-up started (branch ios26-test, 2026-11-12 18:50, Claude)
+
+- Plan: docs/ios26.md. Identity iPhone15,2 (iPhone 14 Pro, 1179x2556, no SPTM/TXM in our kernel), iOS 26.5.x, root on partition ios26.
+- arm64e userland lowered offline to arm64 (UniXNU-zeta's zeta_userland_pauth.py approach; BSD-2-Clause-Patent).
+  DONE for the shared cache: research/ios26/dsc-arm64 (29,465,629 words, page hashes refreshed); kernel needs to
+  run arm64e Mach-Os as arm64 and trust the new cdhashes (docs/ios26.md, 'Lowered shared cache').
+- 2026-11-12 21:20: iOS 26 root (tools/mkios26root-mac.sh, lowered userland + shared cache) is FLASHED to ios26
+  (sparse image via fastboot). Waiting for the kernel.
+- Later (user: not yet): boot menu remembers the last choice in a 1 MiB `bootsel` partition carved from the end of
+  ios26 (one 4 KiB block, shim SCSI WRITE limited to that partition).
+- 2026-11-12 21:29 first boot of outputs/guacamole-ios26-test.img: shim jumps ("XNU jumping (fbcon clears
+  screen)"), then nothing. EXPECTED: work/xnu-12377 so far only has the SWEET machine-config skeleton (27 files:
+  MakeInc.def SWEET, MASTER without PPL/SPTM, tunables #if'd out, SWEET.h). None of the ~260 xnu/patches are
+  forward-ported: no early framebuffer debug (0010/0082/0012), no GIC/timer/PSCI platform (0004, 0065, ...), no
+  monitor-less pmap (UniXNU public-pmap-without-monitor.patch etc.), no fb console, no UFS. A hang right after
+  the jump is invisible without them.
+  NEXT (order): 1) port 0010 + 0082 + 0012 (early fb markers: shows how far start.s/arm_init get); 2) 0004 and
+  the boot path patches it depends on; pmap without PPL/SPTM from UniXNU patches/xnu-12377 (public-pmap-*,
+  native-*, non-apple-*); 3) fb console; 4) sweet_ufs (root on ios26).
+- 2026-11-12 21:56 with early fb debug ported: SWEET EARLY 1-7 (arm_init, PE_init_platform, cpu topology,
+  cpu_bootstrap, kernel_startup_bootstrap, cpu_init, entering arm_vm_init), then EARLY PANIC "Expected 256 seed
+  bytes from bootloader, but got 64" @prng_random.c:75 (12377 asks for 4*SEED_SIZE from /chosen/random-seed).
+  FIXED in tools/mkadt.py: random-seed is 256 bytes (xnu-8796 clamps to the 64 it wants, so iOS 16 images are
+  unaffected). Rebuild the ADT/payload (guac-mkboot.sh runs mkadt) and boot again.
+- 2026-11-12 21:59 second boot: past the seed, EARLY PANIC arm_vm_init.c:1820 in sweet_early_map_final
+  (forward-ported 0012): L1 slot of VM_MIN_KERNEL_ADDRESS+L2_SIZE not a table yet (12377 fills that range's L1
+  slots later, line ~2366). Claude edited work/xnu-12377/osfmk/arm64/arm_vm_init.c: init_ptpages() for that one
+  slot first (non-static, like the later VM_MIN..VM_MAX call) and the L1 index via L1_TABLE_T1_INDEX(va,
+  TCR_EL1_BOOT) as the rest of 12377 does. Diff: research/ios26/xnu12377-early-fb-l1-table.diff. NOT BUILT:
+  rebuild the kernel + image.
+- 2026-11-12 22:06 third boot: EARLY 1-20 (arm_vm_init, pmap_bootstrap, serial_init, kprintf all OK), then
+  "Invalid kernel stack pointer" panic = data abort ESR 0x96000061 (alignment fault, write) at FAR
+  0xfffffff127200040 in _bzero+0x44 called from PE_create_console+0x158 = check_for_panic_log's
+  bzero(gPanicBase): /pram is outside DRAM, and 12377 maps VM_WIMG_WCOMB of non-DRAM as Device-GRE, where
+  DC ZVA (and any unaligned access) faults. Claude edited work/xnu-12377/osfmk/arm/pmap/pmap.c: on
+  ARM64_BOARD_CONFIG_SWEET WCOMB is always CACHE_ATTRINDX_WRITECOMB (Normal NC), as 8796 did; also covers the
+  framebuffer console. 22:11: same panic again = io_map before the VM is up goes through
+  pmap_map_bd_with_options(PMAP_MAP_BD_WCOMB), which picks the attribute separately: patched there too. Diff:
+  research/ios26/xnu12377-wcomb-normal-nc.diff (both places). NOT BUILT.
+- 2026-11-12 22:15 fourth boot: past the console; data abort FAR 0x28 in _sha1_init+0x30 from
+  IOPlatformExpertDevice::generatePlatformUUID: g_crypto_funcs is NULL (no corecrypto kext). Claude applied the
+  iOS 16 crypto stand-ins to work/xnu-12377 (git apply, clean in order): 0020 portable AES (BearSSL), 0023
+  SHA-256, 0027 MD5, 0032 SHA-1, 0033 SHA-384/512. Other g_crypto_funcs users still unpatched (rand, des, rsa,
+  aesxts, chacha20poly1305, nfs gss, flow_divert, ah_core): port 0013/0014 (failed to apply: context) and stub
+  the rest the way 8796 did when they show up. libkern/crypto/sweet_bearssl (what 0020-stage-bearssl.sh fetches)
+  copied from the 8796 tree, identical pinned BearSSL. NOT BUILT.
+- 2026-11-12 22:20 fifth boot: instruction fetch at pc 0 from exe_boothash_salt_generate+0x58 (STARTUP
+  EARLY_BOOT) -> read_random -> prng_funcs.generate NULL (the corecrypto kext registers the kernel PRNG). Claude
+  forward-ported 0014's HMAC-SHA256 DRBG by hand into work/xnu-12377/osfmk/prng/prng_random.c (after the
+  erandom struct; same cckprng_funcs / ccdrbg / register_and_init_prng API in 12377; guard
+  ARM64_BOARD_CONFIG_SWEET; STARTUP EARLY_BOOT RANK_FIRST, before the boothash salt). 0014's write_random and
+  entropy.c hunks are not needed: 12377 hashes with SHA-512 (0033) and entropy.c no longer hashes.
+  Diff: research/ios26/xnu12377-0014-hmac-prng.diff. NOT BUILT.
+- 2026-11-12 22:25 sixth boot: data abort FAR 0x150 in vm_map_store_crypto_init+0x18 (STARTUP EARLY_BOOT):
+  crypto_random_kmem_ctx_size -> g_crypto_funcs NULL. 12377 moved 0013's kmem RNG use to vm_map_store.c, so
+  Claude implemented the generic API instead: work/xnu-12377/libkern/crypto/corecrypto_rand.c on SWEET =
+  SplitMix64 kmem contexts seeded by early_random (crypto_random_kmem_ctx_size/init, crypto_random_generate/
+  uniform; their only users are the kmem contexts) and cc_rand_generate/random_buf via read_random (0014 DRBG).
+  Diff: research/ios26/xnu12377-kmem-rng.diff. NOT BUILT.
+- 2026-11-12 22:31 seventh boot: panic "image4 interface not available" @kern_trustcache.c:584
+  (trust_cache_runtime_init, no-monitor variant). Claude hand-ported 0015 to work/xnu-12377/bsd/kern/
+  kern_trustcache.c (guard ARM64_BOARD_CONFIG_SWEET): without img4if/AMFI the runtime stays NULL (lock still
+  initialized); xnu_load_trust_cache / xnu_load_legacy_trust_cache -> KERN_NOT_SUPPORTED,
+  xnu_query_trust_cache / xnu_check_trust_cache_runtime_for_uuid -> KERN_NOT_FOUND,
+  static_trust_cache_capabilities -> KERN_NOT_SUPPORTED; load_static_trust_cache already handles NULL.
+  Diff: research/ios26/xnu12377-0015-trustcache.diff. NOT BUILT.
+  EXPECT NEXT: the `amfi` interface is NULL too (iOS 16 has it built in: 0025/0035 bsd/kern/sweet_amfi.c +
+  iokit SweetEntitlements.cpp, 0121, 0134, 0137, 0263): port that group next, it is also what lets the lowered
+  (re-signed) userland run.
+- 2026-11-12 22:36 eighth boot: IOKit is running; panic "SWEET CPU: processor_start failed: 5" @SweetCPU.cpp:81.
+  In 12377 ml_processor_register() itself calls processor_boot() (machine_routines.c:1769, !USE_APPLEARMSMP),
+  and processor_start from a driver is processor_start_from_kext = no-op returning KERN_FAILURE. Claude removed
+  the call in work/xnu-12377/iokit/Kernel/arm/SweetCPU.cpp, keeping the check that the CPU is running.
+  Diff: research/ios26/xnu12377-sweetcpu-no-processor-start.diff. NOT BUILT.
+- 2026-11-13 03:50 BULK FORWARD-PORT of the iOS 16 kernel (all 0001-0266 + local/0001) into work/xnu-12377, so
+  the next boots stop finding the same early panics one at a time. NOT BUILT. Method: per-file 3-way merge
+  (base = xnu-8796.141.3 HEAD of work/xnu-local-latest/dxb/xnu, theirs = that tree's working copy = all iOS 16
+  patches, ours = work/xnu-12377 as it was), conflicts resolved by hand. Backup of every file that was already
+  modified before this: research/ios26/xnu12377-before-forwardport.tgz. Diff of the 37 modified files:
+  research/ios26/xnu12377-forwardport-ios16-modified.diff; the 200 new files: research/ios26/
+  xnu12377-forwardport-ios16-newfiles.txt (copied verbatim from the iOS 16 tree).
+  * Added (new files): every bsd/dev/sweet_*.c driver (keys, touch, spmi, rpmh, pmem, usb, gpu, rtc, haptic,
+    mailbox, cpufreq, btuart, sample), redwood_*/flame_* wlan, bsd/kern/sweet_amfi.c (built-in AMFI MAC policy),
+    bsd/pthread/sweet_* + sweet_libpthread (built-in pthread kext), bsd/sweet_hfs (built-in HFS, the iOS 26 root
+    is HFS+), iokit/Kernel/arm Sweet*.cpp (Framebuffer/AppleCLCD, Surface, Accelerator, Audio, AMFI,
+    Entitlements, KeyStore, Watchdog, Battery, Backlight, Vibrator, IPAppender, M2Scaler), RedwoodGPU/WLAN,
+    MiniIONetworkStack, hid/ (SweetHID + IOHIDEvent*). Listed in bsd/conf/files and iokit/conf/files.arm64,
+    matched in KernelConfigTables.cpp. Makefile.template has the pthread/HFS include flags.
+  * config/MASTER.arm64.sweet FILESYS_BASE gains sweet_hfs; config/MASTER has the SWEET_HFS option.
+  * bsd_init.c: sweet_amfi_policy_register + sweet_hfs_register before root mount, unsealed root allowed,
+    mailbox/RTC/pmem/wlan/btuart init before launchd. IOStartIOKit, IOService, IOUserClient, kern_cs (0263 incl.),
+    kern_exec (one exec line), kern_exit/memorystatus, vfs_*, mockfs, exception.c (crash log), mem.c (sweetnull
+    tee), serial_console.c (persistent log + console mute), kern_core (no cores by default), skywalk packet,
+    pmap_misc, pthread_internal (56-byte ksyn element) merged as in iOS 16.
+  * bsd/dev/sweet_ufs.c replaced by the iOS 16 version (writes, faster, DMA above 4G) + vm/vm_kern_xnu.h.
+  * SweetPlatformExpert: now publishes /arm-io nubs (AppleCLCD etc. match on them) and no longer overrides
+    hw.target/hw.product ("sweet"/"Redmi Note 10 Pro"); IODTPlatformExpert takes them from the ADT
+    (iPhone15,2), which MobileGestalt needs.
+  * machine_routines.c: SWEET defaults cpus=1 (cpus=N opts in, max 8) and reads cluster-core-id as in iOS 16.
+  * KEPT the 12377 versions (Codex/Claude ports that already boot): start.s, arm_vm_init.c, arm_init.c, pmap.c,
+    sleh.c, pe_fiq.c (only fixed the literal "\\n" in the GIC kprintf), pe_serial.c, caches_asm.s, cpu.c,
+    prng_random.c, entropy.c, kern_trustcache.c, corecrypto_*.c, MakeInc.def/.cmd/.kernel, board_config.h,
+    proc_reg.h, protos.h, SweetCPU.cpp, kpc.c, sweet_early.*. Skipped 8796-only build fixes (0002 UIO_STACKBUF,
+    IORPC, kas_info, Libsyscall.xcconfig, PPL/tunables/amcc stubs, lldbmacros) and the perf-only 0156 big-core
+    placement in sched_prim.c.
+  * NOT YET (needs SMP): 0065/0078/0156 secondary CPU bring-up (start.s sweet_secondary_entry, cpu.c cache
+    cleans, SweetCPU secondaries). The boot CPU alone is fine to reach SpringBoard.
+  * EXPECT compile errors in the new drivers where 12377 changed APIs (vm_kern_xnu.h split, IOKit
+    signatures, pthread shims version, HID headers from the SDK, AppleKeyStore header). Fix them in place with
+    the smallest change; please list what you changed here.
+- FOR CODEX, first task: set up an xnu-12377.121.6 tree (work/xnu-12377) for the SWEET board, plain arm64,
+  with the applicable UniXNU patches/xnu-12377 (github.com/UniXNU/UniXNU), and forward-port the minimal
+  guacamole set (board config/ADT, shim boot, UFS root, framebuffer console). Target: boots to
+  "waiting for root device" with ufsroot=ios26. Keep it on branch ios26-test.
+
+# Active handoff — kernel 0258/0259/0263-0266 + selector shim built (2026-11-12)
+
+- Built kernel with 0258, 0259, 0262, 0263, 0264, 0265 and 0266 in the current XNU tree. Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,072,576 bytes,
+  SHA-256 `8264e6efafca653ab1b6f34d9d82ece8869c6866f761e9aa6c4b025f1ee07032`).
+- Built the selector shim to `shim/out/Image` (221,184 bytes, SHA-256
+  `ec010a0e2e42fbb26b02fc60fd7f879915e1db1d5ac8e8118b817902c7018651`) and packaged it with the kernel as
+  `outputs/guacamole-0267-selector.img` (21,647,360 bytes, SHA-256
+  `9a8fb36177ce5c075a9f54967382a5f562bd745730a9deb2d9024e81df289de7`). It uses the latest saved boot_b
+  arguments (0263 payload, `sweettime` refreshed); exact args are in `outputs/guacamole-0267-selector-boot-args.txt`.
+- The Mac lacks `aarch64-linux-gnu-gcc`; the shim was compiled with the installed LLVM 18 AArch64 bare-metal
+  toolchain via temporary wrappers, with a small `strcmp` helper linked for Clang's builtin lowering. The
+  image is built locally and has not been transferred, booted or flashed. Future guacamole images must use
+  `shim/out/Image` rather than the old `shim/out/shim-guacamole.Image`, or the Android selector disappears.
+- Phone after boot: `mgtool setbool ringer-switch true` + respring (slider as ring/silent); Files/Safari downloads
+  also need fpwrap + libsweet-fpfs installed and the com.apple.FileProvider job pointed at fpwrap.
+
 # Active handoff — dual boot: Alert Slider boot selector in the shim (2026-11-12 17:50, Claude)
 
 - Layout: slot a boot_a = Android 12 userdebug + Magisk (header v2, UNCOMPRESSED_IMG 48.5 MB Image, text_offset
@@ -3462,3 +5270,308 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Completed the iOS 16.7.16 / 20H392 disassembly in `research/haptics/ios-i/RESULTS.md`.
 - Both VibeSynth and Core Haptics ultimately consult `DeviceSupportsClosedLoopHaptics`. VibeSynth also has a legacy CoreAudio `vibe` device fallback only when that answer is false. It caches its capability once. Kernel 0251 does not participate in either check.
 - To preserve both MG answers, disabling `libVibeSynthEngine.dylib` loading is the reversible way to force MediaExperience back to its IOKit `vibrator` fallback; SpringBoard’s independent UIKit level-2 gate is `DisableLevel2Feedback` (preference storage/write path not verified). See results for limits and caveats. No phone changes made.
+
+- 2026-11-14 (Claude) SSH asks for a password, "alpine" refused. Cause: the Procursus rootless bootstrap's own
+  /var/jb/etc/master.passwd (which its sshd/PAM uses) has root LOCKED ("!") and homes /var/jb/var/root and
+  /var/jb/var/mobile; our authorized_keys went to /private/var/{root,mobile}/.ssh, which sshd never reads. mobile's
+  $6$ hash checked: it IS "alpine". FIX (no reflash): outputs/ios27-ssh-box.img = bootstrap master.passwd with root
+  given mobile's hash (alpine), plus authorized_keys in /var/jb/var/{root,mobile}/.ssh. mkios27root-mac.sh now does
+  both in future builds. Not yet confirmed on the phone.
+- 2026-11-14 (Claude) user: mobile/alpine refused too (before the ssh box), so the locked root alone does not explain
+  it. sshd ran without -e: its log went to syslog, /var/local/sshd.out empty. outputs/ios27-ssh-box.img now also
+  rewrites /System/Library/xpc/launchd.plist (taken from ios27-root.cdr, 734 daemons) so sshd runs
+  "-D -e -o LogLevel=DEBUG3" -> /var/local/sshd.out shows why auth fails. Previous box kept as ios27-ssh-box-v1.img.
+- 2026-11-14 (Claude) user wants no SSH passwords: outputs/ios27-ssh-nopw-box.img = same launchd.plist (sshd debug log)
+  + /var/jb/etc/master.passwd with EMPTY root and mobile passwords + /var/jb/etc/ssh/sshd_config with UsePAM no,
+  PermitEmptyPasswords yes, KbdInteractiveAuthentication no (sshd's own empty-password check, no pam_unix nullok)
+  + the keys. System /private/etc/master.passwd not touched (decmpfs-compressed in the image, size 0 in catalog).
+  mkios27root-mac.sh not changed for this yet.
+- 2026-11-14 (Claude) nopw box applied (server offers only publickey,password) but root still refused, key too.
+  ROOT CAUSE (evidence): bootstrap sshd resolves users through libiosexec ie_getpwnam, which reads ONLY
+  /var/jb/etc/pwd.db / spwd.db (strings of libiosexec.1.dylib); the bootstrap tar has no pwd.db (system-cmds.postinst
+  normally runs "pwd_mkdb -p /var/jb/etc/master.passwd", and we extract on the Mac, no postinst). So every user is
+  invalid -> password and key both refused. FIX: launchd job com.sweet.pwdmkdb runs /var/jb/usr/sbin/pwd_mkdb -p
+  /var/jb/etc/master.passwd at boot (log /var/local/pwdmkdb.out). Box outputs/ios27-ssh-pwdb-box.img (= nopw box +
+  that job); mkios27root-mac.sh adds the job too.
+- 2026-11-14 20:10 (Claude) CONFIRMED by user: SSH works on iOS 27 after ios27-ssh-pwdb-box.img (pwd_mkdb at boot).
+- 2026-11-14 20:11 (Claude) CONFIRMED by user: `reboot` (/var/jb/sbin/reboot) over SSH restarts the phone (PSCI kernel).
+  Procursus launchctl is unusable on 27.2 (missing _launch_active_user_switch in libSystem). halt not tested yet.
+- 2026-11-14 20:12 (Claude) CONFIRMED by user: `halt` powers the phone fully off (PSCI SYSTEM_OFF); power button boots it
+  normally. PSCI power (xnu12377-psci-power.diff) done.
+
+- 2026-11-14 20:30 (Claude) iOS 27 GPU/UI/resolution survey (kernel log outputs/ios26-log.bin, 00:25 UTC boot):
+  * RESOLUTION: every CoreAnimation layer is 1179x2556 (d73 ADT canvas = MobileGestalt's iPhone 14 Pro screen) but
+    SweetFramebuffer hard-codes the presented size 1125x2436 -> the frame loses its right 54 / bottom 120 px and is
+    scaled by the wrong factor. FIX (source, NOT BUILT): xnu12377-fb-canvas.diff - AppleCLCD::start takes the
+    presented size from the provider's (/arm-io/disp0) canvas-width/height (d22 1125x2436, d73 1179x2556, --scale2
+    828x1792 unchanged), boot-arg sweetfb_canvas=0 = old fixed size; dot pitch 460 for 1179. Backup
+    kernel-backup/SweetFramebuffer.cpp.before-canvas. Same ADT (work/guacamole-ios26-d73.adt), same boot args.
+  * SAFARI: not a Metal problem. com.apple.WebKit.WebContent dies 269x with SIGILL: "SWEET UNDEF ... instr 0xd65f0fff
+    (not emulated)" = RETAB in JIT code (pc in the JIT region, offset 0x..c0c0 every time). 27.2 JavaScriptCore is
+    arm64e-only, its JIT emits PAC (RETAB/BRAA/AUT*), the A76/A55 have no PAC; the lowering only fixed static code.
+    WebKit (UI process) reads [NSUserDefaults boolForKey:@"WebKitJSCJITEnabledDefaultsKey"] (registered YES,
+    WebKit 0x19cbbe8ec) into the WebProcess creation parameters (0x19cc2490c, strb +376). TEST (no rebuild):
+    WebKitJSCJITEnabledDefaultsKey=NO in /var/mobile/Library/Preferences/.GlobalPreferences.plist -> WebContent
+    should run LLInt only (static, lowered). Unconfirmed that WebContent honours it on iOS; fallback = emulate PAC
+    in sleh.c (slow) or Lockdown Mode.
+  * SPEED: GPU present is used (CPU-copied Metal frames 0); 17-31 swaps/s while animating, 90/s idle; GPU busy at
+    10-55% of vsyncs -> not GPU-bound. Crash loops burn CPU: WebContent 269, aonsensed 97 (SIGKILL ns 1 code 7),
+    cameracaptured 17 (sig 6, "denied attempt to escape CPU monitor"), fileindexerd 15 (sig 5). Next: profile
+    backboardd over SSH, silence the loops.
+- 2026-11-14 20:40 (Claude) Safari JIT pref test: key not even in .GlobalPreferences afterwards (cfprefsd rewrote it),
+  and moot: WebContent dies INSIDE JSC::initialize() (bt: WebKit -> JSC::initialize -> call_once ->
+  initializeWithOptionsCustomization -> ... -> JIT thunk RETAB), before any WebProcess parameters. Evidence that
+  production JSC honours the env var: PodcastsUI does setenv JSC_useJIT=0 ("Disabling JIT...", string in .36).
+  27.2 WebContent is an ExtensionKit appex: /private/preboot/Cryptexes/OS/System/Library/ExtensionKit/Extensions/
+  WebContent{,EnhancedSecurity,CaptivePortal}Extension.appex. TEST: XPCService.EnvironmentVariables JSC_useJIT=0 in
+  its Info.plist (unconfirmed that ExtensionKit launches honour it). Fallback: PAC emulation in sleh.c.
+- 2026-11-14 20:50 (Claude) env test FAILED: WebContent still SIGILLs on RETAB right after Safari relaunch (appex
+  XPCService.EnvironmentVariables not used, or LS caches the plist). Phone keeps the edited Info.plist; original
+  saved as ...WebContentExtension.appex/Info.plist.orig (restore later).
+  FIX (source, NOT BUILT): xnu12377-pac-emul.diff - sleh.c sweet_emulate_user also emulates FEAT_PAuth outside the
+  HINT space as unauthenticated ops: RETAA/RETAB -> RET, BRAA(Z)/BRAB(Z)/BLRAA(Z)/BLRAB(Z) -> BR/BLR, PACIA..AUTDZB +
+  XPACI/XPACD -> no-op, PACGA -> deterministic hash in the top 32 bits, LDRAA/LDRAB (incl. writeback) -> LDR, and
+  FEAT_JSCVT FJCVTZS (JS ToInt32 on the saved NEON d-reg, Z = exact). Decoders checked against known encodings
+  (plain RET/BR/BLR/RBIT/CLZ/LDR not matched). Backup kernel-backup/sleh.c.before-pac. Every JIT return traps
+  (~us each): JS will be slower than native JIT but runs. Expect "SWEET EMUL: RETAx in com.apple.WebKit.WebContent".
+  CODEX: build with xnu12377-fb-canvas.diff (both in the tree), wrap with work/guacamole-ios26-d73.adt and the
+  current args (outputs/ios27a-*-boot-args used for the running image, sweettime refreshed) as
+  outputs/guacamole-ios27a-pac.img.
+- 2026-11-14 20:47 (Claude) CONFIRMED by user: Safari loads pages on the pac kernel (xnu12377-pac-emul.diff).
+- 2026-11-14 21:05 (Claude) Settings > About Capacity 0 KB (Available 9.34 GB ok); iPhone Storage "-9.35 GB of 0 KB",
+  "unable to load app storage details". libMobileGestalt DiskUsage (0x1afeb86f0): TotalDiskCapacity = NANDSize()
+  (0x1afeb8b90) = IOServiceGetMatchingService(IOBSDNameMatching("disk0")) -> "Size" (kIOMediaSizeKey) SInt64, -1 on
+  failure; the other values come from statfs("/", "/mnt4", "/private/var"). We have no IOMedia (root = ufsroot0
+  bdev). FIX (source, NOT BUILT): xnu12377-disk0-nub.diff - IOFindBSDRoot (ufsroot0 path) publishes IOService
+  "SweetUFSMedia" {BSD Name disk0, Size = root partition bytes, Whole, Writable, BSD Major/Minor}; boot-arg
+  sweetdisk0=0 skips it; sweet_ufs.c exports sweet_ufs_size_bytes(). Backups kernel-backup/*.before-disk0.
+  "Unable to load app storage details" not yet analysed (check after this kernel).
+- 2026-11-14 21:15 (Claude) WALLPAPERS (none load; Add says max reached). 4 PosterBoard crash reports (17:53, SIGTRAP):
+  -[PBFModalRootViewController initWithScene:dataStore:] (PosterBoard.framework, unslid 0x222c81000+0x6bfd8)
+  asserts its dataStore argument non-nil (retain x22 -> nil -> .cold.3 brk, "failure in ... (%@:%i)" line 158):
+  PBFModalSceneDelegate is handed NO poster data store (the Settings-hosted wallpaper scene, voucher from
+  Preferences). Data dir exists: /var/mobile/Library/Application Support/PRBPosterExtensionDataStore. Why the
+  store is nil: in the unified log, which 27.2 compresses with LZBITMAP (chunks start "ZBM\x0c", not bv41):
+  tracev3.py cannot read it. NEW tools/ios-logshow.sh decodes on the Mac with `log show --archive` (built
+  logarchive = diagnostics + uuidtext + minimal Info.plist OSArchiveVersion 4; untested).
+- 2026-11-14 21:30 (Claude) wp log decoded: tools/tracev3-unlzbm.py (on the Mac, libcompression LZBITMAP 0x702 ->
+  "bv4-" blocks; 0 failures) -> outputs/wp-diag, then research/ios26/tools/tracev3.py works on 27.2 logs. No
+  PosterBoard.framework lines persisted. The nil dataStore = [[PBFPosterExtensionDataStoreXPCServiceGlue
+  sharedInstance] dataStore] (scene:willConnectToSession:, 0x222ceb5d4..0x222ceb600). Candidate causes from the
+  framework's strings: "wallpaperPublisherDidReceiveObserverConnection: Deferring dataStore init because migration is
+  pending!", "System data migration is in progress" (DMIsMigrationNeeded, DataMigration.framework), MKBDevice-
+  UnlockedSinceBoot, "Unable to setup/reach dataStore URL ...". runningboardd shows repeated "PosterBoard Migration
+  Assertion". Current images boot with sweetmigrate=1 (kernel never writes LastSystemVersion).
+- 2026-11-14 21:45 (Claude) tracev3.py fixed for 27.2: DSC_DIR may be the phone's uuidtext/dsc/<UUID> file (the
+  phone's cache layout differs from research/ios27.2/dsc-system-arm64: libobjc at +0x404000 vs +0x405000), and
+  has_large_offset+shared-cache formats = 0x80000000 + location (mandiant UnifiedLogs rule). Args still mostly <tXX>
+  (item types not parsed for 27.2). New tools/ios-pull-log.sh (newest 2 Persist+Special over SSH, decoded on Mac).
+  PosterBoard (logging prefs Debug for com.apple.PosterBoard/PosterKit/posterboardservices) at every launch:
+  "System data migration is not needed" -> "Success updating file attributes for URL" -> "Beginning migration to
+  Version N" -> "Failed to migrate to Version N from M" -> ... "wallpaperPublisherDidReceiveObserverConnection: could
+  not initialize data store". The store dir PRBPosterExtensionDataStore/59 (13:44, first boot) holds only empty
+  Extensions/ and GalleryCache/: a half-made v59 store that every launch fails to migrate. TEST: move it aside.
+- 2026-11-14 22:00 (Claude) tracev3.py args fixed for 27.2 (a u32 precedes the large-offset u16 for shared-cache
+  formats): PosterBoard: "Data store migration not needed (24B119)" -> "Beginning migration to Version 59" ->
+  "Failed to migrate to Version 61 from 59 (<private>)" -> "could not initialize data store: Error Domain=
+  com.apple.PosterBoard.generalErrorDomain Code=0 'Data store could not be created for an unknown reason ...'".
+  Same with the old store moved aside (PRBPosterExtensionDataStore.bad on the phone): it fails creating the store,
+  the 59->61 step. Next: Enable-Private-Data (outputs/ios26-logprefs/private-data.plist ->
+  /Library/Preferences/Logging/com.apple.system.logging.plist) to see the private error.
+- 2026-11-14 22:20 (Claude) Wallpaper store: v59 -> v61 migration (PosterBoard 0x222d1b800..): per step it copies
+  pbf_dataStoreURL(v-1) -> (v) with -[NSFileManager copyItemAtURL:toURL:error:], pbf_recursivelyUpdateResourceValues
+  :error:, opens the SQLite db (initWithURL:options:error:) and performChanges; the failing one logs nothing (the
+  "(%@)" in "Failed to migrate" is the base URL). Diagnostic (source, NOT BUILT): xnu12377-systrace.diff -
+  boot-arg sweetsystrace=NAME prints the first 600 failing syscalls of processes named NAME* as "SYSERR name[pid] sc
+  N err E a0 a1 a2 'str0' 'str1'". CODEX: build with pac/canvas/disk0, add sweetsystrace=PosterBoard to the args
+  (keep <= 607 chars; drop sweetfb_noconsole... only if needed), image outputs/guacamole-ios27a-systrace.img.
+  Args: outputs/ios27a-systrace-boot-args.txt = ios27a-net-wifid1-validation args with "sweetcsoff=1 sweetmigrate=1"
+  (first-boot only, per the handoff at the top; migration is recorded: LastSystemVersion 24B119) replaced by
+  "sweetsystrace=PosterBoard" (600 chars). Refresh sweettime.
+- 2026-11-14 22:30 (Claude) after moving the old store aside, PosterBoard made a fresh .../PRBPosterExtensionDataStore/59
+  (18:19, empty Extensions/ GalleryCache/, all drwxrwxrwx) and NO 60: the failing step is the first one of the
+  59->60 migration, -[NSFileManager copyItemAtURL:59 toURL:60 error:] (copyfile of a directory tree on HFS: clone /
+  xattr / ACL / protection-class copy are the suspects). The systrace kernel will name the syscall.
+- 2026-11-14 22:50 (Claude) systrace (tail): PosterBoard's failing syscalls around the store are only normal probes
+  (stat64 .../60 and /61 ENOENT, faccessat .../58 ENOENT, mkdirat EEXIST, csops ERANGE): the migration gives up on
+  a CHECK, not a failed call. 0x222d173bc (store validator) builds [storeURL(v), Extensions, GalleryCache,
+  SQLite URL] and runs -[NSFileManager fileExistsAtPath:isDirectory:] + -[NSURL pbf_URLIsReachableAndConform-
+  ToResourceValues:error:] on each - i.e. compares resource values, almost surely NSURLFileProtectionKey: our HFS
+  root has no MNT_CPROTECT, so cp_vnode_getclass/setclass return ENOTSUP and getattrlist omits
+  ATTR_CMN_DATA_PROTECT_FLAGS (va_dataprotect_class reads 0 via vnode_getattr). FIX (source, NOT BUILT):
+  xnu12377-hfs-cpemul.diff - on a non-cprotect HFS volume, classes are emulated: setclass stores the class in the
+  cnode + xattr com.apple.sweet.cpclass (1 byte, best effort); getclass/getattr report it, default class C (3);
+  nothing is encrypted. Boot-arg sweetcpemul=0 = old behaviour. Backups kernel-backup/*.before-cpemul.
+  Unconfirmed which resource value PosterBoard compares (the systrace tail had no setattrlist error; the head of
+  the 600 lines may).
+- 2026-11-14 23:10 (Claude) cpemul kernel: wallpaper still fails, same log, no unusual SYSERR. Traced the check: after
+  making v59's dirs the loop runs pbf_recursivelyUpdateResourceValues with PFPosterPathURLResourceValues()
+  (PosterFoundation +0x39054) = {NSURLIsReadableKey: YES, NSURLFileProtectionKey: NSURLFileProtectionNone}, then the
+  validator 0x222d173bc(base, 59) -> flag; false -> "Failed to migrate". The validator also checks the store dir
+  .../59 itself, which is never updated, and my emulation reported class C (3) for anything never set -> mismatch.
+  FIX: emulation default = class D (4) = NSFileProtectionNone (true on this unencrypted volume). One-line change in
+  xnu12377-hfs-cpemul.diff (SWEET_CP_DEFAULT). Rebuild; same args.
+- 2026-11-14 23:30 (Claude) D-default kernel: still fails; xattr -l shows NO com.apple.sweet.cpclass anywhere, i.e.
+  Foundation never set/read a class: CoreServices has kCFURLVolumeSupportsFileProtectionKey and skips file
+  protection on a volume without MNT_CPROTECT (inferred; matches "no syscall, no xattr"). FIX added to
+  xnu12377-hfs-cpemul.diff: sweet_cp_emul_visflags(mp) (hfs_cprotect.c) ORs MNT_CPROTECT into what USERLAND sees
+  for an hfs mount with emulation on - statfs f_flags (vfs_get_statfs64 + the 2 sysctl copies in vfs_syscalls.c)
+  and getattrlist ATTR_VOL_MOUNTFLAGS (vfs_attrlist.c) - while mnt_flag stays clear (cp_fs_protected false, HFS never
+  enters its key-wrapping paths, update mounts unaffected). Backups kernel-backup/*.before-cpvol. Rebuild, same args.
+  Check after boot: xattr -l on .../PRBPosterExtensionDataStore/59 should now show com.apple.sweet.cpclass.
+- 2026-11-14 23:45 (Claude) cpvol kernel = BOOT LOOP (photo): keybagd MKB_INIT saw MNT_CPROTECT on /private/var ->
+  "APFSVolumePayloadGet failed", "Not cookie in this volume, attempting to write it", aks keybag cookie 0xe00002c7,
+  "aks_set_keybag_for_volume_with_cookie FAIL", "FATAL KEYBAG ERROR: data volume mapping", "REBOOTING INTO RECOVERY
+  MODE" -> PSCI restart -> same. FIX: sweet_cp_emul_visflags() returns 0 for uid 0 (keybagd and every key-managing
+  boot daemon run as root; PosterBoard/apps run as mobile). Recovery now: boot the previous working kernel image
+  (or this one with sweetcpemul=0) via fastboot.
+- 2026-11-14 23:55 (Claude) cpemul+cpvol(non-root) kernel boots; wallpaper still "Failed to migrate to Version 61 from
+  59". Stop guessing: NEW userland/jb/urlprops.m (in userland/build.sh) prints, for a path, statfs MNT_CPROTECT,
+  getattrlist ATTR_CMN_DATA_PROTECT_FLAGS, F_GETPROTECTIONCLASS and NSURL FileProtection/IsReadable/
+  VolumeSupportsFileProtection; -set first sets NSURLFileProtectionNone via Foundation. Codex: build, scp to
+  /var/local/bin; run as mobile on the store dirs.
+- 2026-11-15 00:20 (Claude) urlprops (as mobile) on the store dirs: statfs MNT_CPROTECT yes (Codex moved
+  sweet_cp_emul_visflags into vfs_subr.c), NSURLVolumeSupportsFileProtectionKey = 1, but getattrlist omits
+  ATTR_CMN_DATA_PROTECT_FLAGS, F_GETPROTECTIONCLASS = ENOTSUP and NSURL has NO NSURLFileProtectionKey (setting None
+  "ok" but not kept). Cause: sweet_hfs_compat.h #undef CONFIG_PROTECT -> hfs_cprotect.o is EMPTY (336 B) and the
+  hfs_vnops getattr block is compiled out: my HFS-side emulation never existed in the binary. Reverted those HFS
+  edits (copies kernel-backup/*.dead-cpemul; old diff renamed xnu12377-hfs-cpemul.DEAD.diff). NEW: per-file
+  emulation in VFS - vfs_subr.c sweet_cp_emul_getattr/setattr(+_done), called from kpi_vfs.c VNOP_GETATTR (after
+  the fs: if class wanted and unsupported -> xattr com.apple.sweet.cpclass or class D 4) and VNOP_SETATTR (class
+  taken out of vap and stored in the xattr before the fs, marked supported after). Same non-root/hfs condition as
+  the volume flag. Diff research/ios27.2/kernel/xnu12377-cpemul-vfs.diff (vfs_syscalls/attrlist/subr/kpi_vfs).
+  Check: urlprops shows "class 4" and NSURLFileProtectionKey = NSURLFileProtectionNone.
+- 2026-11-14 19:31 phone time (Claude, 00:35 UTC) cpemul-vfs kernel: PosterBoard's store MIGRATED: .../PRBPosterExtensionDataStore
+  now holds 61 (59 gone); urlprops as mobile: getattrlist class 4, F_GETPROTECTIONCLASS 4, NSURLFileProtectionKey =
+  NSURLFileProtectionNone. xnu12377-cpemul-vfs.diff confirmed for the data store; wallpaper UI not yet confirmed.
+- 2026-11-15 00:45 (Claude) wp8: store OK, gallery spins forever. PosterFoundation/PosterKit errors: "pf_nukeDirectoryAtURL:
+  swap failed (errno=?)", "PRUpdatingService: relocation failed" -> "cleaning up", "failed to mark subdirectory as
+  purgable", "sortedConfigurations is empty". sweet_hfs hfs_vnop_renamex supports only VFS_RENAME_EXCL -> ENOTSUP
+  for RENAME_SWAP (APFS has it). FIX (source, NOT BUILT): xnu12377-rename-swap.diff - renameatx_np: on ENOTSUP with
+  RENAME_SWAP, sweet_rename_swap() does to->tmp, from->to, tmp->from with RENAME_EXCL (tmp = "<to>.sweetswap-pid-n",
+  rollback per step; boot-arg sweetswap=0 off). systrace now matches NAME anywhere in p_comm and skips ENOENT/ESRCH/
+  EEXIST/ERANGE (the 600-line budget was spent on those); args file now sweetsystrace=Poster (extensions too).
+  "purgable" marking (APFS fsctl) left alone (logged, probably non-fatal).
+- 2026-11-15 01:00 (Claude) rename-swap kernel (phone now on home Wi-Fi 192.168.0.61): the "swap failed"/"relocation
+  failed" errors are GONE; extensions now publish descriptors (reloadDescriptors for Collections/Emoji/Gradient/
+  Unity/Weather/Photos/... and the SQLite db 61/PBFPosterExtensionDataStoreSQLiteDatabase.sqlite3 exists). Gallery
+  still spins: every descriptor is refused by +[PBFPosterModelStoreCoordinator createNewStoreCoordinatorWithPath:]
+  (errno=-1) after "Error marking '...' as purgable: 0 - -1" / "failed to correct file purgable": PosterBoard
+  0x222d4a2d4.. opens the path and ffsctl(fd, 0xc0084a44 = APFSIOC_MARK_PURGEABLE _IOWR('J',68,u64), flags 0x18205)
+  -> HFS ENOTTY. FIX (source, NOT BUILT), in the same vfs_syscalls.c fsctl SWEET block as SWEET_FPFS_DIRSTAT:
+  on hfs, ENOTTY for that cmd -> 0, flags kept in xattr com.apple.sweet.purgeable (boot-arg sweetpurgeable=0 off).
+  Diff research/ios27.2/kernel/xnu12377-rename-swap-purgeable.diff (replaces xnu12377-rename-swap.diff).
+- 2026-11-15 05:10 UTC (Claude) purgeable kernel: LOCK SCREEN + HOME SHOW THE DEFAULT WALLPAPER (photos), but drawn in
+  wrong rectangular blocks (light bands bottom/right, missing tiles). wp10 log: all "Error marking ... as purgable" /
+  createNewStoreCoordinator errors GONE (174 -> 0); still ENOTTY "pf: failed to mark subdirectory ... purgable" on
+  com.apple.PosterKit/temp|trash and pf_nukeDirectoryAtURL (PosterFoundation also issues fsctl 'J' 3 (0x40184a03),
+  113 (0xc1104a71), 111 (0xc0304a6f), 109 (0x40304a6d); only 68 is emulated) - logged only so far. Gallery: 12
+  descriptors pushed, snapshots "much success". SpringBoard (PaperBoardUI): "Could not read snapshot: (url=.../61/
+  Extensions/com.apple.WallpaperKit.CollectionsPoster/configurations/<uuid>/versions/0/RuntimeSnapshot-<hw>-lock.atx)"
+  + "Could not read snapshot color statistics", and a loop "activating lock scene"/"Poster scenes un-fenced update"
+  (~910x). Settings > Wallpaper still spins (likely waits for those snapshots). tracev3.py: a u32 follows the flags for
+  EVERY shared-cache (0x4) format, not only with 0x20 (unparsed args 35064 -> 11250).
+  Next: why .atx snapshots cannot be read (format: AppleTexture / compressed IOSurface?) - pull one .atx + the log.
+- 2026-11-15 05:30 (Claude) the snapshot .atx = "AAPL\r\n\x1a\n" container, HEAD: GL 0x93B0 (ASTC 4x4) RGBA, 1179x2556,
+  layout watermark "DroidVM linear 1" = UniXNU's own texture layout (NativeBridgeMetalFrontend.mm DVMLinearTextureLayout,
+  newTextureWithBytesNoCopy only over that layout). UniXNU's plugin notes (NativeAdrenoMetalPlugin.mm ~107): QuartzCore's
+  CADeviceIsVirtualized byte gates ~40 paths "(XR formats, backdrop compute, ASTC ...)"; "Holding the byte at 0 turned all
+  of them, and the tablet drew light blue blocks" = exactly our lock screen. 24B119 QuartzCore has the MobileGestalt key
+  "IsVirtualDevice" (0x18471e873) -> we answer false (UniXNU's DroidVM: true). TEST: mgtool setbool IsVirtualDevice true
+  (MG cache, system-wide; iOS 16 history: it made locationd crash-loop, see 2026-11-11 above) + reboot. Also: the
+  driver's own refusal lines need boot-arg log-gpu=1 (plugin sets SHENG_LOG_GPU) - add it if the test is not enough.
+- 2026-11-15 05:20 UTC (Claude) IsVirtualDevice=true test: Settings > Wallpaper unchanged (spins), lock screen unchanged,
+  home screen wallpaper turned mostly white like the lock screen -> not the fix; user to `mgtool unset IsVirtualDevice`.
+  Next: the driver's own refusal lines. outputs/ios27a-loggpu-boot-args.txt = systrace args with sweetsystrace=Poster ->
+  log-gpu=1 (plugin sets SHENG_LOG_GPU; NBLOG/GLOG lines go to os_log default, persisted). Same kernel, re-wrap only.
+- 2026-11-15 06:40 UTC (Claude) log-gpu=1 boot (wp11; the plugin's GLOG text is readable with `strings` on the decoded
+  tracev3 - its formats live in the bundle, which tracev3.py does not resolve). native-metal refusals per boot:
+  62x "heap refused: resource options: Invalid(UndefinedValue { ty: MTLResourceOptions, raw: 6291968 (0x600200) })"
+  -> every MTLHeap with the new 27.2 option bits 21/22 is nil; ~150x "heap texture refused: OutOfMemory(Heap)" (automatic
+  heaps fall back to a standalone texture, harmless); 10x render pipeline VertexAttribute 0; UnspecializedFunction
+  (SceneKit-style shaders); 3x device OutOfMemory; many binary-archive refusals (harmless). FIX (plugin source, NOT
+  BUILT): research/ios27.2/adrenometal-resopts.diff - NativeBridgeMetalFrontend.mm passes only the defined
+  MTLResourceOptions fields (kNBDefinedResourceOptions 0x3ff: CPU cache, storage, hazard) to the runtime for heaps,
+  heap buffers, buffers, textures and heap size queries (objects keep the caller's value). Backup
+  kernel-backup/NativeBridgeMetalFrontend.mm.before-resopts. CODEX: rebuild NativeAdrenoMetal.bundle as on
+  2026-11-13 17:07 (ios26.0 deployment, SDK 27.2, lower-macho 0 refused, check-imports), repack a bundle-only box
+  (outputs/ios27-metal-resopts-box.img, the 6 bundle entries of ios26-metal-box.img); user dd's it to rawdump.
+
+- 2026-11-15 07:10 UTC (Claude) Full box boot: Setup ("Hello") runs although the box's nobuddy2 prefs were installed
+  the boot before (this boot: SWEETDNE skip). Kernel log: backboardd aborted once in Setup, "Assertion failed:
+  (found != slist->end()), function push_surface, ogl-context.cpp:1309" (QuartzCore +0x7ba68, caller +0x1d9678 =
+  push_surface right after the context's create-surface vcall) WITH NativeAdrenoMetal loaded, during a GPU stall
+  (fences stuck at done 97 for seconds; no GPU recovery) -> everything relaunched. User: no SSH/Wi-Fi/screen ->
+  never ask for SSH on such boots. NEW tools/ios27-files-pull.py OUTDIR [paths]: copies files off the HFS root from
+  ANDROID (adb su): volume header + whole catalog (~192 MB) -> path lookup -> data extents; "dir/" = 2 newest
+  files; default = Setup/SpringBoard/backboardd prefs + 2 newest Persist/Special tracev3. Tested with IMG=cdr
+  (launchd.plist 1339510 B). Limits: >8 extents, decmpfs-compressed files (reported 0 bytes), unflushed journal.
+- 2026-11-15 07:40 UTC (Claude) Why Setup runs (setup1 pull, tools/ios27-files-pull.py): purplebuddy prefs are fine
+  (SetupDone/SetupFinishedAllSteps/ForceNoBuddy/all Presented = true). Special log: "BYSetupAssistantNeedsToRun is YES
+  to show upgrade mini buddy"; SpringBoard "Setup mode state did change - required reason: initialSetup".
+  Daemon_BYSetupAssistantNeedsToRun (SetupAssistant 0x1cbcae70c): ForceNoBuddy read (NSUserDefaults path) came back NO
+  in that process; then setupDone=YES and flag 0x1ed123c00 = (MGGetSInt32("DeviceClassNumber") == 4, i.e. AppleTV)
+  ==1 -> int "TVSetupVersion" (purplebuddy, user mobile) <= 14 -> mini buddy. So MobileGestalt says DeviceClassNumber
+  4 on the phone (other logs still say deviceClass=iPhone). Suspect mgtool edits of CacheExtra
+  (DeviceClassNumber key mtrAoWJ3gsq+I90ZnQ0vQw). Next: pull com.apple.MobileGestalt.plist from Android and check.
+- 2026-11-15 07:50 UTC (Claude) MG cache pulled (outputs/mg1): CacheExtra still has IsVirtualDevice
+  (MrC93gcyPVLHmEbzUu9uzQ) = True (the 05:20 test was never unset); DeviceClassNumber is not in CacheExtra (comes
+  from CacheData). Box outputs/ios27-fixmg-box.img: MobileGestalt.plist without IsVirtualDevice (rest unchanged) +
+  phone's purplebuddy.plist + TVSetupVersion=99 (so the class-4 mini-buddy branch is skipped even if the class
+  stays 4). Flash to rawdump; existing files keep owner/mode.
+- 2026-11-15 07:35 UTC (Claude) fixmg box worked: Setup gone, home screen + SSH back (so Setup was the IsVirtualDevice
+  leftover). wp15 baseline (IsVirtualDevice gone, original plugin): still 9x "native-metal: heap refused: resource
+  options ... raw: 6291968" (0x600200, bits 21/22 undefined in metal-rs). The resopts black screen happened with
+  IsVirtualDevice still set -> retry outputs/ios27-metal-resopts-box.img (plugin-only); rollback =
+  outputs/ios26-metal-box.img (original plugin only).
+- 2026-11-15 07:55 UTC (Claude) resopts plugin installed over SSH (old bundle at /var/local/NativeAdrenoMetal.bundle.orig):
+  boots fine; "heap refused" gone. Remaining "heap texture refused: OutOfMemory(Heap)" are automatic heaps -> the
+  frontend falls back to a standalone texture (harmless). Settings > Wallpaper spinner cause: PosterBoard's gallery
+  is empty ("gallery has 0 items ... EMPTY -> kicking prewarm"); prewarm 4FB3F2A stalls after ReloadDescriptors;
+  wp15: "enqueueGalleryConfigurationUpdateWithOptions ... Error Domain=com.apple.PosterBoard.generalErrorDomain
+  Code=2 Proactive timed out calling fetchFaceGalleryConfigurationWithCompletion:" -> duetexpertd
+  (com.apple.proactive.FaceSuggestions.xpc) never answers. Next: per-thread stacks of duetexpertd/PosterBoard/
+  Preferences with tsample (NEW: 4th arg -1 = every thread, "A <index>" before each).
+- 2026-11-15 08:00 UTC (Claude) tsample (name lookup + all threads) on duetexpertd: main thread blocked in
+  __ATXInitializeInOwnerProcess (dispatch_once) waiting for thread 1, which is in a SYNCHRONOUS XPC to locationd
+  (CoreLocation CLClientGetAuthorizationStatus... -> xpc_connection_send_message_with_reply_sync, from
+  ProactiveContextClient dispatch_once). locationd never replies -> duetexpertd never finishes init -> FaceSuggestions
+  never answered -> PosterBoard gallery empty -> Settings > Wallpaper spinner. Next: locationd state (27.2 locationd
+  SIGBUS in voucher adopt, see 11-14 05:45).
+- 2026-11-15 08:05 UTC (Claude) locationd (pid 75) alive but thread #3 spins at 99.6% of a core in
+  _dispatch_wait_for_enqueuer -> _pthread_yield_to_enqueuer_4dispatch -> thread_switch (every sample): an MPSC queue
+  whose enqueuer never links its item; other threads idle in kevent. So locationd never serves the sync XPC from
+  duetexpertd. Same family as 11-14 05:45 (CFString where a voucher belongs) -> suspect a libdispatch structure
+  read/written wrongly (LDRAA emulation looks right; open). Test: kill locationd, see if it recurs and whether
+  duetexpertd/the gallery recover.
+- 2026-11-15 08:15 UTC (Claude) Killing locationd (spinning) unblocked duetexpertd: Settings > Wallpaper lists
+  wallpapers. Selecting one froze the phone (SSH alive). wp17 + dmesg-freeze: the GPU recovered from a lost VkDevice
+  (CA command buffer "GpuRecoveryVictim"); afterwards every object backboardd made before is refused
+  (NotImplemented(MadeBeforeRecovery): 7935 heap textures, 1333 setRenderPipelineState, encoders) -> nothing draws;
+  then OutOfMemory(Device) (15342 textures, 595 buffers) and kernel "backboardd method 2 failed 0xe00002bd" x37500,
+  backboardd holding 1633 MB of the GPU pool. Fix A (BUILT AS SOURCE, research/ios27.2/adrenometal-recovery-exit.diff,
+  backup kernel-backup/NativeMetalObjects.rs.before-recovery-exit): bridge/NativeMetalObjects.rs observe_message
+  aborts the process on "metal2vulkan-degrade-device-recovered" (NATIVE_METAL_RECOVERY_EXIT=0 keeps it) -> respring
+  instead of a frozen phone. CODEX: rebuild NativeAdrenoMetal.bundle with it (on top of resopts). Still open: WHY the
+  GPU faulted/hung (kernel ring from Android: tools/ios27-klog-pull.sh), and the boot-time locationd spin.
+- 2026-11-15 08:30 UTC (Claude) Wallpaper set (default iOS 27 one) after a respring; lock-screen clock drawn wrong.
+  wp18/dmesg-clock: "SWEET MTL: PosterBoard: 80 MB buffer refused (holds 174 MB, 315 MB of the pool free): the
+  compositor's reserve" + PosterBoard/MercuryPosterExtension "method 2 failed 0xe00002bd" (pool free 288-314 MB of
+  the 2.7 GB pool); plugin: 126 buffers + 75 textures OutOfMemory(Device). ~2.4 GB of the pool is held by someone the
+  2-min dmesg window does not show (zombies of the killed backboardd? a leak?). NEW kernel diff (SOURCE ONLY, not
+  built): research/ios27.2/kernel/xnu12377-gpu-census.diff (SweetAccelerator.cpp; backup
+  kernel-backup/SweetAccelerator.cpp.before-census): every open client registered; on a pool refusal (cap, reserve,
+  or no free run = fragmentation, now told apart) logs "SWEET MTL census" at most every 10 s: pool free, zombie
+  count/MB, each client name[pid] holds/peak, total. CODEX: build kernel with it + plugin with
+  adrenometal-recovery-exit.diff; boot image with the current boot-args (outputs/ios27a-loggpu-boot-args.txt).
+- 2026-11-15 08:30 UTC (Claude) Wi-Fi never saved (com.apple.wifi-networks.plist {}, auto-join
+  "EmptyKnownNetworksList" at every boot). oslog (userland/out/oslog, works on 27.2) of a join: wifid
+  "Completed Apple80211AssociateAsync (-3902)" 0.1 s BEFORE "link up"; Preferences got "link down (involuntary)
+  reason=4" in between. wland.out: the join itself succeeds ("join: link lost (asked)" -> "*** joined ***" in 120 ms).
+  Cause: flame_sta.c sta_link_changed(false) reports the deliberate drop of the old link (wland leaves before it
+  joins) as a loss (redwood_sta_lost(ECONNRESET) -> involuntary link down) and wifid aborts its join -> never added to
+  known networks. FIX (SOURCE, research/ios27.2/kernel/xnu12377-wifi-quiet-link.diff, backup
+  kernel-backup/flame_sta.c.before-quietlink): sta_quiet during sta_join/sta_leave/power-off suppresses that report;
+  sta_power(false) now leaves the network (Wi-Fi off in Settings did nothing). CODEX: build with the census diff.
+  Also seen: hotspot WPA3-transition join "Attempting to join SAE" (wland does WPA2 PSK; worked as WPA2 here);
+  "failed to become routable" (DHCP slow) after auto-join - check after this fix.

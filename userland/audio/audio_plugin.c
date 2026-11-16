@@ -16,9 +16,10 @@
  * with nothing plugged in plays through, with a volume, the volume display and the place in
  * Control Center that go with it. So this presents four devices under those names:
  *
- *   "Speaker"   a stereo output whose samples are written to /dev/hakios-audio, where the
- *               kernel takes them to whatever can play them (see sys/hakios.audio.h), and a
- *               stereo input that is always silent (on an iPhone: what the amplifiers measure)
+ *   "Speaker"   a stereo output whose samples are written to /var/local/pcm.ring for adspd's
+ *               ADSP ASM playback stream (sweetpcm.h); it falls back to /dev/hakios-audio if
+ *               the ring is not present, plus a stereo input that is always silent (on an iPhone:
+ *               what the amplifiers measure)
  *   "Hawking"   one silent input and nothing else. The virtual audio device will not build the
  *               speaker route without a second virtual device of its own (its type 'vhaw', a
  *               mandatory companion of the default one in the iPhone X's routing tables) whose
@@ -58,6 +59,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -69,6 +71,7 @@
 #include <unistd.h>
 
 #include "hakios.audio.h"
+#include "sweetpcm.h"
 
 /* ---- the AudioServerPlugIn interface (macOS: CoreAudio/AudioServerPlugIn.h, AudioHardwareBase.h) ---- */
 
@@ -241,6 +244,7 @@ static struct device devices[] = {
 static AudioServerPlugInHostRef host;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int sink = -1;                   /* /dev/hakios-audio */
+static struct sweetpcm *pcm_ring;        /* adspd's shared ASM playback ring */
 static Float64 ticks_per_frame;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 /*
@@ -252,6 +256,7 @@ static Float64 speaker_next = -1;       /* the sample time the next write of the
 static UInt64 speaker_jumps, speaker_jumped;    /* how often its times jumped, and by how many frames in all */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
 static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
+static unsigned haptic_starts_said;
 
 static void
 say(const char *format, ...)
@@ -367,6 +372,55 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 	}
 	say("hakios: audio: the speaker is with the HAL (%s: %s)\n", HAKIOS_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
 	return 0;
+}
+
+/* adspd creates the shared ring before starting its ASM stream. Try at StartIO so that
+ * mediaserverd can start before the DSP daemon; the audio callback itself never opens files. */
+static void
+pcm_ring_map(void)
+{
+	if (pcm_ring != NULL) {
+		return;
+	}
+	int fd = open(SWEETPCM_PATH, O_RDWR);
+	if (fd < 0) {
+		say("hakios: audio: no %s; speaker output will be dropped\n", SWEETPCM_PATH);
+		return;
+	}
+	void *m = mmap(NULL, SWEETPCM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (m == MAP_FAILED) {
+		say("hakios: audio: mmap %s failed: %s\n", SWEETPCM_PATH, strerror(errno));
+		return;
+	}
+	struct sweetpcm *ring = m;
+	if (ring->magic != SWEETPCM_MAGIC || ring->frames != SWEETPCM_FRAMES || ring->channels != 2 || ring->rate != HAKIOS_AUDIO_RATE) {
+		say("hakios: audio: %s has an incompatible ring header\n", SWEETPCM_PATH);
+		munmap(m, SWEETPCM_SIZE);
+		return;
+	}
+	pcm_ring = ring;
+	say("hakios: audio: speaker PCM ring mapped (%u Hz, %u frames)\n", ring->rate, ring->frames);
+}
+
+/* HAL mix: packed signed-16 stereo, the same format as the ADSP ring. Apply the
+ * device volume in software when no kernel speaker sink is installed. */
+static void
+pcm_ring_write(const int16_t *src, UInt32 frames)
+{
+	if (pcm_ring == NULL) {
+		return;
+	}
+	Float32 gain = volume;
+	uint64_t w = __atomic_load_n(&pcm_ring->wpos, __ATOMIC_RELAXED);
+	for (UInt32 i = 0; i < frames; i++) {
+		UInt32 k = (UInt32)((w + i) % SWEETPCM_FRAMES);
+		for (UInt32 c = 0; c < 2; c++) {
+			Float32 sample = (Float32)src[2 * i + c] * gain;
+			pcm_ring->data[2 * k + c] = (int16_t)(sample > 32767.0f ? 32767.0f : sample < -32768.0f ? -32768.0f : sample);
+		}
+	}
+	__atomic_store_n(&pcm_ring->wpos, w + frames, __ATOMIC_RELEASE);
 }
 
 static OSStatus
@@ -906,10 +960,18 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 		d->anchor = mach_absolute_time();
 		d->periods = 0;
 		if (d->output != 0) {
+			if (d->object == OBJECT_SPEAKER) {
+				pcm_ring_map();
+			}
 			written = refused = 0;
 			speaker_next = -1;      /* sweet */
 			speaker_jumps = speaker_jumped = 0;
 			say("hakios: audio: playing\n");
+			if (d->object == OBJECT_ACTUATOR && haptic_starts_said < 4) {
+				haptic_starts_said++;
+				say("hakios: audio: Actuator StartIO %u (object %u, stream %u)\n",
+				    haptic_starts_said, (unsigned)d->object, (unsigned)d->output);
+			}
 		}
 		if (d->object == OBJECT_CODEC) {
 			codec_open();
@@ -990,6 +1052,9 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
  */
 static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
 static unsigned haptic_said;
+static unsigned haptic_open_said;
+static unsigned haptic_callbacks_said;
+static unsigned haptic_writes_said;
 
 /*
  * How strong the taps feel: a percentage in /var/local/haptic-strength (1..100, default 100), read again every
@@ -1066,6 +1131,16 @@ actuator_write(const int16_t *samples, UInt32 frames)
 			haptic = open("/dev/hakios-haptic", O_WRONLY | O_NONBLOCK);
 		}
 		haptic = haptic >= 0 ? haptic : -2;
+		if (haptic_open_said < 4) {
+			haptic_open_said++;
+			say("hakios: audio: actuator device open: fd %d%s\n", haptic,
+			    haptic >= 0 ? "" : " (tried /dev/apollo-haptic and /dev/hakios-haptic)");
+		}
+	}
+	if (haptic_callbacks_said < 8) {
+		haptic_callbacks_said++;
+		say("hakios: audio: actuator callback %u: %u frames, peak %d of 32768, fd %d\n",
+		    haptic_callbacks_said, (unsigned)frames, peak, haptic);
 	}
 	if (haptic >= 0) {
 		static uint64_t run_began, heard;
@@ -1080,7 +1155,12 @@ actuator_write(const int16_t *samples, UInt32 frames)
 		int pct = haptic_strength(run_began != 0 && now - heard <= SILENCE_NS && now - run_began >= VIBRATION_NS);
 
 		if (pct >= 100) {
-			(void)write(haptic, samples, (size_t)frames * 2);
+			ssize_t n = write(haptic, samples, (size_t)frames * 2);
+			if (haptic_writes_said < 8) {
+				haptic_writes_said++;
+				say("hakios: audio: actuator write %u: %zd/%u bytes, strength %d%%, errno %d\n",
+				    haptic_writes_said, n, (unsigned)(frames * 2), pct, n < 0 ? errno : 0);
+			}
 		} else {
 			int16_t scaled[1024];
 
@@ -1090,7 +1170,12 @@ actuator_write(const int16_t *samples, UInt32 frames)
 				for (UInt32 i = 0; i < n; i++) {
 					scaled[i] = (int16_t)((int)samples[done + i] * pct / 100);
 				}
-				(void)write(haptic, scaled, (size_t)n * 2);
+				ssize_t bytes = write(haptic, scaled, (size_t)n * 2);
+				if (haptic_writes_said < 8) {
+					haptic_writes_said++;
+					say("hakios: audio: actuator write %u: %zd/%u bytes, strength %d%%, errno %d\n",
+					    haptic_writes_said, bytes, (unsigned)(n * 2), pct, bytes < 0 ? errno : 0);
+				}
 				done += n;
 			}
 		}
@@ -1135,7 +1220,9 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 			speaker_next = at + frames;
 		}
 		/* the kernel takes it all or leaves it: this thread must not wait */
-		if (sink < 0 || write(sink, buffer, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {
+		if (d->object == OBJECT_SPEAKER && pcm_ring != NULL) {
+			pcm_ring_write(buffer, frames);
+		} else if (sink < 0 || write(sink, buffer, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {
 			refused += frames;
 		}
 		written += frames;

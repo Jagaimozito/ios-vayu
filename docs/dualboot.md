@@ -1,12 +1,18 @@
 # Dual boot: Android and iOS on one OnePlus 7 Pro (guacamole)
 
-The Alert Slider picks the operating system at power-on. No PC, no slot switching.
+A boot menu picks the operating system at power-on (`shim/menu.c`): iOS 27, iOS 16, Android. Volume up
+and down move the selection, power starts it. The Alert Slider picks the default, which starts after 5 s
+unless a key is pressed:
 
-| Alert Slider | Boots |
+| Alert Slider | Default |
 | --- | --- |
 | top | Android (boot_a: the stock ROM boot image, Magisk included) |
-| middle | iOS 16 |
+| middle | iOS 27 (partition `ios26`; when the boot image carries no iOS 27 payload: iOS 16) |
 | bottom | iOS 16 |
+
+Keys come from the PM8150 over the SPMI arbiter, read only: power = PON INT_RT_STS (0x0810) bit 0,
+volume down = bit 1 (RESIN) or GPIO7 (0xc610), volume up = GPIO6 (0xc510), as the kernel's keys driver
+reads them. Keys still held from power-on are ignored until released.
 
 Status (2026-11-12): both paths work from a tethered `fastboot boot` of the selector image; Android
 boots with Magisk. Flashing it to `boot_b` with slot B active is the permanent setup below.
@@ -81,6 +87,38 @@ Requirements: unlocked bootloader, Android on slot A (`boot_a`), the iOS root on
    ```
 5. Back to plain Android at any time: `fastboot set_active a`.
 
+## Triple boot image (iOS 27 + iOS 16 + Android)
+
+One boot image carries both iOS payloads in its ramdisk, iOS 16 first, each on a 4 KiB boundary
+(`shim/loader.c` `payload_at`, `loader_count`, `loader_boot_n`); the menu enables "iOS 27" when a
+second payload is there. Build both iOS boot images as usual (their own kernel, ADT and boot-args,
+`ufsroot=ios` / `ufsroot=ios26`), rebuild the shim (`BOARD=guacamole shim/build.sh`), then:
+
+```
+python3 tools/mktripleboot.py dtb/android-boot_b.img shim/out/Image IOS16.img IOS27.img OUT.img
+```
+
+It refuses more than ~50 MiB of payloads (ABL's ramdisk room above the DTB, below 0x85700000). Test with
+`fastboot boot OUT.img`, then flash it to `boot_b` as below. An iOS restart (PSCI SYSTEM_RESET) comes
+back to this menu.
+
+## Rebuilding the boot image (kernel or payload changes)
+
+Same as before, with the selector shim:
+
+```
+tools/xnu-local-build.sh                                   # kernel with any new xnu/patches
+BOARD=guacamole shim/build.sh                               # shim/out/Image = selector shim
+CPUS=8 TOUCH=1 KEYS=1 USB=1 tools/guac-mkboot.sh KERNEL dtb/android-boot_b.img shim/out/Image OUT.img "BOOT-ARGS"
+```
+
+`dtb/android-boot_b.img` only supplies the header fields and the device-tree section (identical in both
+slots' images). The current boot-args are in the payload header of the image on boot_b; to print them:
+
+```
+python3 -c "import struct,sys;b=open(sys.argv[1],'rb').read();k,_,r=struct.unpack_from('<III',b,8);o=4096*(1+(k+4095)//4096);print(b[o+0x48:o+0x48+608].split(b'\0')[0].decode())" OLD.img
+```
+
 ## Rules of thumb
 
 - Every future iOS boot image must be built with this shim, or the selector disappears.
@@ -100,6 +138,7 @@ checks, keystore), the shim could pass ABL's verity line for slot A instead.
 
 ## Files
 
+- `shim/menu.c`, `shim/menu.h`: boot menu (keys over SPMI, drawing).
 - `shim/bootsel.c`, `shim/bootsel.h`: slider read, diagnostics screen.
 - `shim/android.c`, `shim/android.h`: boot_a loader.
 - `shim/ufs.c`: `ufs_open`, `ufs_find`, `ufs_find_guid`, `ufs_read` (read-only, any LUN).
