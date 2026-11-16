@@ -1,5 +1,9 @@
 # Priority handoff — Guacamole RAM accounting; defer remaining haptics (2026-11-15)
 
+## Audio status correction (2026-11-16)
+
+The iOS 27.2 audio path is doing more than the earlier test-tone check: the user confirms Settings sounds and keyboard clicks work. Game audio was absent in the latest game test; microphone input remains unconfirmed. Do not describe all built-in speaker audio as unreliable.
+
 ## Active Wi-Fi join/reporting fix — suppress requested link-off (2026-11-15)
 
 The earlier quiet-link change suppressed `redwood_sta_lost(ECONNRESET)` during a requested join/leave, but it still

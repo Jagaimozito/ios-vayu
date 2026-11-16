@@ -15,7 +15,7 @@
 
 - **Metal and GPU rendering:** the NativeAdrenoMetal/Turnip path has initialized in some boots and can render parts of the UI. Rendering is not dependable: Subway Surfers has shown a black screen shortly after launch, and earlier runs flickered or froze. GPU hangs have also required recovery work. Do not treat Metal app compatibility as complete.
 - **Wi-Fi:** association has succeeded, but iOS may report “failed to join” even when connected. DHCP, link stability, saved-password behavior, and automatic reconnection have not been consistently verified. SSH can drop during a reconnect.
-- **Audio:** a test tone was heard once, but game audio was absent in the latest report. Built-in speaker playback is therefore not reliable; microphone input has not been confirmed.
+- **Audio:** Settings sounds and keyboard clicks work. Game audio was absent in the latest report; microphone input has not been confirmed.
 - **Haptics:** Settings switches and long-press/app-icon feedback still do not work, despite keyboard and ringtone patterns working.
 - **Performance:** the UI has felt slow and sometimes unusable. A profiler capture showed `PerfPowerServices` near 100% CPU and `wland` using CPU, but the cause and current contribution have not been established.
 - **Device identity:** the generated device tree uses the iPhone 14 Pro/D73 identity. That does not mean every identity-dependent feature or app behaves as on a real iPhone 14 Pro.
