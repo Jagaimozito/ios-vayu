@@ -20,6 +20,19 @@
 - **Performance:** the UI has felt slow and sometimes unusable. A profiler capture showed `PerfPowerServices` near 100% CPU and `wland` using CPU, but the cause and current contribution have not been established.
 - **Device identity:** the generated device tree uses the iPhone 14 Pro/D73 identity. That does not mean every identity-dependent feature or app behaves as on a real iPhone 14 Pro.
 
+## Upstream-derived changes
+
+- **PM8150B charging current:** upstream `ios-sweet` commit `6e58ed0` is carried as kernel patch
+  `xnu/patches/0167-guacamole-charger-input-current.patch` and has been applied to the current
+  `work/xnu-12377` tree. It writes only the five PM8150B charger-current registers listed in the patch.
+  It is opt-in: boot with `sb=2 sc=1`; the kernel also accepts the long forms `sweetbattery=2 sweetcharge=1`.
+  The alias-enabled kernel built on 2026-11-16; the new triple-boot image has not been runtime tested yet.
+- **Metal memoryless handling:** upstream commits `8cc7d40` and `8a02388` are carried as bridge patches
+  `0102-sweet-tight-render-area-experiment.patch` and `0103-sweet-untouched-memoryless-dont-care.patch`.
+  Both apply to the pinned metal2vulkan source in order. The memoryless behavior remains opt-in through
+  `M2V_UNTOUCHED_MEMORYLESS=1`; the render-area experiment is separately gated by
+  `M2V_TIGHT_RENDER_AREA=1`. No new bridge/bundle build or rendering test has been run yet.
+
 ## Not working or not implemented
 
 - **Bluetooth:** the Settings toggle has been unstable (including becoming greyed out); usable Bluetooth connections have not been confirmed. The current investigation points to BlueTool/controller profile and service matching, not a finished Bluetooth port.

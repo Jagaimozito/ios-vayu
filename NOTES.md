@@ -1,4 +1,85 @@
+# Priority handoff — Wi-Fi ASSOC_DONE needs a 540-byte record (Claude, 2026-11-16 23:30 UTC)
+
+**RESULT (user, 2026-11-16 23:23 UTC): WORKS.** Join no longer reports failure, it connects, and the password is
+remembered. Diffs committed under `xnu/ios27/`.
+
+The wifi-assoc-event kernel (8-byte ASSOC_DONE payload) still fails every join with -3902 (outputs/wifi-join3.log,
+work network + hotspot; known networks still empty). That capture shows the quiet-link fix works (no involuntary
+link-down any more) and IO80211 prints the cause: `TRACER:_dispatchAsyncAssocEvent@6567:-3902
+join_status:-1431655766/-1431655766`. Disassembly of IO80211 27.2 (_eventRead 0x28c9b5570 -> 0x28c9d3b9c, payload =
+event data after the 16-byte ifname): reads +536 (0 -> ask request 21 and map 1..0x4a through the table at
+0x28c9e5f0c, 1 -> 0 success; nonzero -> map +532 directly), logs +520/+528; a loop also reads 10 entries before them.
+Payload size is therefore 540 bytes; anything shorter leaves wifid's 0xAA fill -> +536 != 0, +532 = 0xAAAAAAAA ->
+-3902. kev_post_msg refuses messages over MLEN (224 bytes), so:
+- bsd/kern/kern_event.c (SWEET only): messages over MLEN go in a cluster (m_getcl), up to MCLBYTES.
+- bsd/dev/redwood_apple80211.c: ASSOC_DONE posts 540 zero bytes (-> request 21 -> join_result).
+Diff: research/ios27.2/kernel/xnu12377-wifi-assoc540.diff (backups kernel-backup/kern_event.c.before-bigkev,
+redwood_apple80211.c.before-assoc540). Built by Codex on the current tree; 2 GiB GPU pool retained. Kernel SHA-256
+`c2b206df564e1a8652ebef5e9949fea3a9b4aaf74220fb783ff389f20784b729`, log
+`work/xnu12377-wifi-assoc540-build.log`. The 540-byte event record and `kern_event` cluster allocation are packaged
+with the same arguments as the earlier wifi-assoc-event image (`sweettime` refreshed) and the D73 ADT. Selector image:
+`outputs/guacamole-ios27a-wifi-assoc540-triple.img`, SHA-256
+`d5148a5eb56bb05c4a0f57cf0f4f6562b3e5c48474e4f78f93b05dd4f79fa3a9`. Not booted or runtime-tested. Boot only this
+selector image; from the repository root run `fastboot boot outputs/guacamole-ios27a-wifi-assoc540-triple.img` and
+select iOS 27. On a later join, check that `join_status:` no longer shows `-1431655766`; a successful join should show
+Forget This Network and a populated `com.apple.wifi-networks.plist`, then auto-join after reboot. The prior log was
+sufficient to diagnose this; do not interrupt an active Wi-Fi/SSH session to collect another log before testing.
+Also open: CoreWiFi "Unexpected event payload length for APPLE80211_M_BSSID_CHANGED (expected=28, actual=0)".
+
+# Review of Codex's 11-15/11-16 work (Claude, 2026-11-16)
+
+- **User 2026-11-16 18:00:** the 2 GiB GPU pool kernels boot and run fine; lock-screen clock usually right at boot, else one
+  respring on the first app close fixes it. The wifi-assoc-event kernel did NOT fix Wi-Fi saving.
+- **(superseded by the user's report above) GPU pool regression in every newer kernel.** `sweet_gpu.c` `gpu_pool_ranges[]` still holds only
+  `0x200000000-0x280000000` (2 GiB) from the untested `ram-gpuhigh` trial, so the shortargs and wifi-assoc-event
+  kernels also have 2 GiB instead of ~2.67 GiB. The 11-15 wallpaper boots already ran out of GPU memory at 2.67 GiB
+  (PosterBoard refused, ~300 MB free). Restore the two low ranges for normal builds; keep 2 GiB only for the trial.
+- **Wi-Fi ASSOC_DONE payload:** plausible and harmless. Timing in `outputs/wifi-join.log` supports it: -3902 came at
+  the join's completion (07.651), not at the involuntary link-down (07.485). The 0xAAAAAAAA handler itself was not
+  re-confirmed (the 0xaaaaaaaa/-3902 sites checked in wifid/IO80211 were a CFNumber lookup and ANQP parsing).
+- **quiet-link extension** (no `redwood_net_link_state(false)` during a join): the interface stays "up" across a
+  network switch, so IPConfiguration may keep the old network's lease. Test switching between two networks.
+- **Charger 0167:** writes limited to 5 PM8150B registers, ICL by source type as smb5-lib, FCC 2000 mA (0.5 C), JEITA
+  and AICL left on. Reasonable. Memoryless patches: unbuilt, gated; fine.
+- **Not built:** `research/ios27.2/adrenometal-recovery-exit.diff` (driver exit after a GPU reset; prevents the
+  wallpaper freeze). The resopts plugin is installed on the phone over SSH, not in any box.
+
+# Priority handoff — iOS 27 Wi-Fi async association result (2026-11-16)
+
+Used the existing `outputs/wifi-join.log`; no new phone interaction or log capture was needed. It records the phone
+actually associating and getting link-up, while `wifid` reports `Apple80211AssociateAsync (-3902)`. The iOS 27
+association completion handler reads two 32-bit words from the kernel event payload; the prior event 9 had no
+payload, leaving both as `0xAAAAAAAA` sentinels, which the handler maps to `-3902` before it can query request 21.
+
+`work/xnu-12377/bsd/dev/redwood_apple80211.c` now sends two zero words with `EVENT_ASSOC_DONE`. This directs the
+handler to request 21, whose existing `join_result` reports success/authentication/timeout from the actual join.
+Kernel build succeeded (`work/xnu12377-wifi-assoc-event-build.log`); kernel SHA-256:
+`35ed3d9d19228da252cb43d198e1dd14a1ac3a7797a711b5c6a81dc471a9d683`. The payload uses the same D73 ADT and
+current DHCP diagnostic arguments, with `sweettime` refreshed (`outputs/guacamole-ios27a-wifi-assoc-event-boot-args.txt`,
+593 characters). The standalone wrapper is `outputs/guacamole-ios27a-wifi-assoc-event.img`; boot only the selector
+image `outputs/guacamole-ios27a-wifi-assoc-event-triple.img` (iOS 16 + iOS 27 + Android), SHA-256
+`dfa1ac1824d730d5f92b6a80fe37bcb7e221844c3c1120abe6a8d56b87fc8eff`. It has not been booted or runtime-tested.
+
+When ready to test, from the repository root: `fastboot boot outputs/guacamole-ios27a-wifi-assoc-event-triple.img`,
+then select iOS 27. This test does not require collecting another log before the boot.
+
 # Priority handoff — Guacamole RAM accounting; defer remaining haptics (2026-11-15)
+
+## Short charging boot arguments (2026-11-16)
+
+`SweetBattery.cpp` now accepts `sb=2` as an alias for `sweetbattery=2` and `sc=1` as an alias for
+`sweetcharge=1`; the long names remain supported. The current kernel was rebuilt successfully with these aliases
+(`work/xnu12377-battery-shortargs-build.log`, kernel SHA-256
+`3c15d89078ada5baefd7dcc29b32ff8ac6eacc266df36a11512bb4e3d8378861`). Boot arguments based on the latest DHCP
+diagnostic now use `sb=2 sc=1` and are 593 characters: `outputs/ios27a-dhcpdiag-charge-boot-args.txt`.
+
+The D73 ADT and existing iOS 16 payload were retained. The ordinary wrapper is
+`outputs/guacamole-ios27a-dhcpdiag-charge.img` (SHA-256
+`7516ee7255e6b57716642262b64b606effa72a6308363b86a8d496f4cc6e1a71`); the required selector/triple-boot image is
+`outputs/guacamole-ios27a-dhcpdiag-charge-triple.img` (SHA-256
+`ee169571f73abc752eeedffeeb00282db1a1a8af058d325339dc44788fd90e21`). The phone has not booted this image yet.
+To test, run `fastboot boot outputs/guacamole-ios27a-dhcpdiag-charge-triple.img` from the repository root and select
+iOS 27 in the shim menu.
 
 ## Audio status correction (2026-11-16)
 

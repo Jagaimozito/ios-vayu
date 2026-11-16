@@ -1893,7 +1893,8 @@ static int w_eapol_mic_ok(uint8_t *eapol, size_t len)
 static void w_eapol_rx(const uint8_t *e, size_t elen)
 {
 	uint8_t frame[512];
-	if (s_state != S_4WAY || elen < 14 + 4 + 95 || elen - 14 > sizeof(frame) || memcmp(e + 6, s_bssid, 6))
+	if ((s_state != S_4WAY && s_state != S_UP) || elen < 14 + 4 + 95 || elen - 14 > sizeof(frame) ||
+	    memcmp(e + 6, s_bssid, 6))
 		return;
 	size_t len = elen - 14;
 	memcpy(frame, e + 14, len);
@@ -1959,6 +1960,56 @@ static void w_eapol_rx(const uint8_t *e, size_t elen)
 		memset(gtk, 0, sizeof(gtk));
 		LOG("*** WPA2 keys installed (group key %s, idx %u) ***", gtk_len ? "yes" : "NO", gtk_idx);
 		w_join_end(0);
+		return;
+	}
+	if (s_state == S_UP && !pairwise && ack && has_mic && (info & 0x0200)) {
+		/* The AP's group-key rekey (WPA2 group message 1). Once joined, answer it with
+		 * group message 2 and install the replacement GTK. Ignoring it makes the AP
+		 * deauthenticate us with reason 16 (Group Key Handshake timeout). */
+		if (!w_eapol_mic_ok(frame, len)) {
+			LOG("wpa: group-key message MIC wrong");
+			return;
+		}
+		if (replay < s_replay) {
+			LOG("wpa: stale group-key message replay %llu (last %llu)", (unsigned long long)replay,
+			    (unsigned long long)s_replay);
+			return;
+		}
+		if (!(info & 0x1000) || dlen < 24 || dlen > 256 + 8) {
+			LOG("wpa: group-key message has invalid key data (info %#x, %u bytes)", info, dlen);
+			return;
+		}
+		uint8_t plain[256], gtk[32], gtk_len = 0, gtk_idx = 1;
+		if (!aes_unwrap(s_ptk + 16, k + 95, dlen, plain)) {
+			LOG("wpa: group-key message unwrap failed (%u bytes)", dlen);
+			return;
+		}
+		for (uint32_t o = 0; o + 2 <= (uint32_t)dlen - 8 && o + 2 + plain[o + 1] <= (uint32_t)dlen - 8;
+		     o += 2 + plain[o + 1]) {
+			if (plain[o] == 0xdd && plain[o + 1] >= 6 && plain[o + 2] == 0x00 && plain[o + 3] == 0x0f &&
+			    plain[o + 4] == 0xac && plain[o + 5] == 0x01) {
+				gtk_idx = plain[o + 6] & 3;
+				gtk_len = (uint8_t)MIN((uint32_t)plain[o + 1] - 6, 32u);
+				memcpy(gtk, plain + o + 8, gtk_len);
+				break;
+			}
+		}
+		memset(plain, 0, sizeof(plain));
+		if (!gtk_len) {
+			LOG("wpa: group-key message has no GTK KDE");
+			memset(gtk, 0, sizeof(gtk));
+			return;
+		}
+		s_replay = replay;
+		int rc = w_install_key(1, gtk_idx, s_group_cipher == 2 ? WMI_CIPHER_TKIP : WMI_CIPHER_CCMP, gtk, gtk_len);
+		memset(gtk, 0, sizeof(gtk));
+		if (rc) {
+			LOG("wpa: group-key install failed (%d)", rc);
+			return;
+		}
+		w_eapol_send(0x0302, NULL, NULL, 0); /* group message 2: MIC + Secure, no pairwise bit */
+		LOG("wpa: group-key rekey acknowledged (idx %u, %u bytes, replay %llu)", gtk_idx, gtk_len,
+		    (unsigned long long)replay);
 	}
 }
 

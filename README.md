@@ -11,6 +11,7 @@ Status snapshot: **2026-11-16**. For detailed evidence, caveats, and engineering
 ### Working
 
 - **Boot and system UI:** iOS 27.2 reaches the lock screen and SpringBoard when started through the triple-boot selector.
+- **Shutdown and reboot:** shutdown and reboot work normally on iOS 27; rebooting through SSH has also been confirmed.
 - **Touch and navigation:** touch input works for navigating the UI and launching apps.
 - **System apps:** the rebuilt root image puts staged system apps in `/Applications`; Filza was separately installed and confirmed to open.
 - **Brightness and Night Shift:** both were confirmed working by the user through the `sweet-displayd` daemon and D73 backlight properties.
@@ -55,4 +56,4 @@ This port is for development on the owner's device. Code-signing, sandbox, and o
 
 ## Credits
 
-Built on Apple's open-source XNU and related releases, Qualcomm and OnePlus hardware documentation and kernel sources, [Mesa](https://mesa3d.org) Freedreno/Turnip, [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel), [ios-topaz](https://github.com/MakrSas/ios-topaz), [ios-flame](https://github.com/NWylynko/ios-flame), and [UniXNU](https://github.com/UniXNU/UniXNU). See source files and component READMEs for origins and licenses. iOS itself is Apple's and is not distributed here.
+Built on Apple's open-source XNU and related releases, Qualcomm and OnePlus hardware documentation and kernel sources, [Mesa](https://mesa3d.org) Freedreno/Turnip, [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel), [ios-topaz](https://github.com/MakrSas/ios-topaz), [ios-flame](https://github.com/NWylynko/ios-flame), [UniXNU](https://github.com/UniXNU/UniXNU), and [OtVaL228/ios-sweet](https://github.com/OtVaL228/ios-sweet). See source files and component READMEs for origins and licenses. iOS itself is Apple's and is not distributed here.
