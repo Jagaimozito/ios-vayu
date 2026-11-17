@@ -24,7 +24,7 @@ Status snapshot: **2026-11-17**. For detailed evidence, caveats, and engineering
 
 ### Partial or unreliable
 
-- **Metal/GPU:** NativeAdrenoMetal and Turnip render the UI. Frame rates are limited (roughly 20-40 fps while animating) and long stutters of a few hundred milliseconds still occur. App and game rendering is not reliable.
+- **Metal/GPU:** NativeAdrenoMetal and Turnip render the UI, at roughly 30-40 fps while scrolling (Turnip concurrent binning on: `tu-cb=1`). The display controller scales frames to the panel in hardware (QSEED3) instead of a GPU blit. Stutters are shorter (about 100 ms at worst while scrolling) but not gone; textures still use a linear layout. App and game rendering is not reliable.
 - **Performance:** better after removing the spinning `PerfPowerServices` job and preferring the big CPU cores, but `locationd` can spin on a full core after boot (killing it works around it) and `wland` polls Wi-Fi every millisecond (about 12% of a core).
 - **Video playback:** plays in Safari (YouTube) and from local files since the YUV video layer fix (`xnu/ios27/xnu12377-fb-yuv.diff`); the player controls over the video are fixed in source but not yet confirmed on a build.
 - **Microphone:** input is unconfirmed.

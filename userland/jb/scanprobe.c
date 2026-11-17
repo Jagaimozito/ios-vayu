@@ -10,7 +10,7 @@
  * MDP base): sizes, source address and stride, format, op mode, fetch config; CTL0 again; INTF1's line counter
  * sampled to show where the refresh is. Only blocks that are in use are read (an unused one hung the bus before).
  *
- *   scanprobe        print it (send all of it)
+ *   scanprobe        print it (send all of it); 2026-11-17: also the VIG pipes' QSEED3 scaler and pixel extension
  * MIT, as userland/.
  */
 #include <errno.h>
@@ -78,6 +78,23 @@ int main(void)
 		"SRC_ADDR_SW_ST", "CURRENT_SRC0?" };
 	row("VIG0", MDP + 0x4000, sspp, ssppn, sizeof(sspp) / sizeof(sspp[0]));
 	row("VIG1", MDP + 0x6000, sspp, ssppn, sizeof(sspp) / sizeof(sspp[0]));
+	/*
+	 * 2026-11-17, for hardware scaling (the VIG pipes upscale CoreAnimation's 828x1792 frame to the panel instead of a
+	 * GPU blit): each VIG pipe's QSEED3 scaler (Linux sm8150 catalog: scaler block at VIG + 0xa00; dpu_hw_util.c
+	 * QSEED3_* offsets) and its pixel-extension registers (SSPP_SW_PIX_EXT_C0/C1C2/C3 at 0x100). Read only.
+	 */
+	static const unsigned qs[] = { 0x00, 0x04, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54,
+		0x58, 0x90, 0x94, 0x98, 0x9c };
+	static const char *const qsn[] = { "HW_VERSION", "OP_MODE", "PHASE_INIT", "STEP_Y_H", "STEP_Y_V", "STEP_UV_H",
+		"STEP_UV_V", "PRELOAD", "SRC_SIZE_Y", "SRC_SIZE_UV", "DST_SIZE", "COEF_LUT_CTRL", "BUFFER_CTRL", "CLK_CTRL0",
+		"CLK_CTRL1", "INIT_Y_H", "INIT_Y_V", "INIT_UV_H", "INIT_UV_V" };
+	row("VIG0-QSEED3", MDP + 0x4000 + 0xa00, qs, qsn, sizeof(qs) / sizeof(qs[0]));
+	row("VIG1-QSEED3", MDP + 0x6000 + 0xa00, qs, qsn, sizeof(qs) / sizeof(qs[0]));
+	static const unsigned pe[] = { 0x100, 0x104, 0x108, 0x110, 0x114, 0x118, 0x120, 0x124, 0x128 };
+	static const char *const pen[] = { "PE_C0_LR", "PE_C0_TB", "PE_C0_REQ", "PE_C12_LR", "PE_C12_TB", "PE_C12_REQ",
+		"PE_C3_LR", "PE_C3_TB", "PE_C3_REQ" };
+	row("VIG0-PE", MDP + 0x4000, pe, pen, sizeof(pe) / sizeof(pe[0]));
+	row("VIG1-PE", MDP + 0x6000, pe, pen, sizeof(pe) / sizeof(pe[0]));
 	/* INTF1 tear check line counter (+0x2b0, 0..height once a frame): where the refresh is, 40 samples 1 ms apart */
 	printf("INTF1 line counter (1 ms apart):");
 	for (int i = 0; i < 40; i++) {

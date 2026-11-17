@@ -27,6 +27,17 @@ Display and responsiveness:
   '420v'/'420f' (NV12) layer, which the compositor skipped (black video with sound). Those layers are now
   converted to BGRA (BT.709) underneath the page, which is blended over them so the player controls show
   (boot-arg `sweetfbyuv=0`: off). Confirmed: video plays (Safari, YouTube, local files).
+- `xnu12377-fb-hwscale.diff` - `SweetFramebuffer.cpp` + `serial_console.c`: the display's VIG pipes scale the
+  828x1792 frame to the 1440x3120 panel with their QSEED3 scalers (bilinear) instead of a GPU stretch blit; the
+  page-flip buffers hold the logical frame, the GPU copies 1:1 (5.9 MB a frame instead of 18 MB) and the display
+  reads a third of the memory. A panic first restores the 1:1 setup so the panic screen shows. Boot-arg
+  `sweetfbhwscale=0`: off. Confirmed on the phone (registers checked with `scanprobe`, picture fine).
+- `xnu12377-fb-cpuflip.diff` - `SweetFramebuffer.cpp`: frames the GPU present cannot take (video layers, a
+  translucent top layer, more than two layers) are composed by the CPU into the hidden buffer and flipped to, instead
+  of being written into the buffer the panel is scanning (that brought the dash artifacts back).
+- `xnu12377-avoid-little.diff` - `sched_clutch.c` (+ the count in `SweetFramebuffer.cpp`'s 5 s statistics): Clutch
+  had no avoid-processor check, so a busy thread stayed on the A55 it landed on; now a thread whose quantum expires on
+  a little core moves to an idle big one (as Edge does). Printing from the scheduler panicked the first version.
 - `xnu12377-fb-pageflip.diff` - `SweetFramebuffer.cpp`: present into a second buffer and flip the display pipes
   (VIG0/VIG1 SRC0_ADDR) instead of writing over the buffer being scanned out (the dashed-line corruption).
 - `xnu12377-fb-asyncflip.diff` - the flip completes from a timer instead of a blocking wait in the present.

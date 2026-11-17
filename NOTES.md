@@ -1,3 +1,71 @@
+# Hardware display scaling (QSEED3) instead of the GPU stretch blit; tu-cb=1 kept (Claude, 2026-11-17)
+- diag/tu-cb (outputs/gpu-diagB-run1.*, image B = diag=1 tu-cb=1; the run named diagA was B): Turnip renders
+  21,895 passes in GMEM, 1 in sysmem (RM row) -> not a sysmem problem; ~10 render passes and 72 draws per frame,
+  5.4 Mpx of GMEM work per frame; frame-gpu (commit->complete) mostly 32-64 ms = GPU queue ~2 frames deep; the
+  Metal threads used 1.3 cores (m2v lowering ~20 %); P0 "texture layouts are DroidVM's linear ones" (no tiling /
+  UBWC: a later lever). That run had all 8 cores at 100 % (2-3 min after boot + diag logging). User: B (tu-cb=1)
+  feels better than A -> keep tu-cb=1 in the boot args (A not measured).
+- scanprobe 11-17 (outputs/scanprobe-scaler.txt): VIG0/VIG1 QSEED3 at VIG+0xa00, HW_VERSION 0x1004, OP_MODE 0 (off),
+  steps 0x200000 (1.0 in 1/2^21), PRELOAD 0x03040304; pipes 720x3120 each, stride 5760, PE REQ = (3120<<16)|720.
+- FIX (SOURCE, NOT BUILT): research/ios27.2/kernel/xnu12377-fb-hwscale.diff (also xnu/ios27/; backups
+  kernel-backup/SweetFramebuffer.cpp.before-hwscale, serial_console.c.before-hwscale): the page-flip buffers hold the
+  logical 828x1792 frame (pitch 3328); the GPU blit is 1:1 (sweet_fb_part targets logical size, dest pitch); the CPU
+  compose copies fCompose rows as they are; each VIG pipe: SRC_SIZE 414x1792, SRC_XY 0/414, stride 3328, PE REQ,
+  QSEED3 steps (414<<21)/720 and (1792<<21)/3120, init 0, preload x4 y3, src/dst sizes, OP_MODE enable | bilinear
+  (3<<16) | not-DX (14) | alpha (10) bilinear (1<<29) | blend (31) (Linux dpu_hw_setup_scaler3 / dpu_plane.c values).
+  Switched over on the first flip after setup. Only on the probed layout (checks sizes, XY, version 0x1xxx != 0x1002,
+  scaler off); log "SWEET FB: hardware scaling on: ..." or "... off (...)". A CPU frame that cannot go to the hidden
+  buffer waits a vsync instead of being drawn panel-sized. A panic first restores ABL's 1:1 pipe setup on buffer 0
+  (sweet_console_panic_hook in serial_console.c), so the panic screen still shows. Boot-arg sweetfbhwscale=0: off.
+  Expect: same picture (bilinear vs the blit's bilinear), GPU present writes 5.9 MB instead of 18 MB a frame, the
+  display reads 1/3 the memory. Seam at the centre column: each pipe filters its own half (no overfetch): watch for
+  a faint vertical line at the middle.
+  CONFIRMED ACTIVE on the phone (outputs/scanprobe-hwscale.txt): both pipes SRC_SIZE 0700019e (414x1792), SRC_XY
+  0 / 0x19e, stride 0xd00, QSEED3 OP_MODE a0034401, steps 0x126666 / 0x126126, DST 0c3002d0. Display works; first
+  scroll test (outputs/gpu-hwscale.txt, ~3 min after boot, 622 % CPU from boot-time daemons): 28-39 swaps/s, GPU
+  busy 44-65 %. Clean comparison (5+ min after boot) pending.
+  User: picture looks good (no seam noticed), feels a bit better.
+
+# Dashes back (user, avoid-little take 3): the CPU present fallback wrote the scanned-out buffer (Claude, 2026-11-17)
+- Take 3 of avoid-little measured (outputs/gpu-perf3.txt, ~5 min after boot, background daemons busy): 35-36
+  swaps/s, longest gaps 88-93 ms, 319-589 moves per 5 s (sane), but the dash artifacts were back (take 2 none).
+- Page flipping only covered GPU presents. The vsync path's CPU fallback (presentGPU returns 0: video layers,
+  a translucent top layer, >2 layers, unmapped surfaces) did fbflip_for_cpu(): flip back to buffer 0, then
+  presentComposed/present wrote the frame into buffer 0 WHILE the panel scanned it = the original dash bug.
+  Different thread timing made that fallback frequent.
+- FIX (SOURCE, NOT BUILT): research/ios27.2/kernel/xnu12377-fb-cpuflip.diff (also xnu/ios27/; backup
+  kernel-backup/SweetFramebuffer.cpp.before-cpuflip): fbflip_cpu_back() waits (<= 20 ms) until earlier flips
+  are taken and returns the hidden buffer (CPU views: buffer 0 = fPixels, buffer 1 = the write-combined second
+  buffer map); presentComposed(rec, dst, force) composes the WHOLE frame into it (force: also single unscaled
+  layers), buffer 0's cached map is cleaned, then fbflip_program(back). The old path stays as the fallback
+  when that is not possible. Stats line now: "page flips N (CPU-composed into the hidden buffer M), ...".
+
+# GPU performance 3 (after tb24): 31-41 fps scrolling; threads stuck on little cores (Claude, 2026-11-17)
+- outputs/gpu-perf1.txt (Settings scrolling, locationd killed, tb24 kernel): 24.9-40.7 swaps/s (was 17-31), GPU
+  busy at 47-72 % of vsyncs (was 10-55 %), gaps of 329 and 557 ms remain, ~50 % of frames waited for a flip.
+  ptop: backboardd 105 % (6000 csw/s), Preferences 87 %, cpu0 (A55) 83 % busy (user 70 %), cpu4-7 33-36 %.
+- outputs/tsample-pref-scroll.txt (prof: ~/scr/prof.py): Preferences main thread ~80 % busy: ~42 % in
+  QuartzCore transaction commit, ~37 % UIKit layout / SwiftUI cells, 19 % idle in mach_msg.
+  outputs/tsample-bbd-scroll.txt: backboardd's busiest thread (#14, ~40 %) is a NativeAdrenoMetal worker: 54 %
+  idle on a condvar, 9.5 % in posix_madvise under malloc (large frees returned to the kernel every frame),
+  13 % mach_msg (IOConnectCallStructMethod submits).
+- Clutch has no avoid-processor check (sched_clutch_dispatch.avoid_processor_enabled = FALSE), so the
+  big-first masks only act when a thread is placed: a thread that keeps running stays on the A55 it landed on.
+  FIX (SOURCE, NOT BUILT): research/ios27.2/kernel/xnu12377-avoid-little.diff (backup
+  kernel-backup/sched_clutch.c.before-avoidlittle): sweet_clutch_thread_avoid_processor (like Edge's): a
+  non-RT unbound thread on a migrate-mask CPU yields it when a recommended non-migrate CPU is idle.
+  Off together with sweetbigfirst=0. Take 1 PANICKED ~69 s after boot: "Console I/O from interrupt-disabled
+  context @serial_console.c:174" - its 30-s printf ran inside the scheduler (interrupts off). Take 2: no console
+  I/O there; the count (global sweet_avoid_moves) is printed by SweetFramebuffer's 5-s statistics as
+  "SWEET SCHED: 5s: N threads moved off a little core to an idle big one". Rule: never printf/IOLog from
+  scheduler callbacks.
+  Take 2 measured (outputs/gpu-perf2.txt): 29-36 swaps/s (no gain), longest gaps 90-114 ms (was 329-557),
+  but 6,000-32,000 moves/s and 444 % CPU in all (was 246 %): every check (IPC handoffs and wakeups landing on
+  cpu0-3) bounced threads; cpu0 still 81 % (sys 27 %). Take 3: only on AST_QUANTUM, like Edge (threads that ran
+  a whole quantum on a little core).
+  Expect: cpu0 no longer the busiest core while scrolling, Preferences' main thread on an A76, higher fps.
+  Next candidates: the malloc madvise in the Metal worker; GPU time per frame (busy 47-72 %).
+
 # Boot menu: Alert Slider order matches the menu; no red (Claude, 2026-11-17)
 - shim/shim.c: the slider now picks the default top to bottom like the menu reads: top iOS 27, middle iOS 16,
   bottom Android (was top Android, middle iOS 27, bottom iOS 16); unknown position: iOS 16. iOS 27 missing from
@@ -35,7 +103,42 @@
   dry-runs clean), log `xnu12377-ios27a-yuv2-build.log`. Reused the exact same sleep-disabled ADT and boot args
   (including sweettime). Kernel SHA-256 `c41cee65a739f38f27df80997edb40bfc9af1714c7fc3dcfa48978639a7ac02e`;
   triple-boot image `outputs/guacamole-ios27a-yuv2.img`, SHA-256
-  `2999801f512106003fc804d7de4fce3f8a72b48657b7cf8e52300130ef2026e9`. Built only; not flashed or booted.
+  `4c2b45fd070c56809fec40c0ab5b0690bc6e65470be08f4070fcb8551ac586b6`. Rebuilt selector shim with
+  `PATH=/private/tmp/guac-llvm18-cross:$PATH BOARD=guacamole sh ./build.sh` from `shim/` (the host lacks
+  `aarch64-linux-gnu-gcc`, and the script is not executable); shim SHA-256
+  `9b043f564b83cd1386975c7a3c22c04409b4353dee79558998e693bf2fa8ed21`. Tripleboot was repacked with the yuv2
+  payload and iOS 16 selector payload unchanged. Built only; not flashed or booted.
+  AVOIDLITTLE build (2026-11-17): `xnu12377-avoid-little.diff` was already applied (reverse dry-run clean); build log
+  `xnu12377-ios27a-avoidlittle-build.log`. Reused the same YUV sleep-disabled ADT and ram5g2 boot args unchanged.
+  Kernel SHA-256 `09aefa1b75f0c10e1eeae1710ac0bee9ae48cbfade6ae87aba4c9a6a4879ee4d`; triple-boot image
+  `outputs/guacamole-ios27a-avoidlittle.img`, SHA-256 `5fb10294d0b6e5c230e283ec46982ea5a7a9176ebe58f74d12c7a42c7ffc0da0`.
+  Uses selector shim SHA-256 `9b043f564b83cd1386975c7a3c22c04409b4353dee79558998e693bf2fa8ed21`. Built only; not flashed or booted.
+  AVOIDLITTLE2 (2026-11-17): rebuilt the updated `sched_clutch.c` + `SweetFramebuffer.cpp` source. The first compile
+  caught C++'s undefined `relaxed` argument in `os_atomic_xchg`; replaced that exchange with the equivalent
+  `__atomic_exchange_n(..., __ATOMIC_RELAXED)` in both the applied source and `research/ios27.2/kernel/xnu12377-avoid-little.diff`.
+  Build log `xnu12377-ios27a-avoidlittle2-build.log`; kernel SHA-256
+  `57eb6f8860ef3932a3d5dd8da921dbbbbfa2b95f9160d046f6e3265afe3b31cd`. Reused `work/guacamole-ios27a-yuv.adt`
+  and the exact 595-character ram5g2 boot args. Triple-boot image `outputs/guacamole-ios27a-avoidlittle2.img`,
+  SHA-256 `f5b789402c86c03f34520b0d19d50e47d6ef2cb72ecd20a31cc21f177b50d014`; selector shim unchanged.
+  Built only; not flashed or booted.
+  AVOIDLITTLE3 (2026-11-17): rebuilt the current tree with take 3's `AST_QUANTUM`-only scheduler guard already
+  applied. Build log `xnu12377-ios27a-avoidlittle3-build.log`; kernel SHA-256
+  `17a12661fbcdb6a884b1664ba07f282e5d1708472643b6cf157d725190b63ee5`. Reused the same YUV sleep-disabled ADT,
+  exact 595-character boot args, selector shim, and iOS 16 payload. Triple-boot image
+  `outputs/guacamole-ios27a-avoidlittle3.img`, SHA-256 `6213df406d7a1d54e97829876b334dfce225561f61dac6be4a95dd05eded00e6`.
+  Built only; not flashed or booted.
+  HWSCALE (2026-11-17): built the current tree with `xnu12377-fb-hwscale.diff` already applied on top of cpuflip,
+  avoid-little take 3, tb24 and fb-yuv. Build log `xnu12377-ios27a-hwscale-build.log`; kernel SHA-256
+  `782c489500a25e1f84615fdd4cb32e997203d916a68acb4ecd6ed74baa8f85b6`. Reused image B's ADT and boot args with
+  only `diag=1` removed; `tu-cb=1` retained (552 characters, saved as
+  `outputs/guacamole-ios27a-hwscale-boot-args.txt`). Triple-boot image `outputs/guacamole-ios27a-hwscale.img`,
+  SHA-256 `9017be7ad0c454ebec66d7b03af2655f6f2772e8a5c2a90aa912702e41c7c372`. Built only; not flashed or booted.
+  CPUFLIP (2026-11-17): built the current tree with `xnu12377-fb-cpuflip.diff` already applied on top of avoid-little
+  take 3, tb24 and fb-yuv. Build log `xnu12377-ios27a-cpuflip-build.log`; kernel SHA-256
+  `78effc320bb781afb976e6af8fd884a7aa43e207098e1ce9ea4c39b527d2931b`. Reused the same YUV sleep-disabled ADT,
+  exact 595-character boot args, selector shim, and iOS 16 payload. Triple-boot image
+  `outputs/guacamole-ios27a-cpuflip.img`, SHA-256 `316f9a6f3b8b940dae3ff8f00bd0609169b2cbc176df5e083ff4a61dd7e0cc1a`.
+  Built only; not flashed or booted.
 
 # Random panic "SWEET CPU: CPU halt/suspend is not implemented" = iOS putting the phone to system sleep (2026-11-17)
 - Panic screen (user photo): event history ends PLATFORM_PRE_SLEEP 0 -> PLATFORM_PANIC; panic from
