@@ -6,33 +6,35 @@ This is an experimental bring-up, not a daily-use phone OS. Many hardware featur
 
 ## Current status
 
-Status snapshot: **2026-11-16**. For detailed evidence, caveats, and engineering history, see [`docs/ios27.md`](docs/ios27.md) and [`NOTES.md`](NOTES.md).
+Status snapshot: **2026-11-17**. For detailed evidence, caveats, and engineering history, see [`docs/ios27.md`](docs/ios27.md) and [`NOTES.md`](NOTES.md).
 
 ### Working
 
-- **Boot and system UI:** iOS 27.2 reaches the lock screen and SpringBoard when started through the triple-boot selector.
-- **Shutdown and reboot:** shutdown and reboot work normally on iOS 27; rebooting through SSH has also been confirmed.
+- **Boot and system UI:** iOS 27.2 reaches the lock screen and SpringBoard when started through the triple-boot selector. The UI runs at a 2x scale (MobileGestalt adjusted, see `NOTES.md`).
+- **Display:** the dashed-line GPU corruption is gone: the kernel now presents each frame into a second buffer and flips the display pipes to it instead of overwriting the buffer being scanned out.
+- **Shutdown and reboot:** shutdown and reboot work normally on iOS 27; rebooting through SSH has also been confirmed, and `rebootbl` reboots straight into fastboot.
 - **Touch and navigation:** touch input works for navigating the UI and launching apps.
-- **System apps:** the rebuilt root image puts staged system apps in `/Applications`; Filza was separately installed and confirmed to open.
+- **System apps:** the rebuilt root image puts staged system apps in `/Applications`; Filza was separately installed and confirmed to open. Safari loads pages.
 - **Brightness and Night Shift:** both were confirmed working by the user through the `sweet-displayd` daemon and D73 backlight properties.
-- **Some haptics:** keyboard and ringtone haptics work; the actuator also buzzed during an initialization/test.
-- **Basic network access:** Wi-Fi has associated with an access point, and SSH has worked while the network connection remained up.
+- **Audio:** speaker playback works without cut-outs (ringtones, system sounds, downloaded mp3s). The cause of the earlier cut-outs was iOS 27 assuming Apple's 24 MHz timebase; the kernel now presents a 24 MHz timebase on the phone's 19.2 MHz timer (`xnu/ios27/xnu12377-tb24.diff`). `adspd` starts at boot from a launchd job.
+- **Haptics:** working, fixed together with audio (the haptics actuator runs through the same audio system).
+- **Bluetooth:** the Settings switch works, devices are found, and Bluetooth audio plays.
+- **Wi-Fi:** joining works and networks are remembered for auto-join; SSH works over Wi-Fi.
+- **Memory:** iOS manages 5 GB (`hw.memsize=5367660544`), with a GPU pool of about 2 GB placed outside it.
 
 ### Partial or unreliable
 
-- **Metal/GPU:** NativeAdrenoMetal and Turnip have initialized in some boots and can render parts of the UI. Subway Surfers has shown a black screen shortly after launch; earlier sessions flickered, froze, or triggered GPU recovery. App rendering is not reliable.
-- **Wi-Fi:** association can succeed while iOS reports “failed to join.” DHCP, link stability, saving credentials, and automatic reconnection remain inconsistent; reconnecting can interrupt SSH.
-- **Audio:** Settings sounds and keyboard clicks work. Game audio was absent in the latest report; microphone input is unconfirmed.
-- **Haptics:** keyboard and ringtone patterns work; Settings switches and long-press/app-icon feedback do not.
-- **Performance:** the UI has felt slow and at times unusable. One profiler capture showed `PerfPowerServices` near 100% CPU and `wland` also using CPU; the current cause is not established.
+- **Metal/GPU:** NativeAdrenoMetal and Turnip render the UI. Frame rates are limited (roughly 20-40 fps while animating) and long stutters of a few hundred milliseconds still occur. App and game rendering is not reliable.
+- **Performance:** better after removing the spinning `PerfPowerServices` job and preferring the big CPU cores, but `locationd` can spin on a full core after boot (killing it works around it) and `wland` polls Wi-Fi every millisecond (about 12% of a core).
+- **Video playback in Safari:** not working in the latest test. Streamed audio in Safari has timed out at times.
+- **Microphone:** input is unconfirmed.
+- **Sleep:** iOS's system sleep panicked the kernel (`SweetCPU::haltCPU` is not implemented). `tools/mkadt.py` now sets `sleep-disabled` in the device tree so iOS no longer attempts it; not yet confirmed on a build. Turning the screen off is unaffected.
 - **Identity:** the generated device tree uses the iPhone 14 Pro/D73 identity, but that does not guarantee all identity-dependent apps and services behave like they do on real iPhone hardware.
 
 ### Not working or not implemented
 
-- **Bluetooth:** the Settings toggle has been unstable or greyed out; usable Bluetooth connections have not been confirmed. BlueTool/controller profile and device-tree service matching are still under investigation.
-- **Full memory capacity:** iOS currently manages about 4.24 GB (`hw.memsize=4239392768`) of the phone's 8 GB. Safely adding the other DRAM ranges while preserving GPU reservations is unresolved.
-- **Cellular calls/data, camera, GPS, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated.
-- Complete system-wide haptics and dependable game audio/graphics remain unfinished.
+- **Full memory capacity:** about 5 of the phone's 8 GB go to iOS; giving it more needs XNU to use non-contiguous RAM ranges.
+- **Suspend (system sleep), cellular calls/data, camera, GPS, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated.
 
 ## Booting
 
@@ -42,12 +44,13 @@ The existing data partition is named `ios26`, so iOS 27 boot arguments commonly 
 
 ## Build and project layout
 
-- **iOS 27 kernel:** source is the separate Git repository at `work/xnu-12377`. Kernel changes must be committed and pushed from that repository independently.
+- **iOS 27 kernel:** the tree at `work/xnu-12377` is not in this repository; each change made to it is kept as a diff in [`xnu/ios27/`](xnu/ios27/README.md).
 - **Metal plugin:** source/build work is in the separate Git repository at `work/UniXNU`; it is not included in commits to this repository.
 - **Root filesystem:** `tools/mkios27root-mac.sh` builds the iOS 27.2 root image on macOS from the prepared IPSW contents.
 - **Device tree and payload:** `tools/mkadt.py`, `tools/mkpayload.py`, and the shim build create the ADT and kernel payload used by the boot image.
 - **Triple-boot image:** `tools/mktripleboot.py` combines the stock boot image, selector shim, iOS 16 payload, and iOS 27 payload. See `docs/dualboot.md` for required inputs.
-- **Userland tools and drivers:** `userland/` contains Wi-Fi, Bluetooth, audio, display, haptics, GPU and diagnostic code.
+- **Userland tools and drivers:** `userland/` contains Wi-Fi, Bluetooth, audio, display, haptics, GPU and diagnostic code, including the phone-side diagnostics `ptop` (CPU, memory and process churn), `tsample` (sampling profiler), `tprobe` (clocks, timed waits, thread policies) and `rebootbl` (reboot to fastboot) in `userland/jb/`.
+- **launchd jobs:** `tools/launchd-add-job.py` and `tools/launchd-drop-job.py` add and remove jobs in iOS's launchd plist (the `adspd` boot job, the removed `PerfPowerServices`).
 - **Detailed status:** [`docs/ios27.md`](docs/ios27.md) tracks the current feature state; [`NOTES.md`](NOTES.md) records experiments, build artifacts, crashes and decisions. A source change or successful build does not by itself establish that a feature works at runtime.
 
 ## Security and artifacts

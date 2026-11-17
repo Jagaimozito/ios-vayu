@@ -1,3 +1,387 @@
+# Random panic "SWEET CPU: CPU halt/suspend is not implemented" = iOS putting the phone to system sleep (2026-11-17)
+- Panic screen (user photo): event history ends PLATFORM_PRE_SLEEP 0 -> PLATFORM_PANIC; panic from
+  SweetCPU::haltCPU (SweetCPU.cpp:295) on cpu 6; epoch "Sleep" set. IOPMrootDomain started a system sleep (idle
+  sleep with the screen off); there is no suspend-to-RAM on this port.
+- FIX (ADT, NOT BUILT): tools/mkadt.py /defaults gets sleep-disabled = 1 (backup
+  kernel-backup/mkadt.py.before-sleepdisabled). IOPMrootDomain reads it at boot-completed (gSleepDisabledFlag) and
+  checkSystemSleepAllowed() then refuses idle and demand sleep (kPMConfigPreventSystemSleep). No kernel change.
+  CODEX: regenerate the ADT with mkadt.py (same flags as the running image: --ram5g --scale2 ...) for the next image.
+
+# Safari "loads forever" fixed: WebContent appex dropped from LaunchServices (Claude + user, 2026-11-17)
+- Symptom: pages never load; no com.apple.WebKit.WebContent process at all (Networking yes, GPU idle-exits).
+  oslog: WebPageProxy PID=0, "have not received a commit 90 s"; BrowserEngineKit "WebContentProcess: ... appex
+  record for bundleIdentifier com.apple.WebKit.WebContent ... -10814 Unable to find this application extension
+  record in the Launch Services database" (NetworkingExtension.appex is found).
+- Cause: the 2026-11-14 JSC_useJIT env test edited WebContentExtension.appex/Info.plist (Info.plist is sealed by the
+  code signature). The old LS record kept Safari working until something rebuilt the LS database; the re-scan then
+  dropped the appex with the broken seal.
+- Fix (done on the phone): original restored (A=/private/preboot/Cryptexes/OS/System/Library/ExtensionKit/
+  Extensions/WebContentExtension.appex; edited copy kept as $A/Info.plist.envtest), `lsreg -r`, killall MobileSafari.
+  Safari loads pages again. Rule: never edit a signed bundle's Info.plist in place; LS drops it on the next rebuild.
+
+# Audio cut-outs = iOS 27 hard-codes a 24 MHz timebase; kernel now presents 24 MHz (Claude, 2026-11-17)
+- CONFIRMED by user on the tb24 kernel (2026-11-17 01:50 local): audio plays without cut-outs, and haptics now work
+  too (the Actuator device had the same HAL timing problem).
+- Measured (mp3 playing, pcm stats 20 s apart, twice, also with locationd killed and timer coalescing off): DSP
+  48,013 frames/s, ring writer exactly 849,920 frames / 20 s = 42,350/s (88 %) every time: deterministic.
+- audiomxd oslog (outputs/au-music.oslog): HALS_OverloadMessage "SafetyViolationOccurred" for Speaker and Actuator in
+  a fixed rhythm, every 65536 frames, with clockResetReason TimeStampOutOfLine; HAL estimates our device at
+  59,077 Hz; cycle bookkeeping uses 512,000 ticks per 1024-frame cycle.
+- tprobe (userland/jb/tprobe.c, outputs/tprobe*.txt): mach_timebase_info 625/12 (19.2 MHz), all clocks agree; RT
+  waits exact (21.35 ms for 21.333); plain waits +2.4 ms (coalescing; turning it off fixed tprobe but NOT audio).
+  audiomxd's I/O thread "audio IO: VAD [vdef] AggDev 30" IS real-time (pri 97) with period 26,667 us
+  = 512,000 ticks = 1024 frames at 48 kHz computed with 24 MHz ticks.
+- Cause: 27.2 CoreAudio hard-codes Apple's 24 MHz timebase: AudioConvertHostTimeToNanos = x*125/3 (0x22be3b11c),
+  AudioConvertNanosToHostTime = x*3/125, AudioGetHostClockFrequency = 24e6 (const 0x22bea82f8). Census
+  (~/scr/tbcensus.py on dsc-system): 125/3 sites in CoreAudio 22, AudioToolbox 39, AVFAudio 14, AudioSession 3,
+  AudioSessionServer 3, AudioToolboxCore 2, ... and 24e6 doubles in caulk, libAudioDSP, ... -> patching user space
+  is impractical. QuartzCore's CACurrentMediaTime still asks the kernel (fine either way).
+- FIX (SOURCE): research/ios27.2/kernel/xnu12377-tb24.diff (backups kernel-backup/*.before-tb24):
+  pe_identify_machine: timebase 19.2 MHz -> report 24 MHz (sweet_tb24 = 1; boot-arg sweettb24=0 = off);
+  machine_routines.c: every counter read scaled hw + hw/4 (= floor(5/4 hw)), decrementer written *4/5 (rounded
+  up) and read back *5/4; user_timebase_type() = USER_TIMEBASE_NONE and user_cont_hwclock_allowed() = FALSE, so
+  libsystem's mach_absolute_time / mach_continuous_time take the mach traps (-3/-4) instead of reading the counter;
+  sleh.c handle_msr_trap emulates any remaining EL0 MRS of CNTVCT/CNTPCT(SS) (= mach_absolute_time) and CNTFRQ
+  (24 MHz), logging the first 16 as "SWEET TB24: EL0 read of ...". hw.tbfrequency becomes 24000000.
+  Cost: every user mach_absolute_time is now a trap (sub-microsecond); watch ptop for kernel_task / sys time.
+  Expect after boot: tprobe prints 125/3 = 24 MHz, clocks agree, RT waits exact; pcm stats ~960,000 frames per
+  20 s and no new underruns; audiomxd oslog without SafetyViolation/TimeStampOutOfLine.
+  Codex build result (2026-11-17): diff was already applied (reverse dry-run clean). Kernel build succeeded; log
+  `xnu12377-ios27a-tb24-build.log`; kernel SHA-256 `834011b338282b36f28688cb86b03a034b6501acff0c20c6dcaa5bb990e178d3`.
+  Reused the `ram5g2` ADT `work/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g2.adt` and its exact boot
+  args from `outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g2-boot-args.txt` (no sweettime change).
+  Triple-boot output `outputs/guacamole-ios27a-tb24.img` includes the iOS 16 selector payload first and the new iOS 27
+  payload second; SHA-256 `cd1d39490de8e0a07a2087a328d94d2e628135c0e456d4124572073e50ab5ff2`. Built only; not flashed or booted.
+  To install after the phone is in bootloader mode:
+  `fastboot flash boot_b outputs/guacamole-ios27a-tb24.img`
+  `fastboot reboot`
+  Then choose iOS 27 from the boot menu.
+
+# Audio cut-outs: the iOS writer delivers too little, the DSP clock is right (Claude, 2026-11-17)
+- Audio did not start at boot: no launchd job for adspd. tools/launchd-add-job.py adds com.sweet.adspd
+  (/var/local/bin/adspd serve, ADSPD_BOOT=30, KeepAlive, log /var/local/adspd.out); backup
+  /var/local/launchd.plist.pre-adspd. Replacing adspd = reboot (kill/restart: "GLINK cannot be resumed").
+- adspd.c: PCM_INFLIGHT 5, prime 3 periods before playing, trim when > 12 periods behind. Underruns remain.
+- Rates (pcm stats 23.3 s apart): DSP 1090 periods = 47,965 frames/s (correct), ring writer (HAL plugin, wpos)
+  27,100 frames/s = 56 % (earlier sample 88 %). Plugin clock = mach timebase (19.2 MHz, right), so the audio
+  server's I/O thread most likely skips cycles (audio_plugin.c counts speaker_jumps but say() goes to stderr).
+  Next: oslog audiomxd/mediaserverd for overload/skip messages during a looping ringtone, or publish the skip
+  counters in sweetpcm.reserved[] for `pcm stats`.
+
+# RAM step 1: 5 GiB for XNU, 2 GiB GPU pool (Claude, 2026-11-17)
+
+User wants ~6 GB iOS + 2 GB GPU. Not possible on this 8 GB phone (7.93 GiB DDR, 0xbbb00000-0xc0000000 hole, ~460 MiB
+of fixed Qualcomm reservations): ceiling ~5.4-5.5 GiB for XNU with a 2 GiB pool, and that needs non-contiguous RAM in
+XNU (research/ios27.2/ram-split-implementation.md). Step 1 (contiguous, low risk): live FDT memory = <0x80000000
+0x3bb00000> <0x180000000 4 GiB> <0xc0000000 3 GiB> = 0xc0000000-0x280000000 in one piece; every fixed
+/reserved-memory region is below 0xace00000 (free low-bank gaps: 0x9a100000-0x9c000000, 0xa0000000-0xa4c00000,
+0xa9c00000-0xac200000, 0xace00000-0xbbb00000). So XNU's window can be 0xc0000000-0x200000000 = 5 GiB (was
+0x100000000 + 0xfcc00000, sweet's memory-node size); the GPU pool stays 0x200000000-0x280000000.
+Changes (source): tools/mkadt.py --ram5g (HIGH_PHYS_BASE 0xc0000000, HIGH_MEM_SIZE 0x140000000; backup
+kernel-backup/mkadt.py.before-ram5g); sweet_gpu.c ZAP_META_PA 0xf0000000 -> 0xa0000000 (the only fixed address of ours
+in 0xc0000000-0x100000000; research/ios27.2/kernel/xnu12377-ram5g-zapmeta.diff, backup
+kernel-backup/sweet_gpu.c.before-ram5g). Shim: ramdisk/payload stay below 0x85700000, loader refuses overlaps.
+Expect hw.memsize 0x13ff00000 (5 GiB - 1 MiB panic log) = 5367660544.
+TAKE 1 RESULT: booted into userland (vm_page_bootstrap 323639 free pages = 5 GiB), then QUALCOMM CrashDump about a
+minute in (log ends before GPU init). Cause: 0xc0000000-0xffffffff is not ours to give XNU: userland/wland/radio.c
+POOL_PA 0xe0000000 (16 MB radio DMA pool, /dev/pmem device mapping), userland/adsp/adspd.c RPC_HEAP_PA 0xfd800000,
+RPC_BUF_PA 0xfe700000, PCM_PA 0xfe800000 (assigned to the ADSP: an HLOS touch there is a CrashDump), zap meta
+0xf0000000. TAKE 2 (source): window grows UP instead: mkadt --ram5g = 0x100000000 + 0x140000000 (to 0x240000000);
+zap meta back at 0xf0000000 (zapmeta diff withdrawn); GPU pool = 0x240000000-0x280000000 (1 GiB, first) +
+0xc4000000-0xe0000000 + 0xe1000000-0xf0000000 + low-bank 0xace00000-0xbbb00000 + 0xa0000000-0xa4c00000 = 2025 MiB
+(research/ios27.2/kernel/xnu12377-ram5g-gpupool.diff, against kernel-backup/sweet_gpu.c.before-ram5g). The low
+ranges were the GPU pool before 0147/ram-gpuhigh (worked); the two low-bank gaps are new to it.
+TAKE 2 BUILD (Codex, 2026-11-16): GPU pool diff was already applied (reverse dry-run clean); the zap firmware metadata PA
+is back at `0xf0000000` and was left unchanged. Kernel build succeeded; log
+`xnu12377-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g2-build.log`. Kernel SHA-256
+`ea636e96bddb4b70f1a6db4d7e371377d27b4d84f11b101fb2bc768a7bd65651`.
+Generated the D73 scale2 ADT with `python3 tools/mkadt.py work/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g2.adt --highmem --guacamole --identity d73 --scale2 --ram5g`;
+`/chosen` dram-base is `0x100000000`, dram-size `0x13ff00000` (5 GiB minus 1 MiB panic log). Boot args match the scale2
+image except refreshed `sweettime=1794889528` (595 chars), saved in
+`outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g2-boot-args.txt`.
+Built payload and single image under `work/`; required triple-boot output is
+`outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g2.img` (iOS 16 first, iOS 27 second), SHA-256
+`ce3a2ebc2cbc212205ede5be1ee8a04da40275e75246c0e5f30667bee924a86e`. Built only; not flashed or booted.
+Codex build result (2026-11-16): the zap-meta diff was already applied (reverse dry-run clean). XNU built successfully
+with the recorded iOS 27 DEVELOPMENT_ARM64_SWEET configuration; log `xnu12377-ios27a-pageflip-bigfirst2-asyncflip-ram5g-build.log`.
+Kernel `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256
+`21ba35c8c05cd4792642959b88ecde382aff8eec4b6634759e14fdf3bc1e1d86`.
+Generated `work/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g.adt` with
+`--highmem --guacamole --identity d73 --scale2 --ram5g`; `/chosen` is dram-base `0xc0000000`, dram-size `0x13ff00000`.
+The boot args match the scale2 image except for refreshed `sweettime=1794887613`; saved at
+`outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g-boot-args.txt` (595 chars).
+Built payload and single image under `work/`; required triple-boot output is
+`outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-ram5g.img` (iOS 16 first, iOS 27 second),
+SHA-256 `b0c098cb255d176be178db38952ba27cc743465e1ceb19129b415b5683bad2a6`. Built only; not flashed or booted.
+
+# @2x on iOS 27: works, no rdar bar (Claude + user, 2026-11-17)
+
+Why: GPU time per frame ~20-24 ms at 1179x2556 @3x (Liquid Glass draws into RGBA16F intermediates; heap texture
+refusals OutOfMemory(Heap) in CA's 23 MB heap; "Metal failed to load render pipeline" x2). Async flip (fps3) changed
+nothing: CA paces itself on the 90 Hz panel and a frame that misses 2 periods waits a 3rd (~28 fps).
+UIKit (SystemStatusUI) picks the status bar by +[_UIStatusBarVisualProvider_Split visualProviderSubclassForScreen:]:
+native pixel width (Split828.nativeDisplayWidth 828.0) and point sizes; iOS 16's 828x1792 attempt kept
+ArtworkDeviceSubType 2556 (Dynamic Island family, no 828 layout) -> rdar bar. Procedure that works:
+1. image guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2 (mkadt --scale2: canvas 828x1792, display-scale 2;
+   boot-arg sweetfb_scale=2);
+2. MobileGestalt cache backed up (/var/local/MobileGestalt.plist.at3x-ios27, outputs/ copy) and moved aside
+   (/var/local/MobileGestalt.plist.moved-for-2x) so it is rebuilt from the 2x ADT (screen size/scale live in
+   CacheData, not CacheExtra);
+3. after boot: the rebuild drops hand-set answers and keeps 14 Pro artwork: mgtool setstr WifiVendor USI; setbool
+   DeviceSupportsHaptics true; setbool DeviceSupportsClosedLoopHaptics true; setbool ringer-switch true; setint
+   ArtworkTraits/ArtworkDeviceSubType 1792; setint ArtworkTraits/ArtworkDeviceScaleFactor 2; respring.
+RESULT: UI right (user), no rdar bar. Frames while swiping 38-40/s in the better 5 s windows (was 22-29), 23/s in
+others; GPU busy 50-62%; many gaps < 17 ms; hitches up to 300-490 ms remain. Dynamic Island: idle pill invisible
+(no camera cutout on this phone; iOS never draws the resting island) - user does not want it drawn.
+Rollback: copy /var/local/MobileGestalt.plist.at3x-ios27 back to the cache path, boot the @3x image.
+
+# FPS 2: GPU-bound-ish, and the page flip's wait serialised CPU and GPU (Claude, 2026-11-17)
+
+dmesg-fps2 (bigfirst2 + primelist): idle 0.3-0.5 swaps/s (the 11/s idle was the priming scan stirring backboardd);
+swiping 28/s, gaps mostly 17-34 ms, GPU busy 81% of vsyncs, 23 of 141 frames waited for a flip.
+dmesg-fps-reducetrans (Reduce Transparency on): 22-29/s, GPU busy 55-63%: less GPU work, no more frames -> not purely
+GPU-bound. GPU time per frame ~24 ms (60% of a 40 ms period); the swap blocked in presentGPU's fbflip_wait (up to
+20 ms: the previous frame's blit, then the panel's next frame start) with CoreAnimation's render thread inside it,
+so CPU encode and GPU work did not overlap.
+Fix (source, research/ios27.2/kernel/xnu12377-fb-asyncflip.diff on top of pageflip+bigfirst2, backup
+kernel-backup/SweetFramebuffer.cpp.before-asyncflip): new IOTimerEventSource fFlipTimer / flipFired (work loop,
+every 0.5 ms while a flip is outstanding): programs the flip as soon as the blit's fence passes (was: next vsync tick
+or next swap), notices the take, then presents the frame that arrived meanwhile (fPending/fDirty, as the swap path
+does). presentGPU no longer waits: not settled -> arm the timer, return -1 (frame stays pending). The "frames that
+waited for a flip" stat now counts every such deferral.
+Codex build result (2026-11-16): asyncflip diff already applied to the pageflip+bigfirst2 source (reverse dry-run
+succeeded). `SweetFramebuffer.cpo` compiled and kernel linked successfully. Log
+`xnu12377-ios27a-pageflip-bigfirst2-asyncflip-build.log`; kernel SHA-256
+`f0aff03bf755bc57c65cfe14e80e7cba1d8dc3a0cbfa9f2675b8c37877d42b38`. Same pageflip-bigfirst2 boot arguments with
+`sweettime=1794884460` refreshed (593 chars), in `outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip-boot-args.txt`.
+Menu/triple-boot image `outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip.img` contains iOS 16 first and iOS 27
+second; SHA-256 `501cbd1136a7bcd5b03157d60502bcfa5aba1236f74f4bc9c729da1196689f46`. Built, not flashed or boot-tested.
+Flash with `fastboot flash boot_b outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip.img`, then choose iOS 27.
+
+Scale2 variant (Codex, 2026-11-16): built the same asyncflip kernel (`f0aff03bf755bc57c65cfe14e80e7cba1d8dc3a0cbfa9f2675b8c37877d42b38`)
+with a freshly generated D73 ADT: `python3 tools/mkadt.py work/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2.adt --highmem --guacamole --identity d73 --scale2`.
+Boot args are in `outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-boot-args.txt`; `sweettime=1794886376` and
+`sweetfb_scale=2`. Removed only `net_trace=200` to stay below the 607-character boot-args limit (final length 595).
+Payload and ordinary image are in `work/payload-guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2.bin` and
+`work/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2-single.img`. Required menu/triple-boot output is
+`outputs/guacamole-ios27a-pageflip-bigfirst2-asyncflip-scale2.img`, preserving iOS 16 first and iOS 27 second.
+Image SHA-256: `cdc24a08241d7be31cc1e8dd93dfec1bcc6abb831a372c5ccddd7ece0834ab02`. This image is built only; do not
+flash or boot it until the Settings change is ready.
+Other levers if still GPU-bound: tu-cb=1 (Turnip concurrent binning, boot arg, never measured), diag=1 for the
+frontend's per-pass telemetry (RM gmem/sys rows), rendering @2x.
+
+# FPS: shader-priming file scan in backboardd + big-first was a no-op (Claude, 2026-11-17)
+
+Page flip RESULT: dashes gone (user). Rate: 19-26 swaps/s while swiping, ~11/s steady at idle (all gaps ~90 ms).
+outputs/ptop-swipe.txt: backboardd 84% CPU, almost all on cpu 0-2 (sys 45-59%), A76s 1-10% busy.
+outputs/tsample-bbd-swipe.txt: backboardd's busiest thread (#11, 81% of a core) was NOT rendering: all 600 samples in
+fts_read (getattrlistbulk 406, fstatat 78, open/close, madvise) under NativeAdrenoMetal: the shader-priming thread
+("native-metal-prime", UniXNU PrimeShaders.h prime::run, 90 s after the device opens). Its library list comes from
+NativeAdrenoMetal.primelist beside the bundle, else the list embedded in the plugin (__DATA,__primelist, iPadOS paths);
+when none of those paths exist it walks /System/Library, /Applications and the cryptex's Library with fts ("held a
+core for 8 s" on UniXNU's iPad; far longer here, at background QoS on an A55). Fix (no build): outputs/
+NativeAdrenoMetal.primelist = the 310 .metallib paths of the iOS 27.2 os-root and SystemOS cryptex tars (cryptex ones
+also without the /System/Cryptexes/OS prefix; missing paths are skipped), installed as
+/System/Library/Extensions/NativeAdrenoMetal.primelist. Priming then compiles those libraries when the screen is
+quiet and records them as done (cache dir prime-done), so later boots skip them.
+Big-first was a no-op: sched_perfcontrol_edge_cpu_rotation_bitmasks_set() is an empty stub without CONFIG_SCHED_EDGE
+(sched.h: only with __AMP__); SWEET runs Clutch on one SMP pset. choose_processor() reads the pset's
+perfcontrol_cpu_preferred/migration_bitmask in either build, so take 2 sets them directly: new
+sweet_sched_cpu_masks() in osfmk/kern/processor.c (pset 0, under the pset lock), called from sweet_big_first.
+research/ios27.2/kernel/xnu12377-big-first2.diff (backups kernel-backup/{processor.c,sweet_cpufreq.c}.before-bigfirst2).
+Log "SWEET CPUFREQ: big cores first: preferred 0xf0, migrate off 0xf (asked ...)".
+Codex build result (2026-11-16): diff was already applied to the current pageflip tree (reverse dry-run succeeded).
+`processor.o` and `sweet_cpufreq.o` compiled; kernel build succeeded. Log
+`xnu12377-ios27a-pageflip-bigfirst2-build.log`; kernel SHA-256
+`ad61f9159eb312ef8cc69da5153cbf6d70c74ebafcae1d8655b8f25c46f11e44`. Pageflip boot arguments are unchanged except
+`sweettime=1794883431` (593 chars), saved as `outputs/guacamole-ios27a-pageflip-bigfirst2-boot-args.txt`.
+Required menu/triple-boot image `outputs/guacamole-ios27a-pageflip-bigfirst2.img`, with iOS 16 first and iOS 27 second;
+SHA-256 `4a081bc79944ea215e8707692d628eb1d929d240e036e23b3afda4fa85d11f47`. Built, not flashed or boot-tested.
+Flash with `fastboot flash boot_b outputs/guacamole-ios27a-pageflip-bigfirst2.img`, then choose iOS 27.
+Next: sample backboardd's render thread itself while swiping, once the scan is gone.
+
+# GPU corruption is in the present path, not the rendering (Claude, 2026-11-17)
+
+surfclean kernel booted ("SWEET SURF: cache clean (mode 1): 1282 surfaces, 8406 MB, 68 ms in the last minute": cheap,
+keep it), dashes unchanged; iOS screenshots taken while the dashes show are CLEAN -> CoreAnimation's frames are
+right; the damage happens getting them onto the panel. Present path in use: the GPU 2D blit (sweetfbgpu, "CPU-copied
+Metal frames 0") of CA's surface into the ONE panel buffer ABL left, which the display controller re-reads on every
+panel TE (DSI command mode, INTF1 autorefresh, 59.86 Hz). The blit is queued at swap time (sweetfbatswap, "shown at
+swap N, at vsync 0") with no regard to the refresh, and its writes leave the GPU's colour cache line by line, so a
+refresh taken while a blit lands sends the panel a scatter of old and new 64-byte lines; trails where things move,
+gone on the next refresh if nothing changes. Fix = page flip: blit into a second buffer, then point the source pipes
+(VIG0 -> LM0, VIG1 -> LM1 per dispprobe) at it with CTL0 FLUSH, latched at the next frame start.
+Step 1 (read-only): NEW userland/jb/scanprobe.c dumps CTL0, VIG0/VIG1 (sizes, SRC0_ADDR, stride, format, op mode,
+fetch config) and INTF1's line counter. Need its output before any register write.
+scanprobe (outputs/scanprobe1.txt): VIG0 and VIG1 both SRC0_ADDR 0x9c000000 (a physical address), YSTRIDE 0x1680,
+SRC_SIZE 720x3120, VIG1 SRC_XY/OUT_XY 720; format 000237ff, op mode 80000000; CTL0 FLUSH reads 0; INTF1 line counter
+runs 0..3120 over the whole period.
+Step 2 (source, research/ios27.2/kernel/xnu12377-fb-pageflip.diff, backup kernel-backup/SweetFramebuffer.cpp.before-flip):
+second panel buffer at 0x9c000000 + 0x1200000 (18 MB into the 36 MB msmnile cont-splash region; XNU uses only the high
+bank), mapped for the GPU at window +16 MB + 18 MB, filled once with a copy of the shown frame. presentGPU blits into
+the buffer the pipes do not read and marks a flip pending on the blit's fence; fbflip_settled() (vsync tick, and
+before each blit, waiting up to 20 ms by polling: a nonzero fence timeout counts as a hang) writes VIG0/VIG1
+SRC0_ADDR + CTL0 FLUSH 0x3 once the fence passed, and waits for FLUSH to read 0 before the other buffer is written.
+CPU paths (compose/present, power-off clear) flip back to buffer 0 first. Checks before enabling: MDSS 5.x, CTL0
+LAYER 01000005/01000028, both SRC0 = panel PA, stride = row bytes. Log "SWEET FB: page flip on: ..." and a 5 s line
+"page flips N, frames that waited for a flip N, back to buffer 0 for the CPU N, slow N". Boot-arg sweetfbflip=0 = off.
+RISK: if the display's SMMU maps only the first 18 MB, the second buffer shows garbage -> boot the previous image.
+Optional check from Android: adb shell su -c 'xxd /proc/device-tree/reserved-memory/cont_splash_region@9c000000/reg'
+(expect size 0x02400000).
+
+Codex build result (2026-11-16): `xnu12377-fb-pageflip.diff` was already present in the current XNU working source
+(reverse dry-run succeeded); built together with the surfclean changes. `SweetFramebuffer.cpo` compiled and the kernel
+linked successfully. Build log `xnu12377-ios27a-fb-pageflip-build.log`; kernel SHA-256
+`68b3eded575fe543ba685aad02ea89b35e791ca0f308754473da5612f770a9fd`. The generated payload reuses the exact ADT
+from the surfclean payload and the same boot arguments, with `sweettime` refreshed to `1794882606` (593 chars);
+`sweetfbflip` is enabled by default (only `sweetfbflip=0` disables it). Boot args are saved in
+`outputs/guacamole-ios27a-pageflip-boot-args.txt`. The required selector image is
+`outputs/guacamole-ios27a-pageflip.img`, containing iOS 16 first and iOS 27 second, with menu-aware `shim/out/Image`;
+SHA-256 `c91f0e4b14b75b93b838815dd9c7f94b75d344c3117e350de780791d5d5b9dfa`. Built, not flashed or boot-tested.
+Flash with `fastboot flash boot_b outputs/guacamole-ios27a-pageflip.img`, then choose iOS 27.
+Also seen: idle home screen swaps at ~11/s, every gap > 50 ms ("longest gap 93 ms", "vsyncs sent 0"): CA is updating
+something continuously at ~11 Hz; look at after the flip (animation smoothness).
+
+# GPU corruption: stale CPU cache lines in IOSurfaces the GPU imports (Claude, 2026-11-17)
+
+User photos (11-17): home-screen icons and widgets with short horizontal dashes inside them, a white app card
+leaving dash trails, blank white widget. Pattern = single 64-byte lines (16 BGRA pixels, 1 row) of old data: CPU
+cache lines that never reached DRAM. Chain: SweetSurface maps surfaces cacheable (mapCache kIOMapDefaultCache;
+icons are "wrapped" surfaces around CoreAnimation's own image memory); SweetAccelerator imports them for the GPU
+"whose CPU caches the client maintains itself"; but UniXNU's NativeBridgeMetalFrontend.mm builds with
+kSurfaceFlush=false for iOS 27 ("iPadOS 27's sys_dcache_flush is a barrier alone ... the kernel keeps imports
+right"): UniXNU's own kernel (drivers/Adreno740 NativeAdrenoVm publishMapped/acquireImported) cleans every
+import at each submit and invalidates GPU-written ones at completion. Ours does neither -> GPU samples DRAM under
+the writer's dirty lines. GPU side is fine (CACHE_FLUSH_TS per submit; fbgpu blit IB invalidates UCHE).
+Fix (source, research/ios27.2/kernel/xnu12377-surface-cache-clean.diff, backup
+kernel-backup/SweetSurface.cpp.before-surfclean): IOSurface lock/unlock are kernel traps here; a writing unlock and
+a wrap of caller-filled memory clean+invalidate the surface (kIOMemoryIncoherentIOFlush); boot-arg sweetsurfclean
+bit 1 (default), bit 2 = lock too (CPU readers of GPU output), 0 = off. WC surfaces skipped. Log once a minute:
+"SWEET SURF: cache clean (mode N): S surfaces, M MB, T ms in the last minute".
+Codex build result (2026-11-16): the cache-clean change was already present in the XNU working tree but its early
+calls lacked a forward declaration. The first compile failed on those two undeclared uses; Codex added the declaration
+to `SweetSurface.cpp` and the diff, then verified that applying the diff to the saved pre-change source reproduces the
+compiled file exactly. Kernel build succeeded; log `work/xnu12377-surface-cache-clean-build.log`; kernel SHA-256
+`3291b36475eb9f9e6f6e3d3e2ba593c4c88fe67c8f618ce886b2875b534d60c5`. Boot args are unchanged from
+`outputs/guacamole-ios27a-emul-atomic-bigfirst-boot-args.txt` except refreshed `sweettime` (593 chars), saved as
+`outputs/guacamole-ios27a-surfclean-boot-args.txt`. Ordinary image `outputs/guacamole-ios27a-surfclean.img`,
+SHA-256 `c71be0e3a17e2029996e56c3601dde0986262480eb2ddc41f31d8f9f3f7b37af`; selector image
+`outputs/guacamole-ios27a-surfclean-triple.img`, SHA-256
+`e1dc6f00186c9e2bfb145f92b1266da6d219359ea9e3dac877ce028447d14399`. The first attempt mistakenly used
+`shim/out/shim-guacamole.Image` (the pre-menu shim), so it booted iOS 16 directly; that image is preserved as
+`outputs/guacamole-ios27a-surfclean-triple-old-shim.img`. Repacked with menu-aware `shim/out/Image` (SHA-256
+`0b7f942b3b18ccaab8c1420e53563cb6a84894eed000b7aec366888e8d5cdf26`); strings confirm entries for iOS 27,
+iOS 16 and Android. Triple payload layout remains iOS 16 first and iOS 27 second. Repacked, not boot-tested.
+Flash with `fastboot flash boot_b outputs/guacamole-ios27a-surfclean-triple.img`, then choose iOS 27.
+Not covered: imports of plain task memory (`newBufferWithBytesNoCopy`) are never locked; they would need per-submit
+cache maintenance like UniXNU's.
+
+# Responsiveness 3: emul-atomic + big-first kernel booted (Claude, 2026-11-17 01:40 UTC)
+
+Booted guacamole-ios27a-emul-atomic-bigfirst (kern.bootargs has sweetcpufreq=3). uname -v still says Nov 12: the
+version string is not refreshed by incremental builds, so it cannot tell kernels apart; use kern.bootargs.
+RESULT emulation: "SWEET EMUL: 20 emulated in 359358 ms (0/s): LDAPUR 0, STLUR 0, other 20". The LRCPC2 sites do
+NOT trap in practice (the 17k LRCPC2-like words counted in the cache are mostly not executed, or not code), so
+the emulation is neither a cost nor the locationd cause: no cache rewrite needed. The atomic copy fix stays
+(harmless, correct). locationd spins again from boot (99%, pid 77): cause still open.
+Idle ptop (outputs/ptop-bigfirst2.txt): 1.35 cores, locationd + wland on cpu 0-2; A76s idle. The spinner yields
+(thread_switch) instead of expiring its quantum, so the rotation masks never move it (fine: it stays on an A55).
+Big-first effect on real work: needs a busy sample.
+Busy sample (outputs/ptop-bigfirst-busy.txt, 15 s of use): A76s 47-52% busy (before 24-38%), A55s 63-85% (before
+57-85), 4.9 cores in all. A respring happened inside it: backboardd/SpringBoard restarted, ReportMemoryException
+started, 70 processes gone (widgets, apps, Spotlight...): looks like a jetsam/memory-limit event (backboardd had
+been 440-545 MB resident). Free memory after: 865 MB.
+locationd (outputs/tsample-locationd.txt): thread 1 in _dispatch_wait_for_enqueuer -> _pthread_yield_to_enqueuer_4dispatch
+(every sample), the 11 workloop threads parked in kevent_id, thread 10/12 in mach_msg: nobody is mid-enqueue, so
+the enqueuer's link store was lost (or its thread vanished between the tail exchange and the link). Not the
+emulation (0 LRCPC2 traps). Open.
+
+# Responsiveness 2: scheduler puts everything on the A55s (Claude, 2026-11-17)
+
+ptop-noperf (after dropping com.apple.PerfPowerServices from launchd.plist; it is gone): idle load 1.7 cores, almost
+all on cpu 0-3; locationd spinning again from boot (98%), wland 19%, backboardd 19%. Clocks are not the problem:
+A76s at their top rows (2419 / 2841 MHz, sweetcpufreq=2), A55s at the boot's 1632 MHz (top 1785: sweetcpufreq=3),
+GPU at level 5 = 585 MHz (top), DDR/memory NoC voted to the top (gpu_ddr_vote).
+Cause: the eight cores are one homogeneous SMP cluster (mkadt cluster-type 0, MAX_CPU_CLUSTERS 1); with no CLPC,
+choose_processor() takes the lowest idle CPU (lsb_first), so work lands on the 1.6 GHz A55s first.
+Fix (source, research/ios27.2/kernel/xnu12377-big-first.diff, backup kernel-backup/sweet_cpufreq.c.before-bigfirst):
+sweet_cpufreq_init ends with sched_perfcontrol_edge_cpu_rotation_bitmasks_set(pset 0, preferred 0xf0, migration
+0x0f): an idle A76 first (round robin), A55 only when no A76 is idle, quantum expiry on an A55 moves to an idle A76.
+Log: "SWEET CPUFREQ: big cores first: preferred 0xf0, migrate off 0xf". Boot-arg sweetbigfirst=0 = old behaviour.
+Full AMP (cluster-type E/P, two clusters, __ARM_AMP__) is the proper version; much bigger change. Codex built these
+changes together with `xnu12377-emul-atomic.diff`: build log `work/xnu12377-emul-bigfirst-build.log`, kernel SHA-256
+`1b9968af597805a398b9e4cc0cdac1e73813da0b35c3469b242e337530ec9bcc`. The selector image is
+`outputs/guacamole-ios27a-emul-atomic-bigfirst-triple.img`, with the wifi-assoc540 arguments except
+`sweetcpufreq=3` and a refreshed `sweettime`; SHA-256
+`e4d35ffdbf8224722660d158e0cafeeeb8d985670aa6577dd45d6b2f3dc64094`. Built but not booted or runtime-tested. Boot only
+the selector image with `fastboot flash boot_b outputs/guacamole-ios27a-emul-atomic-bigfirst-triple.img` and choose iOS 27.
+
+# Responsiveness: two spinning daemons + non-atomic instruction emulation (Claude, 2026-11-17)
+
+User: choppy animations, touch delay, slow app launch, short freezes. New tool userland/jb/ptop.c (ptop [SECS] [N]:
+per-core load, memory/paging, process churn, top CPU users; /var/local/bin/ptop). outputs/ptop-idle.txt (home
+screen, 10 s): 2.5 cores busy at idle, all on the A55s (cpu0-2 60-70%): PerfPowerService 100% of a core, locationd
+99% (the known _dispatch_wait_for_enqueuer spin), wland 18% (1 ms poll loop, link.c link_poll), backboardd 13%.
+Big cores (4-7) nearly idle. Memory: 51-73 MB free, memorystatus level 36-38%, compressor holding ~870 MB,
+backboardd 490 MB resident; paging light. ptop-busy (15 s of use): 4.2 cores busy, same two spinners on top.
+Kernel bug found (source, research/ios27.2/kernel/xnu12377-emul-atomic.diff, backup
+kernel-backup/sleh.c.before-emul-atomic): the LRCPC2 emulation (STLUR/LDAPUR, every acquire/release atomic with an
+offset in the shared cache, ~17k sites per 750 MB of cache) used copyin/copyout, which copy < 16 bytes BYTE BY BYTE:
+on 8 cores other threads see half-written pointers. Now copy{in,out}_atomic{32,64} for aligned 4/8-byte accesses
+(aligned 2-byte loads via the containing word). Same diff counts emulations: "SWEET EMUL: N emulated in M ms (R/s):
+LDAPUR a, STLUR b, other c" at most every 10 s, to measure what the traps cost before rewriting the sites in the
+lowered cache (they would need branch islands: LDUR+DMB ISHLD / DMB ISH+STUR, same imm9 encoding). NOT BUILT.
+PerfPowerService (/usr/libexec/PerfPowerServices, outputs/tsample-perfpower.txt, also research/ios27.2/perfpower-sample.txt
+from 11-15): thread 3 never leaves a dispatch_once block in PowerlogLiteOperators (unslid 0x2a04e4780): for (i = 0;;
+i++) { r = SMCGetKeyFromIndex(conn, i, &key); ... } until r == -4 (cmn w22, #4 at 0x2a04e4834). No AppleSMC here,
+so r is never -4: endless loop; its other threads wait in sync XPC (one to locationd). `killall PerfPowerService`
+does not match (process name is PerfPowerServices). Fix: drop the job from the phone's launchd.plist
+(tools/launchd-drop-job.py). In-cache alternative: 0x2a04e4838 b.ne -> cbz w22 (0x34fffcb6), loop only while OK.
+After killing locationd (not respawned spinning) the user found the phone "better but not great".
+
+# Bluetooth chip bring-up: stuck TX command after a stalled download (Claude, 2026-11-17)
+
+outputs/btbridge7.out, attempt by attempt: a bad boot starts with the firmware download stalling (CTS held, "TX FIFO
+stuck" at segment 36). uart_write then returned without stopping the SE's TX command, which kept waiting for the
+rest of its TRANS_LEN; every later write (the next attempt's 0xC0/0xFC pulses and commands, even in a new btbridge
+process) went into that old command ("TX not done"), and the controller ended up in a state where it answered the
+version request but ignored the download (0 bytes of events back) for the rest of the boot. Good boots had the same
+first stall now and then and got lucky on the retry. Nothing to do with the cached-info / 251-byte changes.
+Fix (userland/bt/btuart.c, btbridge.c): tx_abort() cancels (then aborts) an unfinished TX command, after any failed
+write and at uart_init; the power-on pulse waits 1.5 s for the controller's 00 boot byte (it was arriving late, in
+front of the version reply); boot_controller tries the bring-up 3 times in-process, the later tries leaving the
+controller off for 1 s between the pulses.
+RESULT (bt8, 2026-11-17 00:29 UTC): chip up on the first try (3 Mbaud link up), bluetoothd stays up with the
+cached-info 4-byte answer and the 251-byte padding (no bcm_vsc.c:939 / :1021 aborts on this boot); the Bluetooth
+switch works and nearby devices show up in Settings.
+
+# Bluetooth greyed out: bluetoothd abort loop at bcm_vsc.c:939 (Claude, 2026-11-16 23:50 UTC)
+
+bt2 logs (outputs/bt2-diag, bluetoothd format strings resolved from its own binary, 03340.bin): bluetoothd starts,
+still says "marconi-bt: Unable to match bluetooth service in device tree" but continues with /arm-io/bluetooth
+(local-mac-address OK), the stack reaches "Stack Did Start", then FastLEConnection:readLocalControllerCachedInfo ->
+"AssertFail .../bcm_vsc.c:939 : length == remaining" -> abort -> launchd restarts it (24 instances in one Persist
+file, ~40 s apart; each re-inits the controller through btbridge). Parser at file 0x33dea8: after the status,
+u8 sub-opcode, LITTLE-ENDIAN u16 length, assert length == bytes left. btbridge answered FCE2/0x1c with length 14
+in one byte + 13 bytes left. FIX: userland/bt/btbridge.c fake_vendor_complete: length = 13 (u16). Rebuild btbridge.
+Note: tsample "no process bluetoothd" at the moment of checking = between restarts.
+CORRECTION (bt3, still 9 asserts): the read that uses that parser is 0xfd23 (vendor OCF 0x123) sub 0x0a, its only
+caller at file 0x34b9e4 (FCE2/0x1c was a guess). btbridge now gives both the u16 length = bytes left.
+bt4: still 6 asserts in the new Persist file. Where the parser's byte stream starts (at the sub-opcode echo or
+after it) is not proven, so the reply is now 4 bytes after status, 0a 01 00 00, valid under both readings, and
+btbridge prints "cached-info read fd23/0a answered with ..." (also proves the new binary runs).
+bt5: WORKED for 939 (btbridge.out: 12x fd23/0a and 12x fce2/1c answered 0a|1c 01 00 00; no 939 asserts in the
+new Persist). Next abort: bcm_vsc.c:1021 "ByteStream_NumReadBytesAvail(*pBs) >= 4" in
+_BCM_LowPowerCoreStatsEventParser (file 0x33dfb0, many u32 counters). Generic vendor replies now carry 251 zero
+bytes after the status (was 16).
+
+# Incident (Claude, 2026-11-16 23:30 UTC): kill -9 -1 from a tsample name lookup
+
+My Bluetooth command took a pid from `tsample bluetoothd`'s first line and ran `kill -9` on it. bluetoothd was not
+running, find_pid returned -1, tsample still printed "P bluetoothd pid -1", so the phone ran `kill -9 -1`: everything
+died (respring, wland gone -> no Wi-Fi). Fixed in userland/jb/tsample.c (no P line when nothing matches). Never kill
+from a parsed pid without checking it is > 1. Finding: bluetoothd is not running on this build (greyed-out switch).
+
 # Priority handoff — Wi-Fi ASSOC_DONE needs a 540-byte record (Claude, 2026-11-16 23:30 UTC)
 
 **RESULT (user, 2026-11-16 23:23 UTC): WORKS.** Join no longer reports failure, it connects, and the password is

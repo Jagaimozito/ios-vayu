@@ -110,15 +110,29 @@ static int boot_controller(int fast)
 		logs_off[] = { 0x01, 0x17, 0xfc, 0x02, 0x14, 0x00 }, bdaddr[] = { 0x01, 0x09, 0x10, 0x00 };
 	if (setup())
 		return -1;
-	pulse();
-	exchange("QCA version request", version, sizeof(version), 500);
-	exchange("HCI_Reset", reset, sizeof(reset), 500);
-	uart_init(1);
-	set_baud(115200);
-	if (download("/var/local/fw/bt/crbtfw21.tlv", 0) || download("/var/local/fw/bt/crnv21.bin", 1)) {
-		printf("btbridge: firmware download failed\n");
-		return -1;
+	/* 2026-11-16: a download that stalls (CTS held) leaves the controller half way through it; one exit and launchd
+	 * restart was not always enough to bring it back. Up to three tries here, the later ones with the controller left
+	 * off for a second between the power pulses. */
+	int ok = 0;
+	for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
+		unsigned off_ms = attempt == 1 ? 10 : 1000;
+		if (attempt > 1) {
+			printf("btbridge: bring-up attempt %d, controller off for %u ms\n", attempt, off_ms);
+			uart_init(0);
+			set_baud(115200);
+		}
+		pulse_ex(off_ms);
+		exchange("QCA version request", version, sizeof(version), 500);
+		exchange("HCI_Reset", reset, sizeof(reset), 500);
+		uart_init(1);
+		set_baud(115200);
+		if (download("/var/local/fw/bt/crbtfw21.tlv", 0) || download("/var/local/fw/bt/crnv21.bin", 1))
+			printf("btbridge: firmware download failed\n");
+		else
+			ok = 1;
 	}
+	if (!ok)
+		return -1;
 	delay_ms(100);
 	exchange("HCI_Reset", reset, sizeof(reset), 1000);
 	exchange("QCA logging off", logs_off, sizeof(logs_off), 300);
@@ -291,18 +305,29 @@ static void fake_complete(int m, uint16_t opcode)
  * a parser reading less ignores the rest. */
 static void fake_vendor_complete(int m, uint16_t opcode, const uint8_t *params, unsigned nparams)
 {
-	uint8_t ev[7 + 16] = { 0x04, 0x0e, 3 + 1 + 16, 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0x00 };
-	memset(ev + 7, 0, 16);
+	/* 2026-11-16: 251 zero bytes after the status (the most one event holds), not 16: 27.2's
+	 * _BCM_LowPowerCoreStatsEventParser reads many 4-byte counters and aborted at bcm_vsc.c:1021
+	 * ("ByteStream_NumReadBytesAvail(*pBs) >= 4"); parsers that read less ignore the rest. */
+	uint8_t ev[7 + 251] = { 0x04, 0x0e, 3 + 1 + 251, 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0x00 };
+	memset(ev + 7, 0, 251);
 	if (nparams > 0)
 		ev[7] = params[0];
-	/* BD_VSC_LE_META2_READ_LOCAL_CONTROLLER_CACHED_INFO (FCE2 subcommand 0x1c)
-	 * returns a length-prefixed block. bcm_vsc.c validates that the declared length
-	 * exactly matches the bytes left in the reply; a zero length with this fixed-size
-	 * response makes bluetoothd assert at bcm_vsc.c:939 and exit. The reply below has
-	 * 14 data bytes after this length field.
-	 */
-	if (opcode == 0xfce2 && nparams > 0 && params[0] == 0x1c)
-		ev[8] = 14;
+	/* Read Local Controller Cached Info (27.2 bluetoothd: vendor OCF 0x123 = 0xfd23 sub-opcode 0x0a, the only
+	 * sender of _BCM_ReadLocalControllerCachedInfoEventParser, file 0x34b9e4; FCE2/0x1c as Codex had it, kept).
+	 * The parser (file 0x33dea8, bcm_vsc.c:936-939) reads a u8, a little-endian u16 length, and asserts that the
+	 * length equals the bytes left; any mismatch aborts bluetoothd, which launchd restarts every ~40 s (Bluetooth
+	 * greyed out). Whether its byte stream starts at the sub-opcode echo or after it is not certain, so the reply
+	 * is 4 bytes after the status that pass both readings: 0a 01 00 00 (from the echo: u8 0x0a, length 1, one byte
+	 * left; from after it: u8 0x01, length 0, none left). 2026-11-16: 16 zero-padded bytes failed either way. */
+	if (nparams > 0 && ((opcode == 0xfce2 && params[0] == 0x1c) || (opcode == 0xfd23 && params[0] == 0x0a))) {
+		uint8_t short_ev[11] = { 0x04, 0x0e, 3 + 1 + 4, 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0x00,
+			params[0], 0x01, 0x00, 0x00 };
+		if (write(m, short_ev, sizeof(short_ev)) != (ssize_t)sizeof(short_ev))
+			printf("btbridge: write: %s\n", strerror(errno));
+		printf("btbridge: cached-info read %04x/%02x answered with %02x %02x %02x %02x\n", opcode, params[0],
+		    short_ev[7], short_ev[8], short_ev[9], short_ev[10]);
+		return;
+	}
 	if (write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
 		printf("btbridge: write: %s\n", strerror(errno));
 }

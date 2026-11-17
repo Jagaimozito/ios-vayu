@@ -57,11 +57,12 @@ main(int argc, char **argv)
 		return 2;
 	}
 	int pid = find_pid(argv[1]), samples = argc > 2 ? atoi(argv[2]) : 500, us = argc > 3 ? atoi(argv[3]) : 4000;
-	printf("P %s pid %d\n", argv[1], pid);
+	/* 2026-11-16: no "P" line for a name that matches nothing: a caller that took the pid from it ran kill -9 -1 */
 	if (pid <= 0) {
 		fprintf(stderr, "no process %s\n", argv[1]);
 		return 1;
 	}
+	printf("P %s pid %d\n", argv[1], pid);
 	task_t task;
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
 	if (kr != KERN_SUCCESS) {

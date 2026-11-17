@@ -908,7 +908,7 @@ static void afe_probe(void)
 #define PCM_SID_MSW	1u
 #define PCM_PERIOD	4096u		/* bytes: 1024 frames of 16-bit stereo, 21.3 ms */
 #define PCM_PERIODS	16u
-#define PCM_INFLIGHT	4u		/* periods queued in the ADSP: 85 ms */
+#define PCM_INFLIGHT	5u		/* periods queued in the ADSP: 107 ms (was 4: 85 ms; 2026-11-17 cut-outs) */
 #define PCM_SESSION	1
 #define PCM_PORT	((PCM_SESSION << 8) | 1)	/* session << 8 | stream */
 
@@ -952,18 +952,38 @@ static int pcm_ring_open(void)
 	return 0;
 }
 
-/* one period from the ring: whole periods only (silence while short), latency kept near two periods */
+/*
+ * One period from the ring: whole periods only (silence while short).
+ * 2026-11-17 (audio cut out every so often): the latency was kept near two periods (43 ms) and anything over four
+ * (85 ms) was thrown away, so both a late write from the HAL (an underrun: 21 ms of silence) and a burst of a few
+ * periods at once (a skip: up to 64 ms of audio dropped) were audible, and this phone's stalls make both common. Now
+ * playback (re)starts only once three periods are in the ring, and only more than twelve (256 ms) are trimmed, back
+ * to four. Latency ~64-85 ms in the ring plus the ADSP's queue.
+ */
+static int pcm_primed;
 static void pcm_fill_ring(int16_t *s)
 {
 	const uint32_t n = PCM_PERIOD / 4;
 	uint64_t w = pcm_ring->wpos, r = pcm_ring->rpos;
-	if (w - r > 4 * n || w < r) {
-		r = w - 2 * n;
+	if (w < r) {
+		r = w;          /* the writer started over */
+		pcm_primed = 0;
+	}
+	if (w - r > 12 * n) {
+		r = w - 4 * n;
 		pcm_skips++;
 	}
+	if (!pcm_primed && w - r < 3 * n) {
+		memset(s, 0, PCM_PERIOD);
+		pcm_ring->rpos = r;
+		return;
+	}
+	pcm_primed = 1;
 	if (w - r < n) {
 		memset(s, 0, PCM_PERIOD);
 		pcm_underruns++;
+		pcm_primed = 0;
+		pcm_ring->rpos = r;
 		return;
 	}
 	for (uint32_t i = 0; i < n; i++) {

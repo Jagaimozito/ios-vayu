@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--guacamole] [--scale2]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--guacamole] [--scale2] [--ram5g]
 """
 import hashlib, os, struct, sys
 
@@ -40,6 +40,16 @@ GUACAMOLE = '--guacamole' in sys.argv
 # --scale2: present an @2x screen, 828x1792 (414x896 points, the iPhone XR / 11 screen; 375x812 @2x has no UIKit
 # status bar layout), with kernel boot-arg sweetfb_scale=2 (xnu 0240 + 0241): 1.85x fewer pixels to draw. MobileGestalt caches the screen: move its cache aside after switching.
 SCALE2 = '--scale2' in sys.argv
+# --ram5g (guacamole, 2026-11-17): XNU's window grows upward to 5 GiB, 0x100000000-0x240000000 (was 0xfcc00000 =
+# 3.95 GiB, a size inherited from sweet's memory node). DDR runs on to 0x280000000. Take 1 (window from 0xc0000000)
+# went to QUALCOMM CrashDump about a minute into the boot: 0xc0000000-0xffffffff holds fixed buffers of ours that XNU
+# must not hand out (wland's radio pool 0xe0000000, adspd's FastRPC heap/buffers/PCM 0xfd800000-0xfe9xxxxx, which it
+# assigns to the ADSP, and the GPU zap metadata 0xf0000000). The GPU pool (sweet_gpu.c gpu_pool_ranges) gives up the
+# 1 GiB above the new window and takes about 1 GiB of DDR XNU does not use instead (the old low ranges plus free
+# low-bank gaps), keeping ~2 GiB.
+RAM5G = '--ram5g' in sys.argv
+if RAM5G:
+    HIGH_PHYS_BASE, HIGH_MEM_SIZE = 0x100000000, 0x140000000
 if GUACAMOLE:
     FB_W, FB_H, FB_STRIDE = 1440, 3120, 1440 * 4
     FB_SIZE = 0x1200000
@@ -348,7 +358,11 @@ def build(seed=None, qemu=False, highmem=False):
     # as a plain plist instead of decrypting it with the effaceable key.
     # kern.maxvnodes: xnu's xsmall CONFIG_VNODES caps desiredvnodes at 1024 ("vnode: table is full" on iOS 26);
     # PE_get_default("kern.maxvnodes") in bsd_startupearly overrides it uncapped.
-    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1)), ('kern.maxvnodes', u32(65536))])
+    # sleep-disabled (2026-11-17): IOPMrootDomain reads it at boot-completed (PE_get_default -> gSleepDisabledFlag) and then
+    # refuses idle and demand system sleep. There is no S2R here: a system sleep ended in PLATFORM_PRE_SLEEP and the
+    # panic "SWEET CPU: CPU halt/suspend is not implemented" (SweetCPU::haltCPU). Display off is unaffected.
+    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1)), ('kern.maxvnodes', u32(65536)),
+                                 ('sleep-disabled', u32(1))])
 
     # MobileGestalt HomeButtonType = IODeviceTree:/buttons home-button-type
     # (D22AP: 2, no Home button; absent = 0 = Home-button device).

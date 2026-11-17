@@ -96,6 +96,7 @@
 #define SE_GENI_RX_RFR_WATERMARK 0x814
 #define   M_CMD_DONE            (1u << 0)
 #define   CMD_CANCEL            (1u << 2)
+#define   CMD_ABORT             (1u << 1)
 #define   OPCODE_SHIFT          27
 #define   UART_START_TX         1u
 #define   UART_START_READ       1u
@@ -187,6 +188,8 @@ static void pins(void)
 	}
 }
 
+static void tx_abort(const char *why);
+
 static void rx_stop(void)
 {
 	if (!(se_rd(GENI_STATUS) & S_CMD_ACTIVE))
@@ -217,6 +220,7 @@ static void set_baud(unsigned baud)
 
 static void uart_init(int flow)
 {
+	tx_abort("left over at init");
 	rx_stop();
 	/* FIFO mode, 8-bit bytes four to a word, LSB first (geni_se_config_packing(8, 4, false)) */
 	se_wr(SE_GENI_DMA_MODE_EN, 0);
@@ -241,8 +245,37 @@ static void uart_init(int flow)
 	printf("uart: FIFO mode, 8N1, flow control %s\n", flow ? "on" : "off");
 }
 
+/* A transmit that did not finish (CTS held by the controller in the middle of the firmware download, 2026-11-16) left
+ * the SE's TX command running and waiting for the rest of its TRANS_LEN: every later write (the next attempt's power
+ * pulses and commands, in a new btbridge process too) was fed into that old command, never completed ("TX not done"),
+ * and the controller got stuck half way through a download. Cancel it, abort if the cancel does not take (Linux
+ * qcom_geni_serial_cancel_tx_cmd). */
+static void tx_abort(const char *why)
+{
+	if (!(se_rd(GENI_STATUS) & M_CMD_ACTIVE))
+		return;
+	const char *how = "cancelled";
+	se_wr(SE_GENI_M_CMD_CTRL, CMD_CANCEL);
+	uint64_t t = now_ms();
+	while ((se_rd(GENI_STATUS) & M_CMD_ACTIVE) && now_ms() - t < 50)
+		;
+	if (se_rd(GENI_STATUS) & M_CMD_ACTIVE) {
+		how = "aborted";
+		se_wr(SE_GENI_M_CMD_CTRL, CMD_ABORT);
+		t = now_ms();
+		while ((se_rd(GENI_STATUS) & M_CMD_ACTIVE) && now_ms() - t < 50)
+			;
+		if (se_rd(GENI_STATUS) & M_CMD_ACTIVE)
+			how = "STILL RUNNING after cancel and abort";
+	}
+	se_wr(SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+	printf("uart: unfinished TX command %s (%s); TX FIFO now %u words\n", how, why,
+	    se_rd(SE_GENI_TX_FIFO_STATUS) & 0x0fffffffu);
+}
+
 static int uart_write(const uint8_t *b, unsigned n)
 {
+	tx_abort("left over before a write");
 	se_wr(SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
 	se_wr(SE_UART_TX_TRANS_LEN, n);
 	se_wr(SE_GENI_M_CMD0, UART_START_TX << OPCODE_SHIFT);
@@ -252,6 +285,7 @@ static int uart_write(const uint8_t *b, unsigned n)
 		if ((se_rd(SE_GENI_TX_FIFO_STATUS) & 0x0fffffffu) >= TX_FIFO_WORDS) {
 			if (now_ms() - t > 1000) {
 				printf("uart: TX FIFO stuck (CTS held?)\n");
+				tx_abort("FIFO stuck");
 				return -1;
 			}
 			continue;
@@ -264,6 +298,7 @@ static int uart_write(const uint8_t *b, unsigned n)
 	while (!(se_rd(SE_GENI_M_IRQ_STATUS) & M_CMD_DONE)) {
 		if (now_ms() - t > 2000) {
 			printf("uart: TX not done (M_IRQ %08x, status %08x)\n", se_rd(SE_GENI_M_IRQ_STATUS), se_rd(GENI_STATUS));
+			tx_abort("not done");
 			return -1;
 		}
 	}
@@ -612,20 +647,29 @@ static int setup(void)
 	return 0;
 }
 
-static void pulse(void)
+/* off_ms: how long the controller is left off between the pulses (Linux: about 10 ms). The controller answers the
+ * power-on pulse with one 00 byte when it boots; it can take longer than 500 ms (2026-11-16: the 00 came in front of
+ * the version reply). Returns the number of bytes seen (0: it did not boot, or not yet). */
+static unsigned pulse_ex(unsigned off_ms)
 {
 	uint8_t r[256], off = 0xc0, on = 0xfc;
 	set_baud(2400);
 	uart_write(&off, 1);
-	delay_ms(10);
+	delay_ms(off_ms);
 	set_baud(115200);
 	uart_write(&on, 1);
 	delay_ms(100);
-	unsigned got = uart_read(r, sizeof(r), 500);
+	unsigned got = uart_read(r, sizeof(r), 1500);
 	if (got)
 		show("after the power-on pulse", r, got);
 	else
-		printf("after the power-on pulse: nothing received (normal: the controller waits for a command)\n");
+		printf("after the power-on pulse: nothing received in 1.5 s\n");
+	return got;
+}
+
+static void pulse(void)
+{
+	(void)pulse_ex(10);
 }
 
 /* Controller and host to 3 Mbaud after the download (Linux hci_qca.c qca_set_speed for WCN399x): our RFR (the chip's
