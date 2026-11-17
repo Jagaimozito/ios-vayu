@@ -26,7 +26,7 @@ Status snapshot: **2026-11-17**. For detailed evidence, caveats, and engineering
 
 - **Metal/GPU:** NativeAdrenoMetal and Turnip render the UI. Frame rates are limited (roughly 20-40 fps while animating) and long stutters of a few hundred milliseconds still occur. App and game rendering is not reliable.
 - **Performance:** better after removing the spinning `PerfPowerServices` job and preferring the big CPU cores, but `locationd` can spin on a full core after boot (killing it works around it) and `wland` polls Wi-Fi every millisecond (about 12% of a core).
-- **Video playback in Safari:** not working in the latest test. Streamed audio in Safari has timed out at times.
+- **Video playback:** plays in Safari (YouTube) and from local files since the YUV video layer fix (`xnu/ios27/xnu12377-fb-yuv.diff`); the player controls over the video are fixed in source but not yet confirmed on a build.
 - **Microphone:** input is unconfirmed.
 - **Sleep:** iOS's system sleep panicked the kernel (`SweetCPU::haltCPU` is not implemented). `tools/mkadt.py` now sets `sleep-disabled` in the device tree so iOS no longer attempts it; not yet confirmed on a build. Turning the screen off is unaffected.
 - **Identity:** the generated device tree uses the iPhone 14 Pro/D73 identity, but that does not guarantee all identity-dependent apps and services behave like they do on real iPhone hardware.
@@ -38,7 +38,7 @@ Status snapshot: **2026-11-17**. For detailed evidence, caveats, and engineering
 
 ## Booting
 
-Use the combined triple-boot image and select iOS 27 from the shim menu. **Do not assume a standalone iOS wrapper image will boot**; this setup requires the selector/triple-boot path.
+Use the combined triple-boot image and select iOS 27 from the shim menu. The Alert Slider picks the default in the menu's order: top iOS 27, middle iOS 16, bottom Android. **Do not assume a standalone iOS wrapper image will boot**; this setup requires the selector/triple-boot path.
 
 The existing data partition is named `ios26`, so iOS 27 boot arguments commonly contain `ufsroot=ios26`. That is the partition label, not the OS version. See [`docs/dualboot.md`](docs/dualboot.md) for the image layout and selector workflow. The phone's Android installation and partition backups should be preserved when building or booting test images.
 

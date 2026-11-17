@@ -23,6 +23,10 @@ work):
   the counter or CNTFRQ. Boot-arg `sweettb24=0` turns it off.
 
 Display and responsiveness:
+- `xnu12377-fb-yuv.diff` - `SweetFramebuffer.cpp`: iOS 27 hands decoded video to the display as its own
+  '420v'/'420f' (NV12) layer, which the compositor skipped (black video with sound). Those layers are now
+  converted to BGRA (BT.709) underneath the page, which is blended over them so the player controls show
+  (boot-arg `sweetfbyuv=0`: off). Confirmed: video plays (Safari, YouTube, local files).
 - `xnu12377-fb-pageflip.diff` - `SweetFramebuffer.cpp`: present into a second buffer and flip the display pipes
   (VIG0/VIG1 SRC0_ADDR) instead of writing over the buffer being scanned out (the dashed-line corruption).
 - `xnu12377-fb-asyncflip.diff` - the flip completes from a timer instead of a blocking wait in the present.

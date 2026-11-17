@@ -7,7 +7,7 @@ static uint32_t host_fb[FB_H * FB_STRIDE / 4];
 int main(void)
 {
 	con_fb = host_fb;
-	con_clear(RED);
+	con_clear(BLACK);
 	con_str("SHIM", "sweet milestone 2");
 	con_hex("MMFR0", 0x0000000000101122ULL);
 	con_hex2("PSCI", "ver=", 0x10001, "smccc=", 0x10002);

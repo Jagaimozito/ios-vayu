@@ -1,11 +1,50 @@
+# Boot menu: Alert Slider order matches the menu; no red (Claude, 2026-11-17)
+- shim/shim.c: the slider now picks the default top to bottom like the menu reads: top iOS 27, middle iOS 16,
+  bottom Android (was top Android, middle iOS 27, bottom iOS 16); unknown position: iOS 16. iOS 27 missing from
+  the image: top falls back to iOS 16.
+- The red flash at power-on was shim_main's first con_clear(RED) (the diagnostic console colour) before the menu
+  drew; it now clears to the menu background (console.h MENU_BG 0xff0e0e12). RED is gone from the shim entirely
+  (the unreachable milestone-3 diagnostics and host_test use BLACK). Backups:
+  research/ios27.2/kernel-backup/shim-before-slider/. Compile-checked (aarch64 objects, no ABS64 relocations,
+  host_test). CODEX: rebuild the shim (BOARD=guacamole ./build.sh) and the triple-boot image (tools/mktripleboot.py).
+
+# Video plays black (Safari/YouTube and local files, sound OK): YUV video layers were skipped (Claude, 2026-11-17)
+- outputs/yt.klog: every frame "compose swap N layer 2 surface 2580 640x360 fmt 0x34323076 ... b 0,192 828x466
+  -> skipped". Decoding works (videocodecd busy; the surface is the decoded frame). iOS 27 hands decoded video
+  ('420v' NV12: Y plane + interleaved CbCr at half size) to the display as its own layer (an iPhone's DCP scans
+  it out directly); SweetFramebuffer's compositor (presentComposed) and GPU present took BGRA only.
+- FIX (SOURCE): research/ios27.2/kernel/xnu12377-fb-yuv.diff (also xnu/ios27/; backup
+  kernel-backup/SweetFramebuffer.cpp.before-yuv): sweet_fb_draw_nv12() converts '420v' (video range) / '420f'
+  (full range) to BGRA, BT.709, fixed point, scaled into the layer's rectangle in the CPU compose path
+  (the GPU present path already falls back to it for non-BGRA layers). Opaque, in the record's layer order.
+  Logs the first 4 as "SWEET FB: video layer: surface ... drawn at ...". Boot-arg sweetfbyuv=0 = old behaviour.
+  CONFIRMED (user, 02:08): video plays. Take 2: the video hid YouTube's controls -> video layers are now drawn
+  FIRST (underneath) and the layers above always blended per pixel (the page has a transparent hole for the
+  video and draws its controls over it), ignoring their opaque flag while a video layer is under them.
+  Expect video frames; check colours (BT.601 content would look slightly off) and that YouTube's controls are
+  not hidden under the video (layer order: the video layer was the higher index = top with sweetfbtop=1).
+  CPU cost ~0.4 Mpixel per video frame at 360p window size.
+  CODEX: build with tb24 + this diff, ADT with sleep-disabled -> outputs/guacamole-ios27a-yuv.img.
+  BUILD RESULT (2026-11-17): XNU build succeeded with both diffs already applied (reverse dry-runs clean); log
+  `xnu12377-ios27a-yuv-build.log`, kernel SHA-256 `2161c577c969bd345a4b7a6bea0c70930a9293d1ef6168876f1410b4dca42970`.
+  Generated `work/guacamole-ios27a-yuv.adt` with `--highmem --guacamole --identity d73 --scale2 --ram5g`; its
+  `/defaults/sleep-disabled` is 1. Used the exact `ram5g2` boot args unchanged (595 chars, sweettime unchanged).
+  Triple-boot image `outputs/guacamole-ios27a-yuv.img` (iOS 16 first, iOS 27 second), SHA-256
+  `514821401c8836341dc76eab40bfc35b746c258ca45f876e30b6e976f2b9d027`. Built only; not flashed or booted.
+  YUV follow-up build (2026-11-17): rebuilt after the updated fb-yuv layer-order change (tb24 and fb-yuv reverse
+  dry-runs clean), log `xnu12377-ios27a-yuv2-build.log`. Reused the exact same sleep-disabled ADT and boot args
+  (including sweettime). Kernel SHA-256 `c41cee65a739f38f27df80997edb40bfc9af1714c7fc3dcfa48978639a7ac02e`;
+  triple-boot image `outputs/guacamole-ios27a-yuv2.img`, SHA-256
+  `2999801f512106003fc804d7de4fce3f8a72b48657b7cf8e52300130ef2026e9`. Built only; not flashed or booted.
+
 # Random panic "SWEET CPU: CPU halt/suspend is not implemented" = iOS putting the phone to system sleep (2026-11-17)
 - Panic screen (user photo): event history ends PLATFORM_PRE_SLEEP 0 -> PLATFORM_PANIC; panic from
   SweetCPU::haltCPU (SweetCPU.cpp:295) on cpu 6; epoch "Sleep" set. IOPMrootDomain started a system sleep (idle
   sleep with the screen off); there is no suspend-to-RAM on this port.
-- FIX (ADT, NOT BUILT): tools/mkadt.py /defaults gets sleep-disabled = 1 (backup
+- FIX (ADT): tools/mkadt.py /defaults gets sleep-disabled = 1 (backup
   kernel-backup/mkadt.py.before-sleepdisabled). IOPMrootDomain reads it at boot-completed (gSleepDisabledFlag) and
   checkSystemSleepAllowed() then refuses idle and demand sleep (kPMConfigPreventSystemSleep). No kernel change.
-  CODEX: regenerate the ADT with mkadt.py (same flags as the running image: --ram5g --scale2 ...) for the next image.
+  Included in `outputs/guacamole-ios27a-yuv.img` with the same `--ram5g --scale2` ADT flags as the running image.
 
 # Safari "loads forever" fixed: WebContent appex dropped from LaunchServices (Claude + user, 2026-11-17)
 - Symptom: pages never load; no com.apple.WebKit.WebContent process at all (Networking yes, GPU idle-exits).

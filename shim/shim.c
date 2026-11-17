@@ -387,14 +387,15 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
-	con_clear(RED);
+	con_clear(MENU_BG);	/* 2026-11-17: was red, a red flash before the menu */
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_str("BOARD", BOARD_NAME);
 	con_skip();
 #if defined(BOARD_GUACAMOLE)
 	/*
 	 * Boot menu (menu.c): iOS 27 / iOS 16 / Android, volume keys to move, power to start.
-	 * The Alert Slider picks the default (top Android, middle iOS 27, bottom iOS 16), which
+	 * The Alert Slider picks the default like the menu reads, top to bottom (2026-11-17): top iOS 27,
+	 * middle iOS 16, bottom Android (unknown: iOS 16), which
 	 * starts after 5 s unless a key is pressed. If Android cannot be started the reason
 	 * stays on screen for 15 s, then iOS 16 boots.
 	 */
@@ -416,7 +417,7 @@ void shim_main(uint64_t dtb)
 	entries[2].detail = "boot_a";
 	entries[2].enabled = 1;
 	__asm__ volatile("" ::: "memory");
-	int def = slider == SLIDER_TOP ? 2 : (slider == SLIDER_MIDDLE && entries[0].enabled) ? 0 : 1;
+	int def = (slider == SLIDER_TOP && entries[0].enabled) ? 0 : slider == SLIDER_BOTTOM ? 2 : 1;
 	stage = "menu";
 	int choice = menu_choose(entries, 3, def, 5000);
 	con_quiet = 1;	/* only "Booting ..." until the kernel takes the screen; errors turn it back on */
@@ -460,17 +461,17 @@ void shim_main(uint64_t dtb)
 	reset(20);
 
 	stage = "fill off";
-	uint64_t fill_off = ticks_fill(RED);
+	uint64_t fill_off = ticks_fill(BLACK);
 	uint64_t mem_off = ticks_mem();
 
 	stage = "mmu enable";
 	int rc = mmu_enable(&mi);
 
 	stage = "fill on";
-	uint64_t fill_on = rc ? 0 : ticks_fill(RED);
+	uint64_t fill_on = rc ? 0 : ticks_fill(BLACK);
 	uint64_t mem_on = rc ? 0 : ticks_mem();
 	if (rc)
-		con_clear(RED);
+		con_clear(BLACK);
 
 	con_str("SHIM", "sweet milestone 3");
 	con_skip();

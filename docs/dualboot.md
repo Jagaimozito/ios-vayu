@@ -6,9 +6,11 @@ unless a key is pressed:
 
 | Alert Slider | Default |
 | --- | --- |
-| top | Android (boot_a: the stock ROM boot image, Magisk included) |
-| middle | iOS 27 (partition `ios26`; when the boot image carries no iOS 27 payload: iOS 16) |
-| bottom | iOS 16 |
+| top | iOS 27 (partition `ios26`; when the boot image carries no iOS 27 payload: iOS 16) |
+| middle | iOS 16 |
+| bottom | Android (boot_a: the stock ROM boot image, Magisk included) |
+
+The slider positions follow the menu's order, top to bottom (changed 2026-11-17; before, top was Android).
 
 Keys come from the PM8150 over the SPMI arbiter, read only: power = PON INT_RT_STS (0x0810) bit 0,
 volume down = bit 1 (RESIN) or GPIO7 (0xc610), volume up = GPIO6 (0xc510), as the kernel's keys driver
@@ -71,8 +73,8 @@ Requirements: unlocked bootloader, Android on slot A (`boot_a`), the iOS root on
 1. Build the shim and an iOS boot image as usual (`docs/guacamole.md`, Workflow): `BOARD=guacamole
    shim/build.sh` builds the selector into `shim/out/Image`; `tools/guac-mkboot.sh` /
    `tools/mkguacboot.py` wrap it with the payload.
-2. Test tethered, nothing flashed: `fastboot boot IMAGE` with the slider at the top (Android) and at
-   the bottom (iOS).
+2. Test tethered, nothing flashed: `fastboot boot IMAGE` with the slider at the bottom (Android) and at
+   the top or middle (iOS).
 3. Make `dtbo_b` equal `dtbo_a` (ABL applies the active slot's dtbo; Android needs its own):
    ```
    adb shell su -c "dd if=/dev/block/by-name/dtbo_a of=/dev/block/by-name/dtbo_b bs=4096 conv=fsync"
