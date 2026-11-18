@@ -28,12 +28,24 @@
  	sweet_gpu_probe();	/* GUACAMOLE: boot-arg sweetgpu=N */
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
-@@ -139,6 +139,8 @@
+@@ -139,6 +139,20 @@
  	for (unsigned i = 0; i < sizeof(writable) / sizeof(writable[0]); ++i) {
  		allowed |= sid == 2 && addr == writable[i];
  	}
 +	/* the camera's DVDD switch, PM8150L (SID 4) GPIO 1: MODE, DIG_VIN, DIG_PULL, OUT_SRC, EN (sweet_camhw.c) */
 +	allowed |= sid == 4 && (addr == 0xc040 || addr == 0xc041 || addr == 0xc042 || addr == 0xc044 || addr == 0xc046);
++	/*
++	 * the front camera's pop-up motor (sweet_camhw.c pop_*): its six PMIC GPIOs' 0x40-0x46 (PM8150 GPIO 10 nSLEEP,
++	 * PM8150B GPIO 5 M0 and 12 boost, PM8150L GPIO 8 M1, 10 STEP, 11 DIR) and the PM8150L LPG channel 2's 0x41-0x47
++	 */
++	{
++		unsigned per = addr >> 8, reg = addr & 0xffu;
++		bool gpio_reg = reg >= 0x40 && reg <= 0x46;
++		allowed |= gpio_reg && ((sid == 0 && per == 0xc9) || (sid == 2 && (per == 0xc4 || per == 0xcb)) ||
++		    (sid == 4 && (per == 0xc7 || per == 0xc9 || per == 0xca || per == 0xcb)));     /* 0xcb: PM8150L GPIO 12,
++		                                                                               * the front sensor's VANA switch */
++		allowed |= sid == 5 && per == 0xbd && reg >= 0x41 && reg <= 0x47;
++	}
  	if (!sp_ready || !allowed) {
  		return -1;
  	}
@@ -75,7 +87,7 @@
  	}
 --- /dev/null
 +++ b/bsd/dev/sweet_camhw.c
-@@ -0,0 +1,2224 @@
+@@ -0,0 +1,2657 @@
 +/*
 + * GUACAMOLE (OnePlus 7 Pro, SM8150) rear main camera, step 1: power the Sony IMX586 the way Android does and read
 + * its chip ID over the camera I2C controller (CCI). Nothing is streamed yet.
@@ -180,6 +192,11 @@
 +#define PIN_SCL1    20u
 +#define PIN_VANA2   29u
 +#define PIN_RESET   30u
++/* the front camera (IMX471, DT cam-sensor@2): north 12 reset, 15 MCLK2, 31/32 CCI 1 master 0 */
++#define PIN_RESET_F 12u
++#define PIN_MCLK_F  15u
++#define PIN_SDA_F   31u
++#define PIN_SCL_F   32u
 +#define TLMM_CFG(n) ((uint32_t)(n) * 0x1000u)
 +#define TLMM_IO(n)  (TLMM_CFG(n) + 4u)
 +
@@ -220,9 +237,18 @@
 +#define CCI_ST0_RST_DONE    0x1000000u
 +#define CCI_ST0_M1_RD_DONE  0x1000u
 +#define CCI_ST0_M1_ERROR    0x60ee6000u
-+#define CCI_MASTER          1u
 +#define CCI_QUEUE           1u
-+#define CCI_QOFF            (CCI_MASTER * 0x200u + CCI_QUEUE * 0x100u)
++/* the controller and master in use (cc): CCI 0 master 1 for the rear sensor and its lens, CCI 1 master 0 for the front */
++static struct {
++	vm_offset_t base;
++	unsigned m;
++} cc;
++#define CCI_QOFF            (cc.m * 0x200u + CCI_QUEUE * 0x100u)
++#define CCI_MR(off)         (0x100u + cc.m * 0x100u + (off))     /* SCL, SDA 0-2, MISC, READ_DATA, READ_LEVEL */
++#define CCI_RD_DONE         (cc.m ? 0x1000u : 0x1u)
++#define CCI_Q0_REPORT       (cc.m ? 0x10000u : 0x10u)
++#define CCI_ERR             (cc.m ? 0x60ee6000u : 0x18000ee6u)
++#define CCI_MRESET          (cc.m ? 0x3f001u : 0x3f1u)
 +/* queue commands (cam_cci_dev.h) */
 +#define CMD_SET_PARAM       1u
 +#define CMD_LOCK            6u
@@ -231,6 +257,8 @@
 +#define CMD_WRITE_DISABLE_P 11u
 +
 +#define CH_CSIPHY1_PA  0x0ac66000u
++#define CH_CSIPHY2_PA  0x0ac67000u
++#define CH_CCI1_PA     0x0ac4b000u
 +#define CH_CSID1_PA    0x0acba000u
 +#define CH_IFE1_PA     0x0acb6000u
 +#define CH_SMMU_PA     0x15000000u
@@ -320,6 +348,16 @@
 +#define CC_IFE1_CPHY_RX   0xb054u
 +#define CC_IFE1           0xb028u
 +#define CC_IFE1_AXI       0xb058u
++/* front camera (camcc-sm8150.c) */
++#define CC_CCI1_RCG       0xc124u
++#define CC_CCI1           0xc13cu
++#define CC_MCLK2_RCG      0x5044u
++#define CC_MCLK2          0x505cu
++#define CC_CSI2PHYTMR_RCG 0x604cu
++#define CC_CSI2PHYTMR     0x6064u
++#define CC_CSIPHY2        0x6068u
++#define IMX471_SID        0x10u         /* 8-bit 0x20 */
++#define IMX471_ID         0x0471u
 +/* CSID 175 */
 +#define CSID_HW_VERSION   0x000u
 +#define CSID_RST_STROBES  0x010u
@@ -345,6 +383,7 @@
 +#define IMX586_ID      0x0586u
 +
 +#include "sweet_camhw_imx586.h"
++#include "sweet_camhw_imx471.h"
 +
 +/* CSIPHY v1.1 C-PHY lane settings, lanes 0-2 (cam_csiphy_1_1_hwreg.h csiphy_3ph_v1_1_reg) */
 +enum { P_DEF, P_SETTLE_LO, P_SETTLE_HI };
@@ -489,7 +528,7 @@
 +#define CPHY_LANE_ENABLE 0x2au /* trios 0-2 */
 +
 +static struct {
-+	vm_offset_t gcc, camcc, cci, north, east, csiphy, csid, ife, smmu;
++	vm_offset_t gcc, camcc, cci, cci1, north, east, csiphy, csiphy1, csiphy2, csid, ife, smmu;
 +	vm_offset_t buf[NBUF];          /* FRAME_ALLOC bytes each, wired */
 +	vm_offset_t frame;              /* buf[0]: the test capture's, for sysctl kern.sweet_camhw_frame */
 +	vm_offset_t tables;             /* 4K pages: L1, L2, 8 L3 per buffer */
@@ -500,6 +539,7 @@
 +	int last;               /* the last ID read, or -errno */
 +} ch;
 +static int ch_sleep_chan;
++static bool ch_front;                   /* the sensor being set up: the front IMX471, not the rear IMX586 */
 +
 +/* MMIO as single base-register LDR/STR (as sweet_gpu.c): the hypervisor traps the apps SMMU and decodes only that */
 +static uint32_t
@@ -644,6 +684,172 @@
 +	return e;
 +}
 +
++
++/* ---------------------------------------------------------------- the front camera's pop-up motor (step 5)
++ *
++ * A stepper behind a TI DRV8834 (Android: oneplus_motor + drv8834; NOTES.md "Front camera"): STEP = PM8150L GPIO 10
++ * in func1 from the PM8150L (SID 5) LPG channel 2 (0xbd00), DIR = PM8150L GPIO 11 (low up, high down), M1 = PM8150L GPIO 8 (high)
++ * and M0 = PM8150B GPIO 5 (high impedance): 1/32 microsteps; nSLEEP = PM8150 GPIO 10, the motor supply's boost =
++ * PM8150B GPIO 12. Android moves it by time (outputs/android-frontcam/): 100 ms at a 104166 ns step period, then
++ * 12000 ns, stopped by a timer at 618 ms going up and 626 ms going down; the LPG settings are what pwm-qti-lpg.c
++ * makes of those periods (19.2 MHz clock, prediv 1, 6-bit size: exponent 5 = 106496 ns, exponent 2 = 13312 ns, 50 %).
++ * The pin order is the DRV8834 datasheet's (no source for OnePlus's driver): boost on, mode/direction set, nSLEEP high,
++ * 2 ms, steps; off in reverse. The hall sensors (MXM1120 on QUP SE1) are not read yet: where the camera is, is what
++ * this code last did (it is down at boot as Android leaves it).
++ * sysctl kern.sweet_popup: reads 0 down, 1 up, -1 unknown (a move failed); write 1 raise (from down), 2 lower (from
++ * up), 3 nudge (from down: 100 ms up at the slow rate, about 2 % of the travel, then the same down), 4 lower whatever
++ * it was (recovery).
++ */
++#define PG_SID_PM8150   0u
++#define PG_SID_PM8150B  2u
++#define PG_SID_PM8150L  4u
++#define LPG_SID         5u
++#define LPG2            0xbd00u
++#define PGB(n)          (0xc000u + ((unsigned)(n) - 1u) * 0x100u)
++
++static int pop_pos = 0;                 /* 0 down, 1 up, -1 unknown */
++
++/* a PMIC GPIO (LV/MV): mode 0x40, VIN 0x41, pull 0x42, output source 0x44 (bit 7 invert, low bits function),
++ * output control 0x45 (buffer type << 4 | strength), enable 0x46 (bit 7) -- as pinctrl-spmi-gpio.c writes them */
++static int
++pop_gpio(unsigned sid, unsigned n, uint8_t mode, uint8_t pull, uint8_t src, uint8_t strength, bool enable)
++{
++	unsigned b = PGB(n);
++	int e = 0;
++	e |= sweet_spmi_write(sid, b + 0x41, 0x00);
++	e |= sweet_spmi_write(sid, b + 0x42, pull);
++	e |= sweet_spmi_write(sid, b + 0x45, strength);
++	e |= sweet_spmi_write(sid, b + 0x40, mode);
++	e |= sweet_spmi_write(sid, b + 0x44, src);
++	e |= sweet_spmi_write(sid, b + 0x46, enable ? 0x80 : 0x00);
++	return e;
++}
++
++static int
++pop_out(unsigned sid, unsigned n, bool high, uint8_t pull, uint8_t strength)
++{
++	return pop_gpio(sid, n, 0x01, pull, high ? 0x80 : 0x00, strength, true);
++}
++
++/* the LPG channel: period by exponent (6-bit, 19.2 MHz, prediv 1), 50 %, out on or off */
++static int
++pop_pwm(unsigned exponent, bool on)
++{
++	int e = 0;
++	if (on) {
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x41, 0x03);              /* size 6 bits, clock 19.2 MHz */
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x42, (uint8_t)exponent); /* prediv 1 */
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x43, 0x20);              /* glitch removal */
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x44, 32);                /* 50 % of 64 */
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x45, 0);
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x47, 0x01);              /* sync */
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x46, 0x84);              /* out on, source the PWM value */
++	} else {
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x46, 0x04);              /* out off */
++	}
++	return e;
++}
++
++/* everything as Android leaves it between moves: driver asleep, boost off, M1 high, M0 open, DIR low, STEP on the LPG */
++static int
++pop_idle(void)
++{
++	int e = pop_pwm(0, false);
++	e |= pop_out(PG_SID_PM8150, 10, false, 0x05, 0x03);             /* nSLEEP low */
++	e |= pop_out(PG_SID_PM8150B, 12, false, 0x04, 0x03);            /* boost off */
++	e |= pop_out(PG_SID_PM8150L, 8, true, 0x05, 0x01);              /* M1 high */
++	e |= pop_gpio(PG_SID_PM8150B, 5, 0x00, 0x05, 0x00, 0x01, false); /* M0 high impedance */
++	e |= pop_out(PG_SID_PM8150L, 11, false, 0x05, 0x01);            /* DIR low */
++	e |= pop_gpio(PG_SID_PM8150L, 10, 0x01, 0x05, 0x02, 0x01, true); /* STEP: func1 (the LPG) */
++	return e;
++}
++
++/* one move: up (true) or down, for total_ms; slow_only stops after the 100 ms slow part */
++static int
++pop_move(bool up, unsigned total_ms, bool slow_only)
++{
++	uint64_t t0, t1, t2, ns;
++	int e = pop_idle();
++	if (e) {
++		printf("SWEET POPUP: the pins could not be set (SPMI) -- not moving\n");
++		return EIO;
++	}
++	e |= pop_out(PG_SID_PM8150B, 12, true, 0x04, 0x03);             /* boost on */
++	ch_wait(5);
++	e |= pop_out(PG_SID_PM8150L, 11, !up, 0x05, 0x01);              /* DIR: low raises (camhw10: high lowered it) */
++	e |= pop_out(PG_SID_PM8150, 10, true, 0x05, 0x03);              /* nSLEEP high */
++	ch_wait(2);
++	if (e) {
++		(void)pop_idle();
++		printf("SWEET POPUP: driver power-up failed (SPMI) -- not moving\n");
++		return EIO;
++	}
++	t0 = mach_absolute_time();
++	e = pop_pwm(5, true);                                           /* 106496 ns */
++	ch_wait(100);
++	t1 = mach_absolute_time();
++	if (!slow_only && e == 0) {
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x42, 0x02);      /* 13312 ns */
++		e |= sweet_spmi_write(LPG_SID, LPG2 + 0x47, 0x01);
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (e == 0 && ns / 1000000u < total_ms) {
++			ch_wait(total_ms - (unsigned)(ns / 1000000u));
++		}
++	}
++	t2 = mach_absolute_time();
++	int e2 = pop_pwm(0, false);                                     /* steps off first, whatever happened */
++	e2 |= pop_out(PG_SID_PM8150, 10, false, 0x05, 0x03);            /* nSLEEP low */
++	e2 |= pop_out(PG_SID_PM8150B, 12, false, 0x04, 0x03);           /* boost off */
++	uint64_t slow_ns, all_ns;
++	absolutetime_to_nanoseconds(t1 - t0, &slow_ns);
++	absolutetime_to_nanoseconds(t2 - t0, &all_ns);
++	printf("SWEET POPUP: %s%s: slow %llu ms, all %llu ms -> %d/%d\n", up ? "up" : "down", slow_only ? " (nudge)" : "",
++	    slow_ns / 1000000ull, all_ns / 1000000ull, e, e2);
++	return (e || e2) ? EIO : 0;
++}
++
++static int
++pop_command(int what)
++{
++	if (sweet_spmi_init() != 0) {
++		return ENODEV;
++	}
++	int e;
++	switch (what) {
++	case 1:
++		if (pop_pos != 0) {
++			return EBUSY;
++		}
++		e = pop_move(true, 618, false);
++		pop_pos = e ? -1 : 1;
++		return e;
++	case 2:
++		if (pop_pos != 1) {
++			return EBUSY;
++		}
++		e = pop_move(false, 626, false);
++		pop_pos = e ? -1 : 0;
++		return e;
++	case 3:
++		if (pop_pos != 0) {
++			return EBUSY;
++		}
++		e = pop_move(true, 0, true);
++		ch_wait(300);
++		if (e == 0) {
++			e = pop_move(false, 0, true);
++		}
++		pop_pos = e ? -1 : 0;
++		return e;
++	case 4:
++		e = pop_move(false, 626, false);
++		pop_pos = e ? -1 : 0;
++		return e;
++	default:
++		return EINVAL;
++	}
++}
++
 +static bool
 +ch_clocks_on(void)
 +{
@@ -678,34 +884,34 @@
 +static bool
 +ch_cci_init(void)
 +{
-+	uint32_t ver = ch_rd(ch.cci, CCI_HW_VERSION);
++	uint32_t ver = ch_rd(cc.base, CCI_HW_VERSION);
 +	printf("SWEET CAMHW: CCI hw version %#x (Android's 0x10070000)\n", ver);
 +	if (ver == 0 || ver == 0xffffffffu) {
 +		return false;
 +	}
-+	ch_wr(ch.cci, CCI_IRQ_MASK_0, 0x7fff7ff7u);
-+	ch_wr(ch.cci, CCI_IRQ_MASK_1, 0x00110000u);
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_1, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
-+	ch_wr(ch.cci, CCI_RESET_CMD, CCI_RESET_RMSK);
-+	ch_wr(ch.cci, CCI_RESET_CMD, 1u);
-+	if (!ch_poll(ch.cci, CCI_IRQ_STATUS_0, CCI_ST0_RST_DONE, true, 100000)) {
-+		printf("SWEET CAMHW: CCI reset not acknowledged (status %#x)\n", ch_rd(ch.cci, CCI_IRQ_STATUS_0));
++	ch_wr(cc.base, CCI_IRQ_MASK_0, 0x7fff7ff7u);
++	ch_wr(cc.base, CCI_IRQ_MASK_1, 0x00110000u);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_0, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_1, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_GLOBAL_CLR, 1u);
++	ch_wr(cc.base, CCI_RESET_CMD, CCI_RESET_RMSK);
++	ch_wr(cc.base, CCI_RESET_CMD, 1u);
++	if (!ch_poll(cc.base, CCI_IRQ_STATUS_0, CCI_ST0_RST_DONE, true, 100000)) {
++		printf("SWEET CAMHW: CCI reset not acknowledged (status %#x)\n", ch_rd(cc.base, CCI_IRQ_STATUS_0));
 +		return false;
 +	}
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_1, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
-+	ch_wr(ch.cci, CCI_M0_RD_THRESHOLD, 0x30u);
-+	ch_wr(ch.cci, CCI_M1_RD_THRESHOLD, 0x30u);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_0, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_1, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_GLOBAL_CLR, 1u);
++	ch_wr(cc.base, CCI_M0_RD_THRESHOLD, 0x30u);
++	ch_wr(cc.base, CCI_M1_RD_THRESHOLD, 0x30u);
 +	/* Android's standard mode at 37.5 MHz (thigh 201, tlow 174, tsu_sto 204, tsu_sta 231, thd_dat 22,
 +	 * thd_sta 162, tbuf 227, trdhld 6, tsp 3), halved for 19.2 MHz: about 100 kHz */
-+	ch_wr(ch.cci, CCI_M1_SCL_CTL, (103u << 16) | 89u);
-+	ch_wr(ch.cci, CCI_M1_SDA_CTL_0, (105u << 16) | 118u);
-+	ch_wr(ch.cci, CCI_M1_SDA_CTL_1, (12u << 16) | 83u);
-+	ch_wr(ch.cci, CCI_M1_SDA_CTL_2, 116u);
-+	ch_wr(ch.cci, CCI_M1_MISC_CTL, (0u << 8) | (3u << 4) | 2u);
++	ch_wr(cc.base, CCI_MR(0x00u), (103u << 16) | 89u);
++	ch_wr(cc.base, CCI_MR(0x04u), (105u << 16) | 118u);
++	ch_wr(cc.base, CCI_MR(0x08u), (12u << 16) | 83u);
++	ch_wr(cc.base, CCI_MR(0x0cu), 116u);
++	ch_wr(cc.base, CCI_MR(0x10u), (0u << 8) | (3u << 4) | 2u);
 +	return true;
 +}
 +
@@ -722,41 +928,41 @@
 +		CMD_READ | (n << 4),
 +		CMD_UNLOCK,
 +	};
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_1, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_0, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_1, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_GLOBAL_CLR, 1u);
 +	for (unsigned i = 0; i < 5; ++i) {
-+		ch_wr(ch.cci, CCI_Q_LOAD_DATA + CCI_QOFF, words[i]);
++		ch_wr(cc.base, CCI_Q_LOAD_DATA + CCI_QOFF, words[i]);
 +	}
-+	uint32_t cnt = ch_rd(ch.cci, CCI_Q_CUR_WORDS + CCI_QOFF);
-+	ch_wr(ch.cci, CCI_Q_EXEC_WORDS + CCI_QOFF, cnt);
-+	ch_wr(ch.cci, CCI_QUEUE_START, 1u << (CCI_MASTER * 2u + CCI_QUEUE));
++	uint32_t cnt = ch_rd(cc.base, CCI_Q_CUR_WORDS + CCI_QOFF);
++	ch_wr(cc.base, CCI_Q_EXEC_WORDS + CCI_QOFF, cnt);
++	ch_wr(cc.base, CCI_QUEUE_START, 1u << (cc.m * 2u + CCI_QUEUE));
 +	uint32_t st = 0;
 +	for (unsigned i = 0; i < 100000; ++i) {
-+		st = ch_rd(ch.cci, CCI_IRQ_STATUS_0);
-+		if (st & (CCI_ST0_M1_RD_DONE | CCI_ST0_M1_ERROR)) {
++		st = ch_rd(cc.base, CCI_IRQ_STATUS_0);
++		if (st & (CCI_RD_DONE | CCI_ERR)) {
 +			break;
 +		}
 +		delay(1);
 +	}
-+	uint32_t level = ch_rd(ch.cci, CCI_M1_READ_LEVEL);
-+	bool bad = !(st & CCI_ST0_M1_RD_DONE) || (st & CCI_ST0_M1_ERROR);
++	uint32_t level = ch_rd(cc.base, CCI_MR(0x1cu));
++	bool bad = !(st & CCI_RD_DONE) || (st & CCI_ERR);
 +	if (!ch_cci_quiet || bad) {
 +		printf("SWEET CAMHW: CCI read sid %#x reg %#x: queue words %u, status0 %#x status1 %#x, fifo %u\n",
-+		    sid, reg, cnt, st, ch_rd(ch.cci, CCI_IRQ_STATUS_1), level);
++		    sid, reg, cnt, st, ch_rd(cc.base, CCI_IRQ_STATUS_1), level);
 +	}
 +	if (bad) {
 +		for (unsigned i = 0; i < level && i < 8; ++i) {
-+			(void)ch_rd(ch.cci, CCI_M1_READ_DATA);
++			(void)ch_rd(cc.base, CCI_MR(0x18u));
 +		}
-+		ch_wr(ch.cci, CCI_RESET_CMD, 0x3f001u);      /* CCI_M1_RESET_RMSK: clear master 1 */
-+		return (st & CCI_ST0_M1_ERROR) ? EIO : ETIMEDOUT;
++		ch_wr(cc.base, CCI_RESET_CMD, CCI_MRESET);      /* CCI_M1_RESET_RMSK: clear master 1 */
++		return (st & CCI_ERR) ? EIO : ETIMEDOUT;
 +	}
 +	/* the first byte of the FIFO is the slave id; the data follow, little-endian within each word */
 +	unsigned got = 0;
 +	bool first = true;
 +	for (unsigned w = 0; w < level && w < 8; ++w) {
-+		uint32_t v = ch_rd(ch.cci, CCI_M1_READ_DATA);
++		uint32_t v = ch_rd(cc.base, CCI_MR(0x18u));
 +		for (unsigned b = 0; b < 4 && got < n; ++b) {
 +			if (first) {
 +				first = false;
@@ -765,9 +971,9 @@
 +			out[got++] = (uint8_t)(v >> (8 * b));
 +		}
 +	}
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_1, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_0, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_1, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_GLOBAL_CLR, 1u);
 +	return got == n ? 0 : EIO;
 +}
 +
@@ -871,6 +1077,54 @@
 +	printf("SWEET CAMHW: CSIPHY 1 set for C-PHY x3 (settle %#x); status0 %#x\n", CPHY_SETTLE, ch_rd(p, 0x8b0));
 +}
 +
++/* CSIPHY 2 for D-PHY, 4 data lanes + clock (front camera): cam_csiphy_1_1_hwreg.h csiphy_2ph_v1_1_reg (DNP entries
++ * left out), common lane enable 0xd5, settle 0x0e -- exactly the writes in Android's trace-front-phy.txt */
++static void
++ch_csiphy_dphy_on(void)
++{
++	static const uint16_t lanes[5] = { 0x000, 0x700, 0x200, 0x400, 0x600 };
++	static const uint16_t irq[11] = { 0xff, 0xff, 0xfb, 0xff, 0x7f, 0xff, 0xff, 0xef, 0xff, 0xff, 0xff };
++	vm_offset_t p = ch.csiphy;
++	ch_wr(p, 0x814, 0);
++	ch_wr(p, 0x818, 0);
++	ch_wr(p, 0x81c, 0);
++	ch_wr(p, 0x800, 1);
++	ch_wait(1);
++	ch_wr(p, 0x800, 0);
++	ch_wr(p, 0x814, 0xd5);
++	ch_wr(p, 0x818, 1);
++	ch_wr(p, 0x81c, 2);
++	ch_wr(p, 0x800, 1);
++	ch_wait(1);
++	ch_wr(p, 0x800, 0);
++	for (unsigned l = 0; l < 5; ++l) {
++		uint32_t b = lanes[l];
++		bool clk = b == 0x700;
++		ch_wr(p, b + 0x04, 0x0c);
++		ch_wr(p, b + 0x2c, 0x01);
++		ch_wr(p, b + 0x34, 0x0f);
++		ch_wr(p, b + 0x1c, 0x0a);
++		ch_wr(p, b + 0x14, 0x60);
++		if (clk) {
++			ch_wr(p, b + 0x28, 0x04);
++		}
++		ch_wr(p, b + 0x3c, 0xb8);
++		ch_wr(p, b + 0x00, clk ? 0x80 : 0x90);
++		ch_wr(p, b + 0x08, 0x0e);               /* settle */
++		if (clk) {
++			ch_wr(p, b + 0x0c, 0xa5);
++		}
++		ch_wr(p, b + 0x10, 0x52);
++		ch_wr(p, b + 0x38, clk ? 0x1f : 0xfe);
++		ch_wr(p, b + 0x60, 0x00);
++		ch_wr(p, b + 0x64, 0x7f);
++	}
++	for (unsigned i = 0; i < 11; ++i) {
++		ch_wr(p, 0x82cu + 4u * i, irq[i]);
++	}
++	printf("SWEET CAMHW: CSIPHY 2 set for D-PHY x4 (settle 0xe); status0 %#x\n", ch_rd(p, 0x8b0));
++}
++
 +/* CSID 1: global reset, then CSI-2 RX for C-PHY 3 lanes from PHY 1, packet capture on, all RX interrupts unmasked */
 +static bool
 +ch_csid_on(void)
@@ -893,7 +1147,8 @@
 +	(void)ch_poll(c, CSID_TOP_IRQ_ST, 1u, true, 100000);
 +	ch_wr(c, CSID_TOP_IRQ_CLR, 1);
 +	ch_wr(c, CSID_IRQ_CMD, 1);
-+	ch_wr(c, CSID_RX_CFG0, 0x01102102u);   /* 3 lanes, lane cfg 0x210, C-PHY, phy 1 (Android's) */
++	/* rear: 3 lanes, lane cfg 0x210, C-PHY, PHY 1; front: 4 lanes, lane cfg 0x3210, D-PHY, PHY 2 (Android's) */
++	ch_wr(c, CSID_RX_CFG0, ch_front ? 0x00232103u : 0x01102102u);
 +	ch_wr(c, CSID_RX_CFG1, (1u << 6) | 1u); /* MISR, ECC correction */
 +	/* capture: long packets of DT 0x2b VC 0, short packets, C-PHY headers of DT 0x2b */
 +	ch_wr(c, CSID_RX_CAPTURE, 1u | (1u << 1) | (1u << 2) | (0x2bu << 4) | (0x2bu << 20));
@@ -907,36 +1162,36 @@
 +static int
 +ch_cci_run(unsigned sid, const uint32_t *words, unsigned n)
 +{
-+	const uint32_t qoff = CCI_MASTER * 0x200u;       /* queue 0 */
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_1, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
-+	ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_SET_PARAM | (sid << 4) | (3u << 16));
-+	ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_LOCK);
++	const uint32_t qoff = cc.m * 0x200u;       /* queue 0 */
++	ch_wr(cc.base, CCI_IRQ_CLEAR_0, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_1, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_GLOBAL_CLR, 1u);
++	ch_wr(cc.base, CCI_Q_LOAD_DATA + qoff, CMD_SET_PARAM | (sid << 4) | (3u << 16));
++	ch_wr(cc.base, CCI_Q_LOAD_DATA + qoff, CMD_LOCK);
 +	for (unsigned i = 0; i < n; ++i) {
-+		ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, words[i]);
++		ch_wr(cc.base, CCI_Q_LOAD_DATA + qoff, words[i]);
 +	}
-+	ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_UNLOCK);
-+	ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, 8u | (1u << 8));     /* REPORT */
-+	ch_wr(ch.cci, CCI_Q_EXEC_WORDS + qoff, ch_rd(ch.cci, CCI_Q_CUR_WORDS + qoff));
-+	ch_wr(ch.cci, CCI_QUEUE_START, 1u << (CCI_MASTER * 2u));
++	ch_wr(cc.base, CCI_Q_LOAD_DATA + qoff, CMD_UNLOCK);
++	ch_wr(cc.base, CCI_Q_LOAD_DATA + qoff, 8u | (1u << 8));     /* REPORT */
++	ch_wr(cc.base, CCI_Q_EXEC_WORDS + qoff, ch_rd(cc.base, CCI_Q_CUR_WORDS + qoff));
++	ch_wr(cc.base, CCI_QUEUE_START, 1u << (cc.m * 2u));
 +	uint32_t st = 0;
 +	unsigned t;
 +	for (t = 0; t < 200000; ++t) {
-+		st = ch_rd(ch.cci, CCI_IRQ_STATUS_0);
-+		if (st & (0x10000u | CCI_ST0_M1_ERROR)) {       /* M1 Q0 REPORT, or an error */
++		st = ch_rd(cc.base, CCI_IRQ_STATUS_0);
++		if (st & (CCI_Q0_REPORT | CCI_ERR)) {       /* M1 Q0 REPORT, or an error */
 +			break;
 +		}
 +		delay(1);
 +	}
-+	if (!(st & 0x10000u) || (st & CCI_ST0_M1_ERROR)) {
++	if (!(st & CCI_Q0_REPORT) || (st & CCI_ERR)) {
 +		printf("SWEET CAMHW: CCI batch to sid %#x (%u words, first %#x) failed: status0 %#x after %u us\n",
 +		    sid, n, n ? words[0] : 0, st, t);
-+		ch_wr(ch.cci, CCI_RESET_CMD, 0x3f001u);
++		ch_wr(cc.base, CCI_RESET_CMD, CCI_MRESET);
 +		return EIO;
 +	}
-+	ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
-+	ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
++	ch_wr(cc.base, CCI_IRQ_CLEAR_0, 0xffffffffu);
++	ch_wr(cc.base, CCI_IRQ_GLOBAL_CLR, 1u);
 +	return 0;
 +}
 +
@@ -1391,14 +1646,14 @@
 +	bool ok = ch_pll0();
 +	ok = ok && ch_gdsc(CC_IFE1_GDSC, "ife_1");
 +	ok = ok && ch_rcg(CC_CPHY_RX_RCG, (3u << 8) | 1u, "cphy_rx 400");
-+	ok = ok && ch_rcg(CC_CSI1PHYTMR_RCG, (2u << 8) | 3u, "csi1phytimer 300");
++	ok = ok && ch_rcg(ch_front ? CC_CSI2PHYTMR_RCG : CC_CSI1PHYTMR_RCG, (2u << 8) | 3u, "csiNphytimer 300");
 +	ok = ok && ch_rcg(CC_IFE1_CSID_RCG, (3u << 8) | 1u, "ife_1_csid 400");
 +	ok = ok && ch_rcg(CC_IFE1_RCG, 0, "ife_1 xo");
 +	if (!ok) {
 +		return false;
 +	}
-+	ok = ch_branch(ch.camcc, CC_CSIPHY1, "csiphy1");
-+	ok &= ch_branch(ch.camcc, CC_CSI1PHYTMR, "csi1phytimer");
++	ok = ch_branch(ch.camcc, ch_front ? CC_CSIPHY2 : CC_CSIPHY1, ch_front ? "csiphy2" : "csiphy1");
++	ok &= ch_branch(ch.camcc, ch_front ? CC_CSI2PHYTMR : CC_CSI1PHYTMR, "csiNphytimer");
 +	ok &= ch_branch(ch.camcc, CC_IFE1_CSID, "ife_1_csid");
 +	ok &= ch_branch(ch.camcc, CC_IFE1_CPHY_RX, "ife_1_cphy_rx");
 +	ok &= ch_branch(ch.camcc, CC_IFE1, "ife_1");
@@ -1406,7 +1661,13 @@
 +	if (!ok) {
 +		return false;
 +	}
-+	ch_csiphy_on();
++	if (ch_front) {
++		ch.csiphy = ch.csiphy2;
++		ch_csiphy_dphy_on();
++	} else {
++		ch.csiphy = ch.csiphy1;
++		ch_csiphy_on();
++	}
 +	if (!ch_csid_on()) {
 +		return false;
 +	}
@@ -1418,6 +1679,16 @@
 +static int
 +ch_sensor_start(void)
 +{
++	if (ch_front) {
++		int e = ch_cci_write(IMX471_SID, imx471_start, IMX471_MODE_START);
++		if (!e) {
++			ch_wait(5);
++			e = ch_cci_write(IMX471_SID, imx471_start + IMX471_MODE_START,
++			    (unsigned)(sizeof(imx471_start) / sizeof(imx471_start[0])) - IMX471_MODE_START);
++		}
++		printf("SWEET CAMHW: IMX471 start (%u writes) -> %d\n", (unsigned)(sizeof(imx471_start) / sizeof(imx471_start[0])), e);
++		return e;
++	}
 +	int e = ch_cci_write(IMX586_SID, imx586_start, IMX586_MODE_START);
 +	if (!e) {
 +		ch_wait(5);
@@ -1472,25 +1743,39 @@
 +	printf("SWEET CAMHW: sensor reset held, MCLK off, switches off (rails left voted)\n");
 +}
 +
-+/* power the sensor up as Android does and read its ID: the ID, or -errno (the sensor is left powered on success) */
-+static int
-+ch_power_up(void)
++static bool
++ch_map(void)
 +{
 +	if (!ch.gcc) {
-+		ch.csiphy = ml_io_map(CH_CSIPHY1_PA, 0x1000);
++		ch.csiphy1 = ml_io_map(CH_CSIPHY1_PA, 0x1000);
++		ch.csiphy2 = ml_io_map(CH_CSIPHY2_PA, 0x1000);
++		ch.csiphy = ch.csiphy1;
 +		ch.csid = ml_io_map(CH_CSID1_PA, 0x1000);
 +		ch.ife = ml_io_map(CH_IFE1_PA, 0x4000);
 +		ch.smmu = ml_io_map(CH_SMMU_PA, CH_SMMU_SIZE);
 +		ch.gcc = ml_io_map(CH_GCC_PA, 0x10000);
 +		ch.camcc = ml_io_map(CH_CAMCC_PA, 0x10000);
 +		ch.cci = ml_io_map(CH_CCI_PA, 0x1000);
-+		ch.north = ml_io_map(CH_NORTH_PA, TLMM_CFG(PIN_SCL1 + 1));
++		ch.cci1 = ml_io_map(CH_CCI1_PA, 0x1000);
++		ch.north = ml_io_map(CH_NORTH_PA, TLMM_CFG(PIN_SCL_F + 1));
 +		ch.east = ml_io_map(CH_EAST_PA, TLMM_CFG(PIN_RESET + 1));
 +	}
-+	if (!ch.gcc || !ch.camcc || !ch.cci || !ch.north || !ch.east || !ch.csiphy || !ch.csid) {
++	if (!ch.gcc || !ch.camcc || !ch.cci || !ch.cci1 || !ch.north || !ch.east || !ch.csiphy1 || !ch.csiphy2 || !ch.csid) {
 +		printf("SWEET CAMHW: io map failed\n");
++		return false;
++	}
++	return true;
++}
++
++/* power the sensor up as Android does and read its ID: the ID, or -errno (the sensor is left powered on success) */
++static int
++ch_power_up(void)
++{
++	if (!ch_map()) {
 +		return -ENOMEM;
 +	}
++	cc.base = ch.cci;
++	cc.m = 1;
 +	printf("SWEET CAMHW: TLMM before: 11 %#x/%#x 14 %#x 19 %#x 20 %#x 29 %#x/%#x 30 %#x/%#x; GDSC %#x\n",
 +	    ch_rd(ch.north, TLMM_CFG(PIN_VANA)), ch_rd(ch.north, TLMM_IO(PIN_VANA)), ch_rd(ch.north, TLMM_CFG(PIN_MCLK)),
 +	    ch_rd(ch.north, TLMM_CFG(PIN_SDA1)), ch_rd(ch.north, TLMM_CFG(PIN_SCL1)),
@@ -1547,9 +1832,80 @@
 +	return e == 0 ? (int)v : -e;
 +}
 +
++/* the front camera's power (Android's 5 steps: VANA = bob + PM8150L GPIO 12, VDIG = ldof3 1.056 V, VIO = ldoc1,
++ * MCLK2, RESET) and its ID over CCI 1 master 0: the ID, or -errno (left powered on success). Not with the rear's. */
++static int pop_out(unsigned sid, unsigned n, bool high, uint8_t pull, uint8_t strength);
++
++static void
++ch_front_off(void)
++{
++	ch_gpio(ch.north, PIN_RESET_F, 0, 0, true, false);
++	ch_wait(1);
++	ch_gpio(ch.north, PIN_MCLK_F, 1, 0, false, false);
++	ch_branch_off(ch.camcc, CC_MCLK2);
++	(void)pop_out(PG_SID_PM8150L, 12, false, 0x05, 0x01);   /* VANA switch off */
++	const uint32_t off[1] = { 4 }, zero[1] = { 0 };
++	(void)sweet_rpmh_write("ldof3", 1, off, zero);
++	printf("SWEET CAMHW: front sensor reset held, MCLK2 off, VANA switch and VDIG off\n");
++}
++
++static int
++ch_front_power_up(void)
++{
++	if (!ch_map()) {
++		return -ENOMEM;
++	}
++	cc.base = ch.cci1;
++	cc.m = 0;
++	ch_gpio(ch.north, PIN_RESET_F, 0, 0, true, false);
++	ch_gpio(ch.north, PIN_SDA_F, 3, 1, false, false);
++	ch_gpio(ch.north, PIN_SCL_F, 3, 1, false, false);
++	if (!ch_clocks_on()) {
++		return -EIO;
++	}
++	(void)ch_rcg_xo(CC_CCI1_RCG, "cci_1");
++	if (!ch_branch(ch.camcc, CC_CCI1, "cci_1") || !ch_cci_init()) {
++		return -EIO;
++	}
++	if (ch_bob(3300) != 0 || sweet_spmi_init() != 0) {
++		return -EIO;
++	}
++	int e = pop_out(PG_SID_PM8150L, 12, true, 0x05, 0x01);  /* VANA switch */
++	printf("SWEET CAMHW: PM8150L GPIO12 (front VANA) high -> %d\n", e);
++	ch_wait(2);
++	if (ch_ldo("ldof3", 1056) != 0) {
++		ch_front_off();
++		return -EIO;
++	}
++	ch_wait(2);
++	if (ch_ldo("ldoc1", 1800) != 0) {
++		ch_front_off();
++		return -EIO;
++	}
++	ch_wait(5);
++	(void)ch_rcg_xo(CC_MCLK2_RCG, "mclk2");
++	(void)ch_branch(ch.camcc, CC_MCLK2, "mclk2");
++	ch_gpio(ch.north, PIN_MCLK_F, 0, 1, false, false);      /* cam_mclk */
++	ch_wait(3);
++	ch_gpio(ch.north, PIN_RESET_F, 0, 0, true, true);
++	ch_wait(20);
++	uint8_t id[2] = { 0, 0 };
++	e = ch_cci_read(IMX471_SID, IMX586_ID_REG, 2, id);
++	unsigned v = ((unsigned)id[0] << 8) | id[1];
++	printf("SWEET CAMHW: IMX471 chip ID %#06x -> %d %s\n", v, e, e == 0 && v == IMX471_ID ? "(right)" : "(NOT 0x0471)");
++	return e == 0 ? (int)v : -e;
++}
++
 +static int
 +ch_probe(int mode)
 +{
++	if (mode == 5) {                /* the front sensor's ID only (it reads with the camera down) */
++		ch_front = true;
++		int v = ch_front_power_up();
++		ch_front_off();
++		ch_front = false;
++		return v;
++	}
 +	int v = ch_power_up();
 +	if (mode >= 2 && v == IMX586_ID) {
 +		int se = ch_stream_test(mode == 3);
@@ -1786,10 +2142,20 @@
 +#define CS_BLACK       64u
 +#define CS_GAIN_UNITY  256u
 +#define CS_GAIN_MAX    (CS_GAIN_UNITY * 16u)  /* analog gain code 960 */
-+#define CS_FL_MIN      3695u                  /* the mode's frame length (0x0340 0x0e6f): 30 a second */
-+#define CS_FL_MAX      (CS_FL_MIN * 4u)
 +#define CS_MARGIN      48u
-+#define CS_LINE_NS     9021u                  /* 1/30 s over CS_FL_MIN, until measured */
++
++/* the two cameras' modes: the frames as the WM writes them (lines padded to 16 bytes), the shortest frame (30 a
++ * second), a line's time until measured (1/30 s over it), and Android's last exposure as the start */
++static const struct cs_mode {
++	uint32_t sensor, sid, width, height, pitch, fl_min, line_ns, lines, gain, fl;
++	const char *name;
++} cs_modes[3] = {
++	[1] = { 1, IMX586_SID, 4000, 3000, 5008, 3695, 9021, 6672, CS_GAIN_MAX, 6720, "rear IMX586" },
++	[2] = { 2, IMX471_SID, 2328, 1748, 2912, 2685, 12415, 4040, CS_GAIN_UNITY * 1024u / (1024u - 0x391u), 4058,
++	        "front IMX471" },
++};
++#define CS_FL_MIN      (cs.md->fl_min)
++#define CS_FL_MAX      (cs.md->fl_min * 4u)
 +
 +static struct {
 +	lck_mtx_t *mtx;
@@ -1799,9 +2165,11 @@
 +	int pending;                    /* given to the WM, waiting for the next SOF */
 +	int ready, reading;
 +	uint64_t seq, ready_seq, read_seq, ready_time, last_done;
-+	uint32_t lines, gain, frame_lines, line_ns, bayer;
++	uint32_t lines, gain, frame_lines, line_ns, bayer, bayer_front;
 +	unsigned frames, drops, opens;
-+} cs = { .bayer = 3 };          /* BGGR: blue Gatorade came out orange with RGGB (camhw8) */
++	uint32_t want;                  /* the camera the next start is for (HAKIOS_CAMERA_SENSOR): 1 rear, 2 front */
++	const struct cs_mode *md;       /* the one streaming */
++} cs = { .bayer = 3, .bayer_front = 0, .want = 1, .md = &cs_modes[1] };  /* rear BGGR: blue Gatorade came out orange with RGGB */
 +
 +/* IMX586 analog gain: 1024 / (1024 - code), code 0..960 */
 +static uint32_t
@@ -1834,7 +2202,7 @@
 +		{ 0x0204, (uint16_t)(code >> 8) }, { 0x0205, (uint16_t)(code & 0xffu) },
 +		{ 0x0104, 0 },
 +	};
-+	int e = ch_cci_write(IMX586_SID, w, 8);
++	int e = ch_cci_write(cs.md->sid, w, 8);
 +	if (e == 0) {
 +		lck_mtx_lock(cs.mtx);
 +		cs.lines = lines;
@@ -1979,32 +2347,62 @@
 +	}
 +	lck_mtx_unlock(cs.mtx);
 +	static const uint16_t stop[1][2] = { { 0x0100, 0x00 } };
-+	(void)ch_cci_write(IMX586_SID, stop, 1);
++	(void)ch_cci_write(cs.md->sid, stop, 1);
 +	ch_wr(ch.ife, WM0_CFG, 0);
 +	ch_wr(ch.ife, IFE_REG_UPDATE, 0x2);
 +	ch_wr(ch.csid, CSID_RDI0_CTRL, 2);
 +	ch_wr(ch.csid, CSID_RDI0_CFG0, ch_rd(ch.csid, CSID_RDI0_CFG0) & ~(1u << 31));
 +	ch_wait(40);
-+	ch_lens_power(false);
-+	ch_sensor_off();
-+	printf("SWEET CAMHW: /dev/hakios-camera closed: %u frames, %u dropped\n", cs.frames, cs.drops);
++	if (cs.md->sensor == 2) {
++		ch_front_off();
++		if (pop_pos == 1) {
++			(void)pop_command(2);   /* the camera back down */
++		}
++	} else {
++		ch_lens_power(false);
++		ch_sensor_off();
++	}
++	ch_front = false;
++	printf("SWEET CAMHW: /dev/hakios-camera: the %s stopped: %u frames, %u dropped\n", cs.md->name, cs.frames, cs.drops);
 +}
 +
 +/* ch.lock held */
 +static int
-+cs_start(void)
++cs_start(uint32_t which)
 +{
-+	int v = ch_power_up();
-+	if (v != IMX586_ID) {
-+		ch_sensor_off();
-+		return EIO;
++	const struct cs_mode *md = &cs_modes[which == 2 ? 2 : 1];
++	ch_front = md->sensor == 2;
++	if (ch_front) {
++		if (pop_pos == 0) {
++			int pe = pop_command(1);        /* the camera up first */
++			printf("SWEET CAMHW: front camera up -> %d\n", pe);
++		}
++		int v = ch_front_power_up();
++		if (v != IMX471_ID || !ch_rx_setup() || !ch_capture_prepare()) {
++			ch_front_off();
++			if (pop_pos == 1) {
++				(void)pop_command(2);
++			}
++			ch_front = false;
++			return EIO;
++		}
++	} else {
++		int v = ch_power_up();
++		if (v != IMX586_ID) {
++			ch_sensor_off();
++			return EIO;
++		}
++		ch_lens_power(true);
++		if (!ch_rx_setup() || !ch_capture_prepare()) {
++			ch_lens_power(false);
++			ch_sensor_off();
++			return EIO;
++		}
++		if (cl.fw_len && !cl.ok) {
++			(void)ch_lens_start();  /* the program ISP.mediacapture handed in before */
++		}
 +	}
-+	ch_lens_power(true);            /* its program comes later, from ISP.mediacapture */
-+	if (!ch_rx_setup() || !ch_capture_prepare()) {
-+		ch_lens_power(false);
-+		ch_sensor_off();
-+		return EIO;
-+	}
++	cs.md = md;
 +	vm_offset_t f = ch.ife;
 +	lck_mtx_lock(cs.mtx);
 +	cs.queued = 0;
@@ -2012,10 +2410,10 @@
 +	cs.seq = cs.ready_seq = cs.read_seq = cs.last_done = 0;
 +	cs.fault = cs.stop = false;
 +	cs.frames = cs.drops = 0;
-+	cs.lines = 6672;                /* Android's last (0x0202 0x1a10, 0x0204 0x03c0, 0x0340 0x1a40) */
-+	cs.gain = CS_GAIN_MAX;
-+	cs.frame_lines = 6720;
-+	cs.line_ns = CS_LINE_NS;
++	cs.lines = md->lines;
++	cs.gain = md->gain;
++	cs.frame_lines = md->fl;
++	cs.line_ns = md->line_ns;
 +	ch_wr(f, IFE_IRQ_CLR0, 0xffffffffu);
 +	ch_wr(f, IFE_IRQ_CLR1, 0xffffffffu);
 +	ch_wr(f, IFE_IRQ_GLOBAL_CLR, 1);
@@ -2045,22 +2443,23 @@
 +		cs_stop();
 +		return EIO;
 +	}
-+	printf("SWEET CAMHW: /dev/hakios-camera streaming (4000x3000 RAW10, %u buffers)\n", NBUF);
++	printf("SWEET CAMHW: /dev/hakios-camera streaming the %s (%ux%u RAW10, %u buffers)\n", md->name, md->width,
++	    md->height, NBUF);
 +	return 0;
 +}
 +
 +/* cs.mtx held */
 +static void
-+cs_header(struct hakios_camera_frame *h)
++cs_header(struct hakios_camera_frame *h, const struct cs_mode *md)
 +{
 +	memset(h, 0, sizeof(*h));
 +	memcpy(h->magic, HAKIOS_CAMERA_MAGIC, sizeof(h->magic));
 +	h->header_bytes = sizeof(*h);
-+	h->width = 4000;
-+	h->height = 3000;
-+	h->stride = FRAME_PITCH;
++	h->width = md->width;
++	h->height = md->height;
++	h->stride = md->pitch;
 +	h->format = 1;
-+	h->bayer = cs.bayer;
++	h->bayer = md->sensor == 2 ? cs.bayer_front : cs.bayer;
 +	h->black = CS_BLACK;
 +	h->sequence = cs.ready_seq;
 +	h->time = cs.ready_time;
@@ -2070,11 +2469,11 @@
 +	h->gain_unity = CS_GAIN_UNITY;
 +	h->gain_max = CS_GAIN_MAX;
 +	h->frame_lines = cs.frame_lines;
-+	h->frame_lines_min = CS_FL_MIN;
-+	h->frame_lines_max = CS_FL_MAX;
++	h->frame_lines_min = md->fl_min;
++	h->frame_lines_max = md->fl_min * 4u;
 +	h->margin = CS_MARGIN;
-+	h->sensor = 1;
-+	h->focus = cl.ok ? cl.focus : HAKIOS_CAMERA_NO_FOCUS;
++	h->sensor = md->sensor;
++	h->focus = md->sensor == 1 && cl.ok ? cl.focus : HAKIOS_CAMERA_NO_FOCUS;
 +}
 +
 +static int
@@ -2085,13 +2484,27 @@
 +	if (want < (user_ssize_t)sizeof(h)) {
 +		return EINVAL;
 +	}
++	if (!cs.on) {
++		if (want == (user_ssize_t)sizeof(h)) {   /* the size of the frames to come, nothing started */
++			lck_mtx_lock(cs.mtx);
++			cs_header(&h, &cs_modes[cs.want == 2 ? 2 : 1]);
++			lck_mtx_unlock(cs.mtx);
++			return uiomove((caddr_t)&h, (int)sizeof(h), uio);
++		}
++		lck_mtx_lock(ch.lock);       /* the first read starts the camera asked for */
++		int se = cs.on ? 0 : cs_start(cs.want);
++		lck_mtx_unlock(ch.lock);
++		if (se) {
++			return EIO;
++		}
++	}
 +	lck_mtx_lock(cs.mtx);
 +	if (!cs.on || cs.fault) {
 +		lck_mtx_unlock(cs.mtx);
 +		return EIO;
 +	}
 +	if (want == (user_ssize_t)sizeof(h)) {   /* the frame's size, nothing more */
-+		cs_header(&h);
++		cs_header(&h, cs.md);
 +		lck_mtx_unlock(cs.mtx);
 +		return uiomove((caddr_t)&h, (int)sizeof(h), uio);
 +	}
@@ -2110,13 +2523,14 @@
 +	int b = cs.ready;
 +	cs.reading = b;
 +	cs.read_seq = cs.ready_seq;
-+	cs_header(&h);
++	cs_header(&h, cs.md);
++	user_ssize_t bytes = (user_ssize_t)cs.md->pitch * cs.md->height;
 +	lck_mtx_unlock(cs.mtx);
-+	flush_dcache64((addr64_t)ch.buf[b], FRAME_BYTES, FALSE);     /* the WM wrote it behind the cache */
++	flush_dcache64((addr64_t)ch.buf[b], (unsigned)bytes, FALSE);  /* the WM wrote it behind the cache */
 +	int e = uiomove((caddr_t)&h, (int)sizeof(h), uio);
 +	if (e == 0) {
 +		user_ssize_t n = uio_resid(uio);
-+		e = uiomove((caddr_t)ch.buf[b], (int)(n < (user_ssize_t)FRAME_BYTES ? n : (user_ssize_t)FRAME_BYTES), uio);
++		e = uiomove((caddr_t)ch.buf[b], (int)(n < bytes ? n : bytes), uio);
 +	}
 +	lck_mtx_lock(cs.mtx);
 +	cs.reading = -1;
@@ -2142,9 +2556,9 @@
 +		}
 +		lck_mtx_lock(ch.lock);
 +		e = uiomove((caddr_t)cl.fw, (int)n, uio);
-+		cl.fw_len = (unsigned)n;
-+		if (e == 0) {
-+			e = !cs.on ? EIO : cl.ok ? 0 : ch_lens_start();
++		cl.fw_len = e ? 0 : (unsigned)n;
++		if (e == 0 && cs.on && cs.md->sensor == 1 && !cl.ok) {
++			e = ch_lens_start();    /* (otherwise kept: the rear camera's start downloads it) */
 +		}
 +		lck_mtx_unlock(ch.lock);
 +		return e;
@@ -2156,11 +2570,20 @@
 +		e = cs.on ? cs_exposure(c.a, c.b, c.c) : EIO;
 +		lck_mtx_unlock(ch.lock);
 +		return e;
-+	case HAKIOS_CAMERA_SENSOR:
-+		return c.a == 1 ? 0 : ENODEV;
++	case HAKIOS_CAMERA_SENSOR:     /* the frames stop; the next read starts that one */
++		if (c.a != 1 && c.a != 2) {
++			return ENODEV;
++		}
++		lck_mtx_lock(ch.lock);
++		if (cs.on && cs.md->sensor != c.a) {
++			cs_stop();
++		}
++		cs.want = c.a;
++		lck_mtx_unlock(ch.lock);
++		return 0;
 +	case HAKIOS_CAMERA_FOCUS:
 +		lck_mtx_lock(ch.lock);
-+		e = cs.on ? ch_lens_focus(c.a) : EIO;
++		e = cs.on && cs.md->sensor == 1 ? ch_lens_focus(c.a) : ENODEV;
 +		lck_mtx_unlock(ch.lock);
 +		return e;
 +	default:
@@ -2172,12 +2595,11 @@
 +cs_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
 +{
 +	lck_mtx_lock(ch.lock);
-+	int e = cs.on ? 0 : cs_start();
-+	if (e == 0) {
-+		cs.opens++;
++	if (cs.opens++ == 0 && !cs.on) {
++		cs.want = 1;            /* the rear, unless HAKIOS_CAMERA_SENSOR says otherwise before the first read */
 +	}
 +	lck_mtx_unlock(ch.lock);
-+	return e;
++	return 0;
 +}
 +
 +/* the last close only (no D_TRACKCLOSE) */
@@ -2187,6 +2609,7 @@
 +	lck_mtx_lock(ch.lock);
 +	cs_stop();
 +	cs.opens = 0;
++	cs.want = 1;
 +	lck_mtx_unlock(ch.lock);
 +	return 0;
 +}
@@ -2230,7 +2653,7 @@
 +	if (err || !req->newptr) {
 +		return err;
 +	}
-+	if (value < 1 || value > 3 || !ch.lock) {
++	if (value < 1 || (value > 3 && value != 5) || !ch.lock) {
 +		return EINVAL;
 +	}
 +	lck_mtx_lock(ch.lock);
@@ -2268,6 +2691,28 @@
 +    "lens position for focus 0 (LC898124 CMD_AF_POSITION)");
 +SYSCTL_UINT(_kern, OID_AUTO, sweet_camhw_af_span, CTLFLAG_RW | CTLFLAG_LOCKED, &cl.span, 0,
 +    "lens positions over focus 0..1023 (1024: 0..0x3ff)");
++static int
++sysctl_sweet_popup SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = pop_pos;
++	int err = sysctl_handle_int(oidp, &value, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (!ch.lock) {
++		return ENODEV;
++	}
++	lck_mtx_lock(ch.lock);
++	err = pop_command(value);
++	lck_mtx_unlock(ch.lock);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_popup, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_popup, "I", "front camera pop-up: reads 0 down, 1 up, -1 unknown; 1 raise, 2 lower, 3 nudge, 4 lower anyway");
++
++SYSCTL_UINT(_kern, OID_AUTO, sweet_camhw_bayer_front, CTLFLAG_RW | CTLFLAG_LOCKED, &cs.bayer_front, 0,
++    "the Bayer order of the front camera's frames (0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR)");
 +SYSCTL_UINT(_kern, OID_AUTO, sweet_camhw_bayer, CTLFLAG_RW | CTLFLAG_LOCKED, &cs.bayer, 0,
 +    "the Bayer order /dev/hakios-camera reports: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR (boot-arg sweetcambayer; default 3)");
 +
@@ -2661,6 +3106,50 @@
 +	{0x8146,0x82}, {0x8147,0x37}, {0x8148,0x9f}, {0x8149,0x86}, {0x814a,0x18}, {0x814b,0x1f}, {0x814c,0x7e}, {0x814d,0x18},
 +	{0x814e,0x20}, {0x814f,0x82}, {0x8150,0x18}, {0x8151,0x1f}, {0x0104,0x01}, {0x3100,0x00}, {0x0340,0x1a}, {0x0341,0x40},
 +	{0x0202,0x1a}, {0x0203,0x10}, {0x0204,0x03}, {0x0205,0xc0}, {0x020e,0x01}, {0x020f,0x02}, {0x0104,0x00}, {0x0100,0x01},
++};
+--- /dev/null
++++ b/bsd/dev/sweet_camhw_imx471.h
+@@ -0,0 +1,41 @@
++/*
++ * The front camera's IMX471 start, as Android writes it (outputs/android-camera/trace-front.txt, decoded with
++ * tools/cci-trace-writes.py; 2328x1748 RAW10 over 4 D-PHY lanes): 233 writes, the last one stream on (0x0100 = 1).
++ */
++#define IMX471_MODE_START 232
++static const uint16_t imx471_start[][2] = {
++	{0x0136,0x13}, {0x0137,0x33}, {0x3c7e,0x04}, {0x3c7f,0x04}, {0x300a,0x02}, {0x3e35,0x00}, {0x3e36,0x00},
++	{0x3e37,0x00}, {0x3f7f,0x01}, {0x4431,0x04}, {0x531c,0x01}, {0x531d,0x02}, {0x531e,0x04}, {0x5928,0x00},
++	{0x5929,0x2f}, {0x592a,0x00}, {0x592b,0x85}, {0x592c,0x00}, {0x592d,0x32}, {0x592e,0x00}, {0x592f,0x88},
++	{0x5930,0x00}, {0x5931,0x3d}, {0x5932,0x00}, {0x5933,0x93}, {0x5938,0x00}, {0x5939,0x24}, {0x593a,0x00},
++	{0x593b,0x7a}, {0x593c,0x00}, {0x593d,0x24}, {0x593e,0x00}, {0x593f,0x7a}, {0x5940,0x00}, {0x5941,0x2f},
++	{0x5942,0x00}, {0x5943,0x85}, {0x5e12,0x00}, {0x5e13,0x23}, {0x5f06,0x08}, {0x5f07,0x81}, {0x5f0b,0xeb},
++	{0x5f0c,0xae}, {0x5f0d,0x15}, {0x5f0e,0x6e}, {0x5f0f,0x03}, {0x5f10,0xa5}, {0x5f11,0xc6}, {0x5f12,0x92},
++	{0x5f13,0xb9}, {0x5f14,0x5e}, {0x5f17,0x5e}, {0x5f18,0xdc}, {0x5f19,0x23}, {0x5f1a,0xdb}, {0x5f1b,0xc7},
++	{0x5f1c,0x5b}, {0x5f1d,0x7e}, {0x5f1e,0x20}, {0x5f1f,0x51}, {0x5f20,0xa2}, {0x5f21,0x46}, {0x5f22,0x87},
++	{0x5f23,0x2c}, {0x5f24,0x1d}, {0x5f25,0x10}, {0x5f26,0x76}, {0x5f27,0xa1}, {0x5f28,0xc6}, {0x5f29,0x07},
++	{0x5f2a,0x1a}, {0x5f2b,0x1c}, {0x5f2c,0xa8}, {0x5f2d,0x76}, {0x5f2e,0x61}, {0x5f2f,0xc6}, {0x5f30,0x87},
++	{0x5f31,0x2c}, {0x5f32,0x1d}, {0x5f33,0x10}, {0x5f34,0x76}, {0x5f35,0xa1}, {0x5f36,0xc6}, {0x5f37,0x07},
++	{0x5f38,0x1a}, {0x5f39,0x1c}, {0x5f3a,0xa8}, {0x5f3b,0x76}, {0x5f3c,0xa1}, {0x5f3d,0xc6}, {0x5f3e,0x87},
++	{0x5f3f,0x2c}, {0x5f40,0x1d}, {0x5f41,0x10}, {0x5f42,0x76}, {0x5f43,0xa1}, {0x5f44,0xc6}, {0x5f45,0x07},
++	{0x5f46,0x2a}, {0x5f47,0x1d}, {0x5f48,0x08}, {0x5f49,0x76}, {0x5f4a,0x81}, {0x5f4b,0xc0}, {0x5f75,0x27},
++	{0x5f76,0xee}, {0x5f77,0xee}, {0x5f78,0xee}, {0x5f79,0xe5}, {0x7990,0x01}, {0x7993,0x5d}, {0x7994,0x5d},
++	{0x7995,0xa1}, {0x799a,0x01}, {0x799d,0x00}, {0x8169,0x01}, {0x8359,0x01}, {0x9300,0x2a}, {0x9301,0x24},
++	{0x9302,0x1e}, {0x9304,0x2c}, {0x9305,0x23}, {0x9306,0x1f}, {0x9308,0x2d}, {0x9309,0x28}, {0x930a,0x26},
++	{0x930c,0x2e}, {0x930d,0x2c}, {0x930e,0x23}, {0x9310,0x2e}, {0x9311,0x28}, {0x9312,0x23}, {0x9314,0x31},
++	{0x9315,0x31}, {0x9316,0x2c}, {0x9317,0x19}, {0xb046,0x01}, {0xb048,0x01}, {0xaa06,0x3f}, {0xaa07,0x05},
++	{0xaa08,0x04}, {0xaa12,0x3f}, {0xaa13,0x04}, {0xaa14,0x03}, {0xab55,0x02}, {0xab57,0x01}, {0xab59,0x01},
++	{0xabb4,0x00}, {0xabb5,0x01}, {0xabb6,0x00}, {0xabb7,0x01}, {0xabb8,0x00}, {0xabb9,0x01}, {0x0112,0x0a},
++	{0x0113,0x0a}, {0x0114,0x03}, {0x0342,0x0a}, {0x0343,0x00}, {0x0340,0x0a}, {0x0341,0x7d}, {0x0344,0x00},
++	{0x0345,0x00}, {0x0346,0x00}, {0x0347,0x00}, {0x0348,0x12}, {0x0349,0x2f}, {0x034a,0x0d}, {0x034b,0xa7},
++	{0x0381,0x01}, {0x0383,0x01}, {0x0385,0x01}, {0x0387,0x01}, {0x0900,0x01}, {0x0901,0x22}, {0x0902,0x08},
++	{0x3f4c,0x81}, {0x3f4d,0x81}, {0x0408,0x00}, {0x0409,0x00}, {0x040a,0x00}, {0x040b,0x00}, {0x040c,0x09},
++	{0x040d,0x18}, {0x040e,0x06}, {0x040f,0xd4}, {0x034c,0x09}, {0x034d,0x18}, {0x034e,0x06}, {0x034f,0xd4},
++	{0x0301,0x06}, {0x0303,0x02}, {0x0305,0x03}, {0x0306,0x00}, {0x0307,0x61}, {0x030b,0x02}, {0x030d,0x0c},
++	{0x030e,0x02}, {0x030f,0x71}, {0x0310,0x01}, {0x3f78,0x01}, {0x3f79,0x31}, {0x3ffe,0x00}, {0x3fff,0x8a},
++	{0x5f0a,0xb6}, {0x0202,0x0a}, {0x0203,0x74}, {0x0204,0x00}, {0x0205,0x00}, {0x020e,0x01}, {0x020f,0x00},
++	{0x0104,0x01}, {0x3100,0x00}, {0x0340,0x0f}, {0x0341,0xda}, {0x0202,0x0f}, {0x0203,0xc8}, {0x0204,0x03},
++	{0x0205,0x91}, {0x020e,0x01}, {0x020f,0x00}, {0x0104,0x00}, {0x0104,0x01}, {0x3100,0x00}, {0x0340,0x0f},
++	{0x0341,0xda}, {0x0202,0x0f}, {0x0203,0xc8}, {0x0204,0x03}, {0x0205,0x91}, {0x020e,0x01}, {0x020f,0x00},
++	{0x0104,0x00}, {0x0100,0x01},
 +};
 --- /dev/null
 +++ b/bsd/dev/sweet_hakios_camera.h

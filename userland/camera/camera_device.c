@@ -578,7 +578,7 @@ static const struct camera {
 	/* Note SWEET: the sizes and rates of D73/AVCaptureSession.plist's FigCaptureStreamFormats (iPhone 14 Pro) */
 	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 6.86, 1.78, 1.22, 69.0,
 	  { { 4224, 3024, 60 }, { 4224, 2640, 30 } } },        /* "Photo", "Video-30" */
-	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", false,   /* Note FE: the 4E6 reads out turned already (0x0101 = 3) */ 2.87, 2.2, 1.0, 70.0,
+	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true,    /* Note SWEET: the IMX471 is mounted the other way up from the IMX586 (DT roll 270 against 90) and the kernel does not flip it (no 0x0101) */ 2.87, 2.2, 1.0, 70.0,
 	  { { 4032, 3024, 30 }, { 4032, 2528, 30 } } },        /* "Photo", "Video-30" */
 };
 

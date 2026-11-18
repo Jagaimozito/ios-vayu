@@ -6579,3 +6579,75 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   sums PM 0xbbafb DMA 0x800650d DMB 0x2bca3b6b = parity 0x33d65b73 (as Android's); servo + OIS on; ISP.mediacapture's
   contrast AF settles (lens at 372 / 396 / 228 for different scenes, sharpness 0.5-1.0) and photos are taken after it.
   Each camera open re-downloads (~1.2 s on the 100 kHz CCI). 0xf01a reads back 0x8 (not the position: a status).
+
+# Front camera (pop-up) bring-up (Claude, 2026-11-18)
+- From Android's DT (outputs/android-camera/fdt.dts) and dmesg: the pop-up is a stepper motor behind a TI DRV8834
+  ("[oneplus_motor] drv8834_platform_probe"), DT step_motor (compatible oneplus,step-motor): step = PM8150L GPIO 10
+  in func1 from the LPG PWM (pwm-lpg @0xbc00, channel 1, default period 20,000,000 ns), dir = PM8150L GPIO 11,
+  mode1 = PM8150L GPIO 8, mode0 = PM8150B GPIO 5 (high or high-impedance), boost-en = PM8150B GPIO 12, nsleep =
+  PM8150 GPIO 10. Position: two MagnaChip MXM1120 hall sensors (up 0x0c, down 0x0d) on QUP SE1 I2C (i2c@884000,
+  GENI), irqs TLMM 120/121; free-fall irq TLMM 163 (motor_pl, oneplus-motor). Thermal zone pop-mem-step.
+- Front sensor: Sony IMX471 (sunny_imx471 module file). The driver source (OnePlus drivers/step_motor) is not in
+  the clones here; the container and the Mac's sandbox cannot reach github (403), the user clones it.
+- tools/android-frontcam-recon.sh: samples motor/hall sysfs, PMIC GPIOs and PWM 10x/s while the front camera rises
+  and falls -> outputs/android-frontcam/.
+- 2026-11-18 RESULT android-frontcam-recon (outputs/android-frontcam/): Android's motor driver (oneplus_motor +
+  drv8834) moves the camera BY TIME, not by the hall sensors: direction 1 = up, 0 = down; PWM from PM8150L (SID 5)
+  LPG @0xbc00 channel 2 ("LPG 2 is requested by step_motor"). Each move: drv8834_set_power(mode 1, on); speed 10 =
+  PWM period 104166 ns (9.6 kHz, duty 50 %) for 100 ms (960 pulses, "speed_up"), then speed 0 = period 12000 ns
+  (83.3 kHz) until a stop timer at 618 ms (up) / 626 ms (down) = step_count 1380 full steps x 32 microsteps (1/32
+  stepping: m0 high-impedance (-22), m1 = 1) = 44160 pulses; then drv8834_set_power(mode 0). Config while moving:
+  sleep 1, step 1, vref 1. The hall sensors (MXM1120 up/down, values 0..~270) are read every ~16 ms only to watch
+  (stall/abnormal detection) and to confirm at the end: down = hall_down ~265 / up ~5, up = down ~8 / up ~218;
+  thresholds 150 (hall_up_irq_position / hall_down_irq_position). sysfs motor_pl: position 1 down / 0 up,
+  move_state 1 rising, 3 up, 2 falling, 4 down. Pin order within set_power not seen (sampling too slow): needs the
+  OnePlus drivers/step_motor source.
+- 2026-11-18 RESULT front traces (outputs/android-camera/trace-front.txt, trace-front-isp.txt): the front camera is
+  DT qcom,cam-sensor@2 = Sony IMX471 (chip ID 0x471), slave 0x20 (7-bit 0x10) on CCI 1 (0xac4b000), master 0.
+  Power (Android's order, 5 steps): VANA = pm8150l_bob 3.3 V + PM8150L GPIO 12 (CAM_VANA_2), VDIG = pm8009_l3
+  (ldof3) 1.056 V, VIO = pm8150l_l1, MCLK2 (TLMM 15, 19.2 MHz), RESET = TLMM 12. D-PHY, 4 lanes, on CSIPHY 2
+  (res_sel 0x4003 = PHY_2), DT 0x2b RAW10, VC 0, into CSID 1 / IFE 1 (the same as the rear). Mode (Android's): RAW10
+  (0x0112 0x0a0a), 4 lanes (0x0114 3), line length 0x0a00, 2328x1748 output (0x034c 0x0918, 0x034e 0x06d4), VT/OP
+  PLL 0x0301 6, 0x0303 2, 0x0305 3, 0x0307 0x61, 0x030b 2, 0x030d 0x0c, 0x030f 0x0271, 0x0310 1; stream on after
+  232 writes (outputs/android-camera/imx471-start-writes.txt, from tools/cci-trace-writes.py), then group-hold AE
+  updates (frame length 0x0fda, exposure 0x0fc8, gain 0x0391). Still to get: the CSIPHY 2 D-PHY register writes and
+  settle count (a MASK=163840 trace with the front camera) and the motor driver's pin order (OnePlus source: not
+  in drivers/step_motor at OnePlusOSS 1dd473a).
+- 2026-11-18 RESULT trace-front-phy.txt (MASK 163840, front camera): CSIPHY 2 is set as D-PHY with PixelExperience
+  cam_csiphy_1_1_hwreg.h csiphy_2ph_v1_1_reg exactly (4 data lanes + clock lane, settle 0x0e as the rear's C-PHY):
+  common 0x814 = 0xd5 (lanes 0,2,4,6 + clock 7), 0x818 = 1, 0x81c = 2, reset 0x800 = 1/0, the lane tables, then the
+  same irq masks as the rear. CSID 1 rx cfg0 = 0x00232103 (4 lanes, lane cfg 0x3210, PHY 2, D-PHY) (rear:
+  0x01102102). The OnePlus GPL release here (OnePlusOSS 1dd473a, OOS 9.5.11) has no motor driver source at all
+  (no drivers/step_motor, nothing in drivers/oneplus or drivers/misc): the pin order will follow the DRV8834
+  datasheet (VM boost on, mode/dir pins set, nSLEEP high, >= 1 ms wake, then STEP pulses; off in reverse). LPG period
+  arithmetic from drivers/pwm/pwm-qti-lpg.c (clock 1024 / 32768 / 19.2 MHz, prediv 1/3/5/6, exponent 0-7, size 6/9
+  bits; period = 2^size * 2^exp * prediv / clock).
+- 2026-11-18 camhw10 SOURCE (Claude, NOT BUILT): the pop-up motor, sysctl kern.sweet_popup (sweet_camhw.c pop_*):
+  reads 0 down / 1 up / -1 unknown (kernel-tracked; down assumed at boot; hall sensors not read yet); writes 1 raise
+  (from down, 618 ms), 2 lower (from up, 626 ms), 3 nudge (from down: 100 ms up at the slow rate, ~2 % of travel,
+  then the same down), 4 lower whatever (recovery). Move: idle pins as Android's (nSLEEP low, boost off, M1 high, M0
+  hi-Z, DIR low, STEP func1), boost on, 5 ms, DIR, nSLEEP high, 2 ms, LPG2 (SID 5 0xbd00: 0x41 0x03, 0x42 exponent,
+  0x43 0x20, 0x44 32, 0x47 1, 0x46 0x84) at exponent 5 (106496 ns) for 100 ms, then exponent 2 (13312 ns) until the
+  total, then LPG out off (0x46 0x04), nSLEEP low, boost off. Periods are what pwm-qti-lpg.c makes of Android's
+  104166 / 12000 ns. sweet_spmi.c: writes allowed to those GPIOs' 0x40-0x46 and LPG2 0x41-0x47.
+- 2026-11-18 RESULT camhw10: THE POP-UP MOVES under iOS -- but reversed: sweet_popup=2 raised it, =1 lowered it
+  (DIR high = down on this hardware; Android's "direction 1 = up" is its own convention). Fix (camhw11): DIR = !up.
+- 2026-11-18 RESULT camhw11: POP-UP WORKS both ways under iOS: sweet_popup=1 raises (slow 105 ms, all 619 ms),
+  =2 lowers (627 ms), SPMI writes all ok (-> 0/0).
+- 2026-11-18 camhw12 SOURCE (Claude, NOT BUILT): THE FRONT CAMERA through /dev/hakios-camera. CCI code generalised
+  (cc = controller + master: CCI 0 master 1 rear/lens, CCI 1 0xac4b000 master 0 front; per-master SCL/SDA/MISC/READ
+  regs at 0x100 + m*0x100, RD_DONE 0x1/0x1000, Q0 REPORT 0x10/0x10000, errors 0x18000ee6/0x60ee6000, reset
+  0x3f1/0x3f001). Front power (ch_front_power_up): CCI 1 pins TLMM 31/32 func 1 pull-up, cci_1 clocks (0xc124/0xc13c),
+  bob 3.3 V + PM8150L GPIO 12, ldof3 1056 mV, ldoc1, MCLK2 (0x5044/0x505c, TLMM 15 func 1), reset TLMM 12, ID at
+  0x0016 = 0x0471. CSIPHY 2 (0xac67000) D-PHY x4 (ch_csiphy_dphy_on, the 2ph v1.1 table), csiphy2/csi2phytimer clocks
+  (0x6068/0x604c/0x6064), CSID rx cfg0 0x00232103. IMX471 start = bsd/dev/sweet_camhw_imx471.h (233 writes, last stream
+  on). Frames 2328x1748, pitch 2912, frame length min 2685, Android's AE start (0x0fc8 lines, gain 0x391, 0x0fda).
+  /dev/hakios-camera now starts on the first full read (a header-size read before that tells the size without
+  starting), for the camera HAKIOS_CAMERA_SENSOR last asked for (1 rear default, 2 front); SENSOR to the other one
+  stops the frames. Front start: pop-up raised first (if down), lowered at stop. Lens program kept and downloaded at
+  the rear's start. sysctl kern.sweet_camhw=5: front chip ID only; kern.sweet_camhw_bayer_front (default 0 RGGB).
+  sweet_spmi.c: + PM8150L GPIO 12.
+- 2026-11-18 RESULT camhw12: THE FRONT CAMERA WORKS in the Camera app (pop-up rises, IMX471 frames, colours right
+  with RGGB = bayer_front 0) but upside down. Fix in ISP.mediacapture: the Front Camera's `turned` = true
+  (the picture turned half round in preview and photos), no kernel change.
+- 2026-11-18 RESULT: front camera upright in preview and photos with turned = true; rear still works after.
