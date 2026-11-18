@@ -6553,3 +6553,29 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   (else synth; /var/tmp/sweetcam.synth forces synth; ENODEV on SENSOR -> that handle goes to synth, so the front
   camera stays the test pattern); camera_device.c logs which ("frames from the kernel's /dev/hakios-camera" or
   "made-up frames ...").
+- 2026-11-18 RESULT camhw8: the Camera app takes photos from the real IMX586 (committed 664bb5c). Blurry (no AF);
+  red and blue swapped (blue Gatorade orange) -> the Bayer order is BGGR: kern.sweet_camhw_bayer default now 3.
+- AUTOFOCUS facts (Android dmesg + trace.txt + OnePlus GPL cam_ois): the main camera's lens is moved by the OIS
+  controller, an ON Semi LC898124EP3 at CCI 0 master 1, 7-bit address 0x3e (same bus as the IMX586), DT
+  qcom,actuator@7 (VAF = pm8150l_bob 3.3 V, TLMM 25 CAM_VAF_0) and qcom,ois@02. Its program is RAM: Android downloads
+  it on every power-up (166 ms): ois_name imx586_lc898124ep3_ois, GyroSelect 2, ActSelect 2 (SO2820), MasterSlave 0
+  -> LC898124EP3_Code_0_1_2_2_0_0.h (Vendor 01, User 1b, Version 1c, SPI master, ST LSM6DSM gyro); verify sums
+  PM 0xbbafb DMA 0x800650d DMB 0x2bca3b6b. Then (trace) 0x8970=1, 0xf111=1, 0xf000=0, poll 0x00f1, 0xf010=3 (servo
+  on), 0xf012=1 (OIS on), 0xf013=1 (still mode). Focus: RamWrite32A(CMD_AF_POSITION 0xF01A, pos | 0x10000), pos
+  0..0x3ff (uni-directional), then poll status (HighLevelCmd.c SetTregAf).
+- 2026-11-18 camhw9 SOURCE (Claude, NOT BUILT): AUTOFOCUS. sweet_camhw.c: ch_cci_write split into ch_cci_run (one
+  batch) + ch_cci_burst (one I2C transaction of up to 330 bytes as 11-byte WRITE commands with length 0xf = bus
+  held, the last with the stop: Android's sequential write, LOAD_DATA 0x...f9 in trace.txt). Lens: at open TLMM 25
+  high, RPMh ldof6 2856 / ldof5 2800, ROM version read at 0x3e (logged "lens controller ... ROM version"). New
+  HAKIOS_CAMERA_LENS_FIRMWARE (5): ISP.mediacapture sends /var/local/fw/lc898124-so2820.fw after opening; the kernel
+  runs DownloadToEP3 (ROMINFO, PM at 0x00100000 in 0x40+60-byte writes, checksum cmd f0 0a, DMA/DMB 60-byte writes,
+  verify PM+DMA+DMB == parity), then the trace's coefficients, 0xf000/0x8970/0xf111, servo on 0xf010=3, OIS on
+  0xf012=1, still 0xf013=1, focus 300. HAKIOS_CAMERA_FOCUS -> 0xf01a = (af_offset + focus * af_span / 1024) |
+  0x10000; frames' focus = position once started. sysctls kern.sweet_camhw_focus (manual, while streaming),
+  kern.sweet_camhw_af_offset / _af_span. Close: OIS/servo off, TLMM 25 low, ldof5/6 off. Bayer default 3.
+  tools/lc898124-fw.py -> outputs/camhw/lc898124-so2820.fw (11940 bytes; first PM bytes 64 00 00 02 07 64 00 00 c1 c7
+  = the trace's first burst; info 01 1b 00 1c as Android's MonitorInfo).
+- 2026-11-18 RESULT camhw9: AUTOFOCUS WORKS. Lens controller answers (ROM 0x20170410); program download 1131 ms,
+  sums PM 0xbbafb DMA 0x800650d DMB 0x2bca3b6b = parity 0x33d65b73 (as Android's); servo + OIS on; ISP.mediacapture's
+  contrast AF settles (lens at 372 / 396 / 228 for different scenes, sharpness 0.5-1.0) and photos are taken after it.
+  Each camera open re-downloads (~1.2 s on the 100 kHz CCI). 0xf01a reads back 0x8 (not the position: a status).

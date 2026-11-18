@@ -1996,6 +1996,40 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	}
 }
 
+/*
+ * Note SWEET: the rear main camera's lens is moved by its OIS controller, whose program is downloaded at every
+ * power-up: the file tools/lc898124-fw.py makes (from OnePlus's GPL driver), handed to the kernel after the open.
+ */
+#define LENS_FIRMWARE "/var/local/fw/lc898124-so2820.fw"
+
+static void
+send_lens_firmware(int device)
+{
+	FILE *fp = fopen(LENS_FIRMWARE, "rb");
+	if (fp == NULL) {
+		say("no %s (%s): the lens stays where it is (no focus)", LENS_FIRMWARE, strerror(errno));
+		return;
+	}
+	uint8_t *buf = malloc(sizeof(struct hakios_camera_command) + 16384);
+	size_t n = buf ? fread(buf + sizeof(struct hakios_camera_command), 1, 16384, fp) : 0;
+	fclose(fp);
+	if (n == 0) {
+		say("%s: nothing read", LENS_FIRMWARE);
+		free(buf);
+		return;
+	}
+	struct hakios_camera_command c = { .command = HAKIOS_CAMERA_LENS_FIRMWARE, .bytes = (uint32_t)n };
+	memcpy(buf, &c, sizeof(c));
+	uint64_t t0 = mach_absolute_time();
+	ssize_t w = cam_write(device, buf, sizeof(c) + n);
+	int err = w < 0 ? errno : 0;
+	mach_timebase_info_data_t tb;
+	mach_timebase_info(&tb);
+	say("the lens's program (%zu bytes) to the kernel: %s (%llu ms)", n, w < 0 ? strerror(err) : "started",
+	    (unsigned long long)((mach_absolute_time() - t0) * tb.numer / tb.denom / 1000000u));
+	free(buf);
+}
+
 static void *
 worker(void *context)
 {
@@ -2019,6 +2053,7 @@ worker(void *context)
 	}
 	if (cam_open_errno == 0) {
 		say("frames from the kernel's %s", HAKIOS_CAMERA_DEVICE);
+		send_lens_firmware(device);
 	} else {
 		say("made-up frames (synth_camera.c): %s %s", HAKIOS_CAMERA_DEVICE,
 		    cam_open_errno == EEXIST ? "not wanted (/var/tmp/sweetcam.synth)" : strerror(cam_open_errno));

@@ -53,6 +53,9 @@ enum {
 	HAKIOS_CAMERA_SENSOR = 3,      /* another sensor: a which (as in the frames' header), b its mode (~0: the usual one);
 	                                 * the frames stop, everything goes down, and the next read starts the other one */
 	HAKIOS_CAMERA_FOCUS = 4,       /* the lens to a: 0 (the furthest) to 1023, from the next frame or so */
+	HAKIOS_CAMERA_LENS_FIRMWARE = 5, /* Note SWEET: the lens controller's program follows (bytes of it: the file
+	                                 * tools/lc898124-fw.py makes); the kernel downloads it and starts the lens, and
+	                                 * from then on the frames' focus is a position */
 };
 
 struct hakios_camera_command {

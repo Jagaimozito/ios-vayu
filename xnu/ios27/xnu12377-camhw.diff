@@ -75,7 +75,7 @@
  	}
 --- /dev/null
 +++ b/bsd/dev/sweet_camhw.c
-@@ -0,0 +1,1922 @@
+@@ -0,0 +1,2224 @@
 +/*
 + * GUACAMOLE (OnePlus 7 Pro, SM8150) rear main camera, step 1: power the Sony IMX586 the way Android does and read
 + * its chip ID over the camera I2C controller (CCI). Nothing is streamed yet.
@@ -710,6 +710,8 @@
 +}
 +
 +/* read n (<= 3) bytes from a 16-bit register address: cam_cci_read()'s queue sequence */
++static bool ch_cci_quiet;              /* reads not logged (the lens controller's status polls) */
++
 +static int
 +ch_cci_read(unsigned sid, unsigned reg, unsigned n, uint8_t *out)
 +{
@@ -738,9 +740,12 @@
 +		delay(1);
 +	}
 +	uint32_t level = ch_rd(ch.cci, CCI_M1_READ_LEVEL);
-+	printf("SWEET CAMHW: CCI read sid %#x reg %#x: queue words %u, status0 %#x status1 %#x, fifo %u\n",
-+	    sid, reg, cnt, st, ch_rd(ch.cci, CCI_IRQ_STATUS_1), level);
-+	if (!(st & CCI_ST0_M1_RD_DONE) || (st & CCI_ST0_M1_ERROR)) {
++	bool bad = !(st & CCI_ST0_M1_RD_DONE) || (st & CCI_ST0_M1_ERROR);
++	if (!ch_cci_quiet || bad) {
++		printf("SWEET CAMHW: CCI read sid %#x reg %#x: queue words %u, status0 %#x status1 %#x, fifo %u\n",
++		    sid, reg, cnt, st, ch_rd(ch.cci, CCI_IRQ_STATUS_1), level);
++	}
++	if (bad) {
 +		for (unsigned i = 0; i < level && i < 8; ++i) {
 +			(void)ch_rd(ch.cci, CCI_M1_READ_DATA);
 +		}
@@ -898,48 +903,91 @@
 +	return true;
 +}
 +
-+/* sensor writes over the CCI, master 1 queue 0, 16 at a time, each batch ended by a REPORT and waited for */
++/* one batch on master 1 queue 0: SET_PARAM, LOCK, the words, UNLOCK, REPORT; waits for the REPORT */
 +static int
-+ch_cci_write(unsigned sid, const uint16_t (*regs)[2], unsigned n)
++ch_cci_run(unsigned sid, const uint32_t *words, unsigned n)
 +{
 +	const uint32_t qoff = CCI_MASTER * 0x200u;       /* queue 0 */
-+	unsigned done = 0;
-+	while (done < n) {
-+		unsigned k = n - done < 16 ? n - done : 16;
-+		ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
-+		ch_wr(ch.cci, CCI_IRQ_CLEAR_1, 0xffffffffu);
-+		ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
-+		ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_SET_PARAM | (sid << 4) | (3u << 16));
-+		ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_LOCK);
-+		for (unsigned i = 0; i < k; ++i) {
-+			uint32_t reg = regs[done + i][0], val = regs[done + i][1];
-+			ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff,
-+			    9u | (3u << 4) | (((reg >> 8) & 0xffu) << 8) | ((reg & 0xffu) << 16) | ((val & 0xffu) << 24));
++	ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
++	ch_wr(ch.cci, CCI_IRQ_CLEAR_1, 0xffffffffu);
++	ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
++	ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_SET_PARAM | (sid << 4) | (3u << 16));
++	ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_LOCK);
++	for (unsigned i = 0; i < n; ++i) {
++		ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, words[i]);
++	}
++	ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_UNLOCK);
++	ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, 8u | (1u << 8));     /* REPORT */
++	ch_wr(ch.cci, CCI_Q_EXEC_WORDS + qoff, ch_rd(ch.cci, CCI_Q_CUR_WORDS + qoff));
++	ch_wr(ch.cci, CCI_QUEUE_START, 1u << (CCI_MASTER * 2u));
++	uint32_t st = 0;
++	unsigned t;
++	for (t = 0; t < 200000; ++t) {
++		st = ch_rd(ch.cci, CCI_IRQ_STATUS_0);
++		if (st & (0x10000u | CCI_ST0_M1_ERROR)) {       /* M1 Q0 REPORT, or an error */
++			break;
 +		}
-+		ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, CMD_UNLOCK);
-+		ch_wr(ch.cci, CCI_Q_LOAD_DATA + qoff, 8u | (1u << 8));     /* REPORT */
-+		ch_wr(ch.cci, CCI_Q_EXEC_WORDS + qoff, ch_rd(ch.cci, CCI_Q_CUR_WORDS + qoff));
-+		ch_wr(ch.cci, CCI_QUEUE_START, 1u << (CCI_MASTER * 2u));
-+		uint32_t st = 0;
-+		unsigned t;
-+		for (t = 0; t < 200000; ++t) {
-+			st = ch_rd(ch.cci, CCI_IRQ_STATUS_0);
-+			if (st & (0x10000u | CCI_ST0_M1_ERROR)) {       /* M1 Q0 REPORT, or an error */
-+				break;
-+			}
-+			delay(1);
-+		}
-+		if (!(st & 0x10000u) || (st & CCI_ST0_M1_ERROR)) {
-+			printf("SWEET CAMHW: CCI write batch at %u (reg %#x) failed: status0 %#x after %u us\n",
-+			    done, regs[done][0], st, t);
-+			ch_wr(ch.cci, CCI_RESET_CMD, 0x3f001u);
-+			return EIO;
-+		}
-+		done += k;
++		delay(1);
++	}
++	if (!(st & 0x10000u) || (st & CCI_ST0_M1_ERROR)) {
++		printf("SWEET CAMHW: CCI batch to sid %#x (%u words, first %#x) failed: status0 %#x after %u us\n",
++		    sid, n, n ? words[0] : 0, st, t);
++		ch_wr(ch.cci, CCI_RESET_CMD, 0x3f001u);
++		return EIO;
 +	}
 +	ch_wr(ch.cci, CCI_IRQ_CLEAR_0, 0xffffffffu);
 +	ch_wr(ch.cci, CCI_IRQ_GLOBAL_CLR, 1u);
 +	return 0;
++}
++
++/* sensor writes (16-bit address, 8-bit data), 16 to a batch */
++static int
++ch_cci_write(unsigned sid, const uint16_t (*regs)[2], unsigned n)
++{
++	uint32_t w[16];
++	unsigned done = 0;
++	while (done < n) {
++		unsigned k = n - done < 16 ? n - done : 16;
++		for (unsigned i = 0; i < k; ++i) {
++			uint32_t reg = regs[done + i][0], val = regs[done + i][1];
++			w[i] = 9u | (3u << 4) | (((reg >> 8) & 0xffu) << 8) | ((reg & 0xffu) << 16) | ((val & 0xffu) << 24);
++		}
++		int e = ch_cci_run(sid, w, k);
++		if (e) {
++			printf("SWEET CAMHW: CCI write batch at %u (reg %#x) failed\n", done, regs[done][0]);
++			return e;
++		}
++		done += k;
++	}
++	return 0;
++}
++
++/* one I2C write of n bytes (the device's address bytes first) as one transaction: WRITE commands of 11 bytes that
++ * leave the bus held (length 0xf, Android's sequential write: cam_cci_data_queue), the last one with the stop */
++static int
++ch_cci_burst(unsigned sid, const uint8_t *b, unsigned n)
++{
++	uint32_t w[100];
++	unsigned nw = 0;
++	if (n == 0 || n > 11u * 30u) {
++		return EINVAL;
++	}
++	while (n > 0) {
++		unsigned k = n > 11u ? 11u : n;
++		uint8_t c[12];
++		c[0] = (uint8_t)(9u | ((n > 11u ? 0xfu : k) << 4));
++		memcpy(c + 1, b, k);
++		for (unsigned i = 0; i < k + 1u; i += 4) {
++			uint32_t v = 0;
++			for (unsigned j = 0; j < 4 && i + j < k + 1u; ++j) {
++				v |= (uint32_t)c[i + j] << (8 * j);
++			}
++			w[nw++] = v;
++		}
++		b += k;
++		n -= k;
++	}
++	return ch_cci_run(sid, w, nw);
 +}
 +
 +static void
@@ -1514,6 +1562,215 @@
 +	return v;
 +}
 +
++/* ---------------------------------------------------------------- the lens: LC898124EP3 (OIS + AF), step 4
++ *
++ * The main camera's lens is moved by its OIS controller, an ON Semi LC898124EP3 on the same CCI master as the
++ * IMX586 (7-bit 0x3e; DT qcom,ois@02: vio pm8150l_l1, vdig pm8009_l6 2.856 V, vaf pm8009_l5 2.8 V; qcom,actuator@7:
++ * VAF bob + TLMM 25 CAM_VAF_0). Its program is RAM, downloaded at every power-up as OnePlus's GPL cam_ois_core.c
++ * does (DownloadToEP3; the program from tools/lc898124-fw.py, handed in by ISP.mediacapture as
++ * HAKIOS_CAMERA_LENS_FIRMWARE); then the writes Android's trace shows (gyro/accel coefficients, 0x8970, 0xf111,
++ * 0xf000, servo on 0xf010 = 3, OIS on 0xf012 = 1, still mode 0xf013 = 1). Focus: CMD_AF_POSITION 0xf01a = position
++ * | 0x10000 (HighLevelCmd.c SetTregAf), position = af_offset + focus * af_span / 1024 (sysctls, default 0 and 1024:
++ * the 10-bit uni-directional range).
++ */
++#define LENS_SID        0x3eu
++#define PIN_VAF         25u             /* east tile */
++#define LENS_FW_MAX     16384u
++
++static struct {
++	bool powered, ok;
++	uint32_t focus;                 /* 0..1023 as last set */
++	uint32_t offset, span;
++	unsigned fw_len;
++	uint8_t fw[LENS_FW_MAX];
++} cl = { .span = 1024 };
++
++static int
++ch_lens_rd(uint32_t addr, uint32_t *v)
++{
++	uint8_t b[4] = { 0, 0, 0, 0 };
++	ch_cci_quiet = true;
++	int e = ch_cci_read(LENS_SID, addr, 4, b);
++	ch_cci_quiet = false;
++	*v = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
++	return e;
++}
++
++static int
++ch_lens_wr(uint32_t addr, uint32_t v)
++{
++	uint8_t b[6] = { (uint8_t)(addr >> 8), (uint8_t)addr, (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8),
++		         (uint8_t)v };
++	return ch_cci_burst(LENS_SID, b, 6);
++}
++
++/* CMD_READ_STATUS 0xf100: busy while READ_STATUS_INI (bit 24) */
++static bool
++ch_lens_idle(unsigned ms)
++{
++	uint32_t v = 0;
++	for (unsigned i = 0; i <= ms; ++i) {
++		if (ch_lens_rd(0xf100, &v) == 0 && !(v & 0x01000000u)) {
++			return true;
++		}
++		ch_wait(1);
++	}
++	printf("SWEET CAMHW: lens: still busy after %u ms (status %#x)\n", ms, v);
++	return false;
++}
++
++/* ch.lock held: power and check it answers (ROM code version, CMD_ROMVER 0xf00f) */
++static void
++ch_lens_power(bool on)
++{
++	if (on) {
++		(void)ch_ldo("ldof6", 2856);    /* vdig */
++		(void)ch_ldo("ldof5", 2800);    /* vaf */
++		ch_gpio(ch.east, PIN_VAF, 0, 0, true, true);
++		ch_wait(20);
++		uint32_t rom = 0;
++		int e = ch_lens_rd(0xf00f, &rom);
++		cl.powered = e == 0;
++		printf("SWEET CAMHW: lens controller (LC898124EP3, 0x3e): ROM version %#x -> %d%s\n", rom, e,
++		    e ? " (NOT answering)" : "");
++	} else {
++		if (cl.ok) {
++			(void)ch_lens_wr(0xf012, 0);    /* OIS off */
++			(void)ch_lens_wr(0xf010, 0);    /* servo off */
++			ch_wait(5);
++		}
++		ch_gpio(ch.east, PIN_VAF, 0, 0, true, false);
++		const uint32_t off[1] = { 4 }, zero[1] = { 0 };
++		(void)sweet_rpmh_write("ldof5", 1, off, zero);
++		(void)sweet_rpmh_write("ldof6", 1, off, zero);
++		cl.powered = cl.ok = false;
++	}
++}
++
++/* ch.lock held: the position, 0..1023 */
++static int
++ch_lens_focus(uint32_t focus)
++{
++	if (!cl.ok) {
++		return ENODEV;
++	}
++	focus = focus > 1023u ? 1023u : focus;
++	uint32_t pos = cl.offset + focus * cl.span / 1024u;
++	pos = pos > 0x7ffu ? 0x7ffu : pos;
++	int e = ch_lens_wr(0xf01a, pos | 0x10000u);       /* bit 16: FST mode */
++	if (e == 0) {
++		cl.focus = focus;
++	}
++	return e;
++}
++
++/* ch.lock held: DownloadToEP3 + Android's start (cam_ois_fw_download and the trace) from cl.fw */
++static int
++ch_lens_start(void)
++{
++	const uint8_t *f = cl.fw;
++	uint32_t hdr[4], v = 0;
++	if (!cl.powered) {
++		return ENODEV;
++	}
++	if (cl.fw_len < 24 || memcmp(f, "LC124FW1", 8) != 0) {
++		printf("SWEET CAMHW: lens: not a program (tools/lc898124-fw.py makes it)\n");
++		return EINVAL;
++	}
++	memcpy(hdr, f + 8, sizeof(hdr));
++	uint32_t pm_words = hdr[0], dma = hdr[1], dmb = hdr[2], parity = hdr[3];
++	uint32_t pm_bytes = pm_words * 5u, dma_bytes = dma * 6u / 4u, dmb_bytes = dmb * 6u / 4u;
++	if (24u + pm_bytes + dma_bytes + dmb_bytes > cl.fw_len) {
++		printf("SWEET CAMHW: lens: program short (%u bytes)\n", cl.fw_len);
++		return EINVAL;
++	}
++	const uint8_t *pm = f + 24, *dm = pm + pm_bytes;
++	uint64_t t0 = mach_absolute_time(), ns;
++
++	/* 0. the boot program: ROM (0x0a) runs as it is, RAM (0x01) is reset first */
++	int e = ch_lens_rd(0xf00f, &v);
++	if (e || v == 0x20161121u) {
++		printf("SWEET CAMHW: lens: ROM version %#x (%d): old or not answering\n", v, e);
++		return EIO;
++	}
++	(void)ch_lens_wr(0xc000, 0x00e0500cu);           /* CMD_IO_ADR_ACCESS = ROMINFO */
++	(void)ch_lens_rd(0xd000, &v);                    /* CMD_IO_DAT_ACCESS */
++	if ((v & 0xffu) == 0x01) {
++		static const uint8_t remap[10] = { 0xc0, 0x00, 0x00, 0xd0, 0x00, 0xac, 0x00, 0x00, 0x10, 0x00 };
++		(void)ch_cci_burst(LENS_SID, remap, 10);    /* SYSDSP_REMAP = 0x1000: CORE_RST */
++		ch_wait(6);
++	} else if ((v & 0xffu) != 0x0a) {
++		printf("SWEET CAMHW: lens: ROMINFO %#x: not runnable\n", v);
++		return EIO;
++	}
++	/* 1. the program: PM address 0x00100000, then 0x40 + 12 words a write, then the checksum command */
++	static const uint8_t pm_at[5] = { 0x30, 0x00, 0x10, 0x00, 0x00 };
++	e = ch_cci_burst(LENS_SID, pm_at, 5);
++	uint8_t b[61];
++	for (uint32_t o = 0; e == 0 && o < pm_bytes; o += 60u) {
++		uint32_t k = pm_bytes - o < 60u ? pm_bytes - o : 60u;
++		b[0] = 0x40;
++		memcpy(b + 1, pm + o, k);
++		e = ch_cci_burst(LENS_SID, b, k + 1u);
++	}
++	if (e == 0) {
++		uint8_t sum[4] = { 0xf0, 0x0a, (uint8_t)(pm_words >> 8), (uint8_t)pm_words };
++		e = ch_cci_burst(LENS_SID, sum, 4);
++	}
++	/* 2. the tables: DMA then DMB, 60 bytes (10 records) a write, as they are */
++	if (e == 0) {
++		(void)ch_lens_wr(0x0100, 0);             /* DMA parity clear */
++		(void)ch_lens_wr(0x0104, 0);             /* DMB parity clear */
++	}
++	for (uint32_t o = 0; e == 0 && o < dma_bytes + dmb_bytes; ) {
++		uint32_t end = o < dma_bytes ? dma_bytes : dma_bytes + dmb_bytes;
++		uint32_t k = end - o < 60u ? end - o : 60u;
++		e = ch_cci_burst(LENS_SID, dm + o, k);
++		o += k;
++	}
++	/* 3. verify */
++	uint32_t vpm = 0, vdma = 0, vdmb = 0;
++	if (e == 0) {
++		(void)ch_lens_rd(0x0110, &vpm);
++		(void)ch_lens_rd(0x0100, &vdma);
++		(void)ch_lens_rd(0x0104, &vdmb);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("SWEET CAMHW: lens program: %u PM words, DM %u + %u bytes in %llu ms -> %d; sums PM %#x DMA %#x DMB %#x "
++	    "(%#x, want %#x)\n", pm_words, dma_bytes, dmb_bytes, ns / 1000000ull, e, vpm, vdma, vdmb, vpm + vdma + vdmb, parity);
++	if (e || vpm + vdma + vdmb != parity) {
++		return EIO;
++	}
++	/* Android's after the download: SetGyroAccelCoef for SO2820 (as the trace writes it), 0xf000, 0x8970, 0xf111 */
++	static const uint32_t coef[10][2] = {
++		{ 0x86a4, 0 }, { 0x86a8, 0x7fffffff }, { 0x86ac, 0 }, { 0x86b0, 0x7fffffff }, { 0x86c8, 0x7fffffff },
++		{ 0x86b4, 0 }, { 0x86b8, 0x7fffffff }, { 0x867c, 0 }, { 0x8680, 0x7fffffff }, { 0x8684, 0x7fffffff },
++	};
++	for (unsigned i = 0; i < 10; ++i) {
++		(void)ch_lens_wr(coef[i][0], coef[i][1]);
++	}
++	(void)ch_lens_wr(0xf000, 0);
++	(void)ch_lens_wr(0x8970, 1);
++	(void)ch_lens_wr(0xf111, 1);
++	/* then its OIS start (the trace): 0xf000, wait idle, servo on, OIS on, still mode */
++	(void)ch_lens_wr(0xf000, 0);
++	(void)ch_lens_idle(200);
++	e = ch_lens_wr(0xf010, 3);
++	(void)ch_lens_idle(100);
++	(void)ch_lens_wr(0xf012, 1);
++	(void)ch_lens_idle(100);
++	(void)ch_lens_wr(0xf013, 1);
++	(void)ch_lens_idle(100);
++	cl.ok = e == 0;
++	if (cl.ok) {
++		(void)ch_lens_focus(300);
++	}
++	uint32_t af = 0;
++	(void)ch_lens_rd(0xf01a, &af);
++	printf("SWEET CAMHW: lens: servo and OIS on -> %d; focus %u (0xf01a reads %#x)\n", e, cl.focus, af);
++	return cl.ok ? 0 : EIO;
++}
++
 +/* ---------------------------------------------------------------- /dev/hakios-camera: the frames, for ISP.mediacapture
 + *
 + * As userland/camera/hakios.camera.h says (HakiOS's device, here the copy sweet_hakios_camera.h): the first open
@@ -1544,7 +1801,7 @@
 +	uint64_t seq, ready_seq, read_seq, ready_time, last_done;
 +	uint32_t lines, gain, frame_lines, line_ns, bayer;
 +	unsigned frames, drops, opens;
-+} cs = { .bayer = 0 };
++} cs = { .bayer = 3 };          /* BGGR: blue Gatorade came out orange with RGGB (camhw8) */
 +
 +/* IMX586 analog gain: 1024 / (1024 - code), code 0..960 */
 +static uint32_t
@@ -1728,6 +1985,7 @@
 +	ch_wr(ch.csid, CSID_RDI0_CTRL, 2);
 +	ch_wr(ch.csid, CSID_RDI0_CFG0, ch_rd(ch.csid, CSID_RDI0_CFG0) & ~(1u << 31));
 +	ch_wait(40);
++	ch_lens_power(false);
 +	ch_sensor_off();
 +	printf("SWEET CAMHW: /dev/hakios-camera closed: %u frames, %u dropped\n", cs.frames, cs.drops);
 +}
@@ -1741,7 +1999,9 @@
 +		ch_sensor_off();
 +		return EIO;
 +	}
++	ch_lens_power(true);            /* its program comes later, from ISP.mediacapture */
 +	if (!ch_rx_setup() || !ch_capture_prepare()) {
++		ch_lens_power(false);
 +		ch_sensor_off();
 +		return EIO;
 +	}
@@ -1814,7 +2074,7 @@
 +	h->frame_lines_max = CS_FL_MAX;
 +	h->margin = CS_MARGIN;
 +	h->sensor = 1;
-+	h->focus = HAKIOS_CAMERA_NO_FOCUS;
++	h->focus = cl.ok ? cl.focus : HAKIOS_CAMERA_NO_FOCUS;
 +}
 +
 +static int
@@ -1875,6 +2135,20 @@
 +	if (e) {
 +		return e;
 +	}
++	if (c.command == HAKIOS_CAMERA_LENS_FIRMWARE) {
++		user_ssize_t n = uio_resid(uio);
++		if (n <= 0 || n > (user_ssize_t)LENS_FW_MAX) {
++			return EINVAL;
++		}
++		lck_mtx_lock(ch.lock);
++		e = uiomove((caddr_t)cl.fw, (int)n, uio);
++		cl.fw_len = (unsigned)n;
++		if (e == 0) {
++			e = !cs.on ? EIO : cl.ok ? 0 : ch_lens_start();
++		}
++		lck_mtx_unlock(ch.lock);
++		return e;
++	}
 +	uio_update(uio, (user_size_t)uio_resid(uio));        /* what follows (KEEP's picture): not wanted */
 +	switch (c.command) {
 +	case HAKIOS_CAMERA_EXPOSURE:
@@ -1884,6 +2158,11 @@
 +		return e;
 +	case HAKIOS_CAMERA_SENSOR:
 +		return c.a == 1 ? 0 : ENODEV;
++	case HAKIOS_CAMERA_FOCUS:
++		lck_mtx_lock(ch.lock);
++		e = cs.on ? ch_lens_focus(c.a) : EIO;
++		lck_mtx_unlock(ch.lock);
++		return e;
 +	default:
 +		return 0;
 +	}
@@ -1966,8 +2245,31 @@
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_camhw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
 +    sysctl_sweet_camhw, "I", "IMX586 bring-up: 1 reads the chip ID, 2 also streams into CSID 1, 3 also captures one frame");
 +
++static int
++sysctl_sweet_camhw_focus SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = cl.ok ? (int)cl.focus : -1;
++	int err = sysctl_handle_int(oidp, &value, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (value < 0 || value > 1023 || !ch.lock) {
++		return EINVAL;
++	}
++	lck_mtx_lock(ch.lock);
++	err = cs.on ? ch_lens_focus((uint32_t)value) : EIO;
++	lck_mtx_unlock(ch.lock);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_camhw_focus, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_camhw_focus, "I", "the rear main camera's lens, 0 (far) to 1023, while it streams (-1: no lens)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_camhw_af_offset, CTLFLAG_RW | CTLFLAG_LOCKED, &cl.offset, 0,
++    "lens position for focus 0 (LC898124 CMD_AF_POSITION)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_camhw_af_span, CTLFLAG_RW | CTLFLAG_LOCKED, &cl.span, 0,
++    "lens positions over focus 0..1023 (1024: 0..0x3ff)");
 +SYSCTL_UINT(_kern, OID_AUTO, sweet_camhw_bayer, CTLFLAG_RW | CTLFLAG_LOCKED, &cs.bayer, 0,
-+    "the Bayer order /dev/hakios-camera reports: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR (boot-arg sweetcambayer)");
++    "the Bayer order /dev/hakios-camera reports: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR (boot-arg sweetcambayer; default 3)");
 +
 +/* the last captured frame as received: 4000x3000 MIPI RAW10 (5000 bytes a line), `sysctl -b kern.sweet_camhw_frame` */
 +static int
@@ -2362,7 +2664,7 @@
 +};
 --- /dev/null
 +++ b/bsd/dev/sweet_hakios_camera.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,67 @@
 +/*
 + * /dev/hakios-camera: the phone's wide camera for Darwin (boot-arg cam=5; the kernel's drivers/camera/hakios.camera.c,
 + * whose bsd/sys/hakios.camera.h this is a copy of).
@@ -2418,6 +2720,9 @@
 +	HAKIOS_CAMERA_SENSOR = 3,      /* another sensor: a which (as in the frames' header), b its mode (~0: the usual one);
 +	                                 * the frames stop, everything goes down, and the next read starts the other one */
 +	HAKIOS_CAMERA_FOCUS = 4,       /* the lens to a: 0 (the furthest) to 1023, from the next frame or so */
++	HAKIOS_CAMERA_LENS_FIRMWARE = 5, /* Note SWEET: the lens controller's program follows (bytes of it: the file
++	                                 * tools/lc898124-fw.py makes); the kernel downloads it and starts the lens, and
++	                                 * from then on the frames' focus is a position */
 +};
 +
 +struct hakios_camera_command {
