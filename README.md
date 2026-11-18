@@ -6,7 +6,7 @@ This is an experimental bring-up, not a daily-use phone OS. Many hardware featur
 
 ## Current status
 
-Status snapshot: **2026-11-17**. For detailed evidence, caveats, and engineering history, see [`docs/ios27.md`](docs/ios27.md) and [`NOTES.md`](NOTES.md).
+Status snapshot: **2026-11-18**. For detailed evidence, caveats, and engineering history, see [`docs/ios27.md`](docs/ios27.md) and [`NOTES.md`](NOTES.md).
 
 ### Working
 
@@ -20,6 +20,7 @@ Status snapshot: **2026-11-17**. For detailed evidence, caveats, and engineering
 - **Haptics:** working, fixed together with audio (the haptics actuator runs through the same audio system).
 - **Bluetooth:** the Settings switch works, devices are found, and Bluetooth audio plays.
 - **Wi-Fi:** joining works and networks are remembered for auto-join; SSH works over Wi-Fi.
+- **Camera:** both cameras work in the Camera app, for the preview and photos. The rear main camera (Sony IMX586) has contrast autofocus through its lens/OIS controller (LC898124EP3). The front camera (Sony IMX471) rises on its pop-up motor when selected and lowers when you switch away or close the app. The kernel drives the sensors, receivers, image front end and SMMU itself and hands raw frames to `ISP.mediacapture` through `/dev/hakios-camera` (`xnu/ios27/xnu12377-camhw.diff`, `userland/camera/`). The lens controller's program comes from OnePlus's GPL driver and is kept out of git: `tools/lc898124-fw.py` makes it, and it goes to `/var/local/fw/lc898124-so2820.fw` on the phone.
 - **Memory:** iOS manages 5 GB (`hw.memsize=5367660544`), with a GPU pool of about 2 GB placed outside it.
 
 ### Partial or unreliable
@@ -27,6 +28,7 @@ Status snapshot: **2026-11-17**. For detailed evidence, caveats, and engineering
 - **Metal/GPU:** NativeAdrenoMetal and Turnip render the UI, at roughly 30-40 fps while scrolling (Turnip concurrent binning on: `tu-cb=1`). The display controller scales frames to the panel in hardware (QSEED3) instead of a GPU blit. Stutters are shorter (about 100 ms at worst while scrolling) but not gone; textures still use a linear layout. App and game rendering is not reliable.
 - **Performance:** better after removing the spinning `PerfPowerServices` job and preferring the big CPU cores, but `locationd` can spin on a full core after boot (killing it works around it) and `wland` polls Wi-Fi every millisecond (about 12% of a core).
 - **Video playback:** plays in Safari (YouTube) and from local files since the YUV video layer fix (`xnu/ios27/xnu12377-fb-yuv.diff`); the player controls over the video are fixed in source but not yet confirmed on a build.
+- **Camera limits:** the rear camera takes about 2 s to start, because the sensor setup and lens program are sent over a slow 100 kHz I2C bus. The preview is processed on the CPU from full 4000x3000 frames, so it is not smooth. The pop-up is moved on a timer like Android's, but its position sensors and drop detection are not used yet. The ultra-wide and telephoto cameras are not supported, and photos come out as single frames (no multi-frame processing).
 - **Microphone:** input is unconfirmed.
 - **Sleep:** iOS's system sleep panicked the kernel (`SweetCPU::haltCPU` is not implemented). `tools/mkadt.py` now sets `sleep-disabled` in the device tree so iOS no longer attempts it; not yet confirmed on a build. Turning the screen off is unaffected.
 - **Identity:** the generated device tree uses the iPhone 14 Pro/D73 identity, but that does not guarantee all identity-dependent apps and services behave like they do on real iPhone hardware.
@@ -34,7 +36,7 @@ Status snapshot: **2026-11-17**. For detailed evidence, caveats, and engineering
 ### Not working or not implemented
 
 - **Full memory capacity:** about 5 of the phone's 8 GB go to iOS; giving it more needs XNU to use non-contiguous RAM ranges.
-- **Suspend (system sleep), cellular calls/data, camera, GPS, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated.
+- **Suspend (system sleep), cellular calls/data, GPS, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated.
 
 ## Booting
 
