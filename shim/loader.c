@@ -100,7 +100,12 @@ static uint64_t payload_at(uint64_t rd_start, uint64_t rd_end, int n)
 			return 0;
 		if (k == n)
 			return at;
-		at = (at + payload_span(p) + 0xfff) & ~0xfffUL;
+		/* mktripleboot.py aligns each payload offset relative to the ramdisk.
+		 * ABL's initrd-start is not guaranteed to have the same alignment, so
+		 * align the offset, then add the ramdisk base back. */
+		uint64_t offset = at - rd_start;
+		offset = (offset + payload_span(p) + 0xfff) & ~0xfffUL;
+		at = rd_start + offset;
 	}
 }
 
