@@ -92,7 +92,7 @@ ns_to_abs(uint64_t ns)
 }
 
 int
-cam_open(void)
+synth_cam_open(void)
 {
 	pthread_mutex_lock(&lock);
 	if (tb.denom == 0) {
@@ -115,7 +115,7 @@ cam_open(void)
 }
 
 void
-cam_close(int handle)
+synth_cam_close(int handle)
 {
 	(void)handle;
 	pthread_mutex_lock(&lock);
@@ -186,7 +186,7 @@ render(uint8_t *raw)
 }
 
 ssize_t
-cam_read(int handle, void *buffer, size_t bytes)
+synth_cam_read(int handle, void *buffer, size_t bytes)
 {
 	struct hakios_camera_frame *h = buffer;
 	size_t whole = sizeof(*h) + (size_t)STRIDE * HEIGHT;
@@ -227,7 +227,7 @@ cam_read(int handle, void *buffer, size_t bytes)
 }
 
 ssize_t
-cam_write(int handle, const void *buffer, size_t bytes)
+synth_cam_write(int handle, const void *buffer, size_t bytes)
 {
 	const struct hakios_camera_command *c = buffer;
 

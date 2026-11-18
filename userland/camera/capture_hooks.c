@@ -353,13 +353,78 @@ preview_fill(CMSampleBufferRef sbuf)
 	CVPixelBufferRelease(src);
 }
 
+/*
+ * TEST 26 (preview scaling): what the graph's pixel transfer nodes ("Preview Scaler" and others) are given, every 30th
+ * buffer per node class: the picture, its PrimaryCaptureRect attachment and its metadata's ValidBufferRect -- the
+ * Preview Scaler logged an input crop rect of NaNs and a 16x16 intermediate pass. And /var/tmp/sweetcam.nofill (if
+ * there) turns the preview fill off, to see what the scaler gives by itself.
+ */
+static IMP original_transfer_render;
+
+static void
+rect_text(CFTypeRef v, char *out, size_t size)
+{
+	snprintf(out, size, "-");
+	if (v == NULL) {
+		return;
+	}
+	CFStringRef d = CFCopyDescription(v);
+	if (d != NULL) {
+		CFStringGetCString(d, out, (CFIndex)size, kCFStringEncodingUTF8);
+		CFRelease(d);
+	}
+	for (char *c = out, *o = out; ; c++) {
+		if (*c == '\n' || *c == '\t') {
+			*c = ' ';
+		}
+		if (*c == ' ' && o > out && o[-1] == ' ') {
+			continue;
+		}
+		*o++ = *c;
+		if (*c == 0) {
+			break;
+		}
+	}
+}
+
+static void
+transfer_render(id self, SEL selector, CMSampleBufferRef sbuf, id input)
+{
+	static unsigned n;
+
+	if (sbuf != NULL && n++ % 30 == 0 && n < 300) {
+		CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sbuf);
+		CFStringRef *k_primary = dlsym(RTLD_DEFAULT, "kFigCaptureSampleBufferAttachmentKey_PrimaryCaptureRect");
+		CFStringRef *k_md = dlsym(RTLD_DEFAULT, "kFigCaptureSampleBufferAttachmentKey_MetadataDictionary");
+		CFStringRef *k_valid = dlsym(RTLD_DEFAULT, "kFigCaptureStreamMetadata_ValidBufferRect");
+		CFTypeRef primary = k_primary != NULL ? CMGetAttachment(sbuf, *k_primary, NULL) : NULL;
+		CFTypeRef md = k_md != NULL ? CMGetAttachment(sbuf, *k_md, NULL) : NULL;
+		CFTypeRef valid = md != NULL && CFGetTypeID(md) == CFDictionaryGetTypeID() && k_valid != NULL ?
+		    CFDictionaryGetValue(md, *k_valid) : NULL;
+		char name[96] = "?", tp[300], tv[300];
+		id nm = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("name"));
+		if (nm != nil) {
+			CFStringGetCString((CFStringRef)nm, name, sizeof(name), kCFStringEncodingUTF8);
+		}
+		rect_text(primary, tp, sizeof(tp));
+		rect_text(valid, tv, sizeof(tv));
+		OSType f = pb != NULL ? CVPixelBufferGetPixelFormatType(pb) : 0;
+		say("hooks: transfer node %s (%s): in %c%c%c%c %zux%zu; PrimaryCaptureRect %s; ValidBufferRect %s",
+		    name, object_getClassName(self), (int)(f >> 24), (int)(f >> 16 & 255), (int)(f >> 8 & 255), (int)(f & 255),
+		    pb ? CVPixelBufferGetWidth(pb) : 0, pb ? CVPixelBufferGetHeight(pb) : 0, tp, tv);
+	}
+	((void (*)(id, SEL, CMSampleBufferRef, id))original_transfer_render)(self, selector, sbuf, input);
+}
+
 static IMP original_queue_render;
 static void
 queue_render(id self, SEL selector, CMSampleBufferRef sbuf, id input)
 {
 	static unsigned n;
 
-	preview_fill(sbuf);
+	if (access("/var/tmp/sweetcam.nofill", F_OK) != 0) {
+		preview_fill(sbuf);
+	}
 	if (sbuf != NULL && n++ % 30 == 0 && n < 400) {
 		CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sbuf);
 		if (pb != NULL && CFGetTypeID(pb) == CVPixelBufferGetTypeID()) {
@@ -435,6 +500,7 @@ static struct replacement {
 	{ "FigCaptureSessionParsedConfiguration", "smartStyleRenderingEnabled", (IMP)answer_no, NULL, true, false },
 	{ "FigCaptureMovieFileSinkPipelineConfiguration", "smartStyleRenderingEnabled", (IMP)answer_no, NULL, true, false },
 	{ "BWStreamingFilterNode", "changeToSemanticStyle:animated:", (IMP)change_semantic_style, NULL, true, false },
+	{ "BWPixelTransferNode", "renderSampleBuffer:forInput:", (IMP)transfer_render, &original_transfer_render, true, false },
 };
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 

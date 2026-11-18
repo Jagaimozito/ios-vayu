@@ -2010,12 +2010,18 @@ worker(void *context)
 	bool switched = false;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
-	int device = cam_open(), failures = 0;      /* Note SWEET: synth_camera.c */
+	int device = cam_open(), failures = 0;      /* Note SWEET: camera_source.c (the kernel's, else synth_camera.c) */
 
 	pthread_setname_np("hakios-camera");
 	if (device < 0) {
 		say("no %s (%s): no frames", HAKIOS_CAMERA_DEVICE, strerror(errno));
 		return NULL;
+	}
+	if (cam_open_errno == 0) {
+		say("frames from the kernel's %s", HAKIOS_CAMERA_DEVICE);
+	} else {
+		say("made-up frames (synth_camera.c): %s %s", HAKIOS_CAMERA_DEVICE,
+		    cam_open_errno == EEXIST ? "not wanted (/var/tmp/sweetcam.synth)" : strerror(cam_open_errno));
 	}
 	isp_init(&isp);
 	while (s->running && failures < 5) {

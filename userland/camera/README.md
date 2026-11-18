@@ -14,9 +14,11 @@ boot-arg `sweetcamera=0` leaves it out) and this is our `ISP.mediacapture`.
   version 3 with a fourth function (EnqueueReactionEffect, refused here); the device class is used at version 1.
 - The back and front cameras' formats by D73/AVCaptureSession.plist (Photo 4224x3024 and Video-30 4224x2640 at
   the back, 4032x3024 and 4032x2528 at the front).
-- Frames from `synth_camera.c` instead of `/dev/hakios-camera`: RAW10 at 1600x1200, 30 a second, colour bars
-  (back) or a chequer (front) with a bright square moving across, through the same ISP code (exposure, white
-  balance, scaling) as a real sensor's would go.
+- Frames from the kernel's `/dev/hakios-camera` when it has one (our `sweet_camhw.c`: the rear main camera, IMX586,
+  4000x3000 RAW10, sensor 1), through `camera_source.c`; otherwise, and for the front camera (the kernel answers
+  ENODEV to HAKIOS_CAMERA_SENSOR 2), and when `/var/tmp/sweetcam.synth` exists, from `synth_camera.c`: RAW10 at
+  1600x1200, 30 a second, colour bars (back) or a chequer (front) with a bright square moving across, through the
+  same ISP code (exposure, white balance, scaling) as a real sensor's.
 - Its log goes to the unified log ("hakios: camera: ..."; `oslog -t 30 > /var/root/all.log`, unfiltered: the process filter
   catches nothing, and cameracaptured's sandbox refuses a log file).
 - `capture_hooks.c`: HakiOS's inject.c replacements, made by this bundle's constructor inside cameracaptured (no injection

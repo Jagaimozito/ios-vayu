@@ -6458,3 +6458,98 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   sta_power(false) now leaves the network (Wi-Fi off in Settings did nothing). CODEX: build with the census diff.
   Also seen: hotspot WPA3-transition join "Attempting to join SAE" (wland does WPA2 PSK; worked as WPA2 here);
   "failed to become routable" (DHCP slow) after auto-join - check after this fix.
+
+# Real camera bring-up: what Android shows (Claude, 2026-11-18)
+- Phone's sensors (PixelExperience 12.1 dmesg probes): slot 0 IMX586 @0x34 (module vendor 0x03 = Sony_semco, OnePlus
+  table in cam_sensor_core.c), slot 1 S5K3M5 (0x30d5) tele @0x20, slot 2 IMX471 front @0x20, slot 3 IMX481 ultra-wide
+  @0x34. First target: IMX586 (fixed rear).
+- IMX586 DT (qcom,cam-sensor@0 under cci@ac4a000): cci-device 0, cci-master 1, csiphy-sd-index 1; MCLK1 on TLMM GPIO 14
+  at 19.2 MHz (camcc clock 0x4a, titan_top_gdsc @0xad0c1bc); reset TLMM GPIO 30; CAM_VANA_0 GPIO 11, CAM_VANA2_0 GPIO 29,
+  CAM_PVDD = PM8150L GPIO 1; supplies cam_vio pm8150l_l1 1.8 V, cam_vana pm8150l_bob 3.3 V, cam_vdig pm8009_l1 1.104 V
+  (regulator_summary with Camera open). Files: outputs/android-camera/ (tools/android-camera-recon.sh, git-ignored).
+- Register settings: the OnePlus kernel source carries a complete IMX586 start (FTM test mode):
+  research/oneplus-sm8150-camera/.../cam_sensor/CAM_SENSOR_SETTINGS.h imx586_setting0+1 (~600 writes, word address,
+  byte data): RAW10, 2x2 binned 4000x3000 (0x034C/E), line 0x1EC0, frame 0x0EFC lines, ends 0x0100=1 (stream on).
+  The camera driver source (camera_8150_op: CCI, CSIPHY 1.2, CSID/IFE 175, CPAS, SMMU) is in
+  research/oneplus-sm8150-camera/ (OnePlusOSS android_kernel_oneplus_sm8150 sm8150_s_12.1_op7pro 180d787, GPL).
+- Next: tools/android-camera-trace.sh records Android's power sequence, CCI writes and CSIPHY setup (debug_mdl 0xC020).
+- Plan: (1) kernel: camcc clocks + titan_top GDSC + MCLK1 + supplies (sweet_rpmh: bob, l1c, l1f) + GPIOs, CCI master 1,
+  read IMX586 chip ID (reg 0x0016 = 0x0586); (2) CSIPHY 1 + CSID + IFE RDI write-to-memory through the camera SMMU
+  context; (3) /dev/hakios-camera from those frames (the bundle and CPU ISP already take RAW10).
+- 2026-11-18: Android trace (tools/android-camera-trace.sh -> outputs/android-camera/trace.txt; decoder ~/scr/ccidec.py
+  in the Claude VM): IMX586 power-up order = VANA (bob 3.3 V + TLMM 11), TLMM 29, VDIG (pm8009 L1F 1.104 V),
+  PM8150L GPIO 1 (DVDD switch, DT cam_sensor_rear_0_dvdd), VIO (pm8150l L1C 1.8 V), MCLK (TLMM 14), RESET (TLMM 30);
+  CCI hw version 0x10070000; then 2800 writes to 0x1a (outputs/android-camera/imx586-start-writes.txt: init,
+  4000x3000 2x2-binned RAW10 mode with OP PLL 0x041d, ~1000 calibration writes, AEC, 0x0100=1).
+- STEP 1 SOURCE (Claude, NOT BUILT): xnu/ios27/xnu12377-camhw.diff (applied in work/xnu-12377): bsd/dev/sweet_camhw.c
+  (boot-arg sweetcamhw=1, sweetcamhwdelay=40 s; sysctl kern.sweet_camhw=1 re-runs): GCC/CAMCC clocks from XO,
+  titan_top GDSC, RPMh votes bobc1/ldof1/ldoc1, TLMM + PM8150L GPIO 1, CCI 0 reset + master 1 at ~100 kHz, reads
+  IMX586 reg 0x0016 (expect 0x0586), then holds reset and turns MCLK/switches off (rails stay voted). Log lines
+  "SWEET CAMHW:". sweet_spmi.c allows writes to SID 4 0xc040/41/42/44/46 for it. CODEX: build + boot-arg.
+- 2026-11-18 RESULT camhw3: "SWEET CAMHW: IMX586 chip ID 0x0586 (right)" -- the iOS kernel powers the rear main sensor
+  and talks to it. Fixes on the way: GCC camera_ahb/xo and camcc core_ahb are BRANCH_HALT_DELAY (CLK_OFF not
+  meaningful); sweet_rpmh rh_lookup now accepts a cmd-db name listed twice at one address ("bobc1" is). CCI hw version
+  0x10070000 as Android's; rails via RPMh bobc1 3300 / ldof1 1104 / ldoc1 1800 complete; PM8150L GPIO 1 writes succeed
+  (its reads give 0xff: no read channel there). titan_top GDSC was already on (0xf822f000). Next: step 2 (CSIPHY 1,
+  CSID, IFE RDI to memory, camera SMMU), after an Android trace of the CSID/IFE setup (CAM_ISP debug).
+- STEP 2a SOURCE (Claude, NOT BUILT; in xnu/ios27/xnu12377-camhw.diff): sysctl kern.sweet_camhw=2 = chip ID, then
+  camcc PLL0 (trion 1200 MHz), ife_1 GDSC, cphy_rx 400 / csi1phytimer 300 / ife_1_csid 400 MHz, CSIPHY 1 C-PHY x3
+  (PixelExperience cam_csiphy_1_1_hwreg.h, the table Android's trace matches exactly; settle 0x0e, lane enable 0x2a),
+  CSID 1 (0xacba000) rx cfg0 0x01102102 (Android's), the 2800 IMX586 writes (bsd/dev/sweet_camhw_imx586.h), then the
+  CSID RX counters for 0.5 s ("SWEET CAMHW: CSID streaming: ... packets N ... long pkt"), stream off, power down.
+  Android trace facts: CSID 1 HW 1.75.101, lane type 1 (C-PHY) lanes 3 DT 0x2b VC 0 4000x3000; IFE 1 RDI0 -> WM 0.
+- 2026-11-18 RESULT camhw4 (step 2a): THE SENSOR STREAMS INTO CSID 1. PLL0 locked, ife_1 GDSC on, all RCGs ok,
+  2800 IMX586 writes ok (1.1 s at ~100 kHz), then CSID RX: ~70,000 packets/s, ECC 0, CRC 0, captured long packet
+  header 0x2b1388 (DT 0x2b RAW10, word count 0x1388 = 5000 = 4000 px) and C-PHY header the same; rx irq 0x400777 =
+  SOT/EOT on trios 0-2, long/short/C-PHY captured, and bit 22 UNMAPPED_VC_DT (no path set up yet: expected).
+  CSID 1 hw version register reads 0x10000000. Next (2b): CSID RDI0 path, IFE 1 (clock from camcc PLL3) RDI0 write
+  master 0, apps SMMU context bank with stage-1 tables for the IFE streams (0x840/0x620 ...; buffers must sit below
+  4 GiB in IOVA, RAM is above), MMNOC/DDR bandwidth votes.
+- STEP 2b + 3 SOURCE (Claude, NOT BUILT; in xnu/ios27/xnu12377-camhw.diff): sysctl kern.sweet_camhw=3 = step 2a plus
+  one frame to memory. Camcc PLL4 (0x4000, L 0x29 alpha 0xaaaa, even /2 = 400 MHz; Android's IFE 1 PLL is PLL4, not
+  PLL3) -> ife_1 RCG 0xb010 cfg 0x601; camnoc_axi 400 MHz (PLL0 /3, cfg 0x105). 16 MB wired kernel buffer filled 0x5a,
+  stage-1 tables (4K granule, T0SZ 32, L1 -> L2 -> 8 L3, pages PA|0x643, MAIR0 0x44) on a free apps SMMU SMR/CB
+  (SMR 0x840 mask 0x620, S2CR translate, CBAR 0x1f000, CBA2R 1, TCR 0x802020, TCR2 0x38001, SCTLR 0x27), SMMU MMIO as
+  single-register ldr/str (ch_rd/ch_wr now asm). IFE 1 (0xacb6000): reset 0x3f9f, bus init as cam_vfe_bus_init_hw,
+  WM0 frame-based RAW (width/stride 0xff01, height 0, cfg 3, burst 0xf) at IOVA 0x10000000, reg update 0x2. CSID RDI0
+  cfg0 0x802bf007 (VC 0 DT 0x2b decode 0xf, enabled), ctrl 1. Then the sensor starts; waits up to 2 s for bus status1
+  bit 0 (WM0 buffer done) or an SMMU fault, stops WM0/RDI0/sensor, logs CSID RDI irq/status/format measure/byte count,
+  IFE top/bus/WM status, SMMU FSR/FAR, how many 64-bit words of the buffer changed and 8 row means.
+  sysctl -b kern.sweet_camhw_frame = the 15,000,000-byte RAW10 frame.
+- 2026-11-18 RESULT camhw5 (step 2b + 3): everything set up as written -- PLL4 locked, ife_1 400 / camnoc 400 ok,
+  16 MB buffer + tables, SMMU CB6 via SMR10 (SMR 0x86200840, S2CR 6, SCTLR 0x27, TTBR0 ok; ID0 0x4c017e5e ID1
+  0x60000038), IFE 1 hw 0x10020000 bus 0x20000, reset done, CSID RDI0 cfg0 0x802bf007. But the wait loop quit after
+  10 ms: SMMU FSR reads 0x400, which is FSR.FORMAT = 2 (AArch64), not a fault -- my check treated any nonzero FSR as
+  a fault. Nothing had arrived yet at 10 ms (CSID RDI0 irq 0, bus 0). Fix (camhw6): ignore FSR bits 10:9; CSID RX
+  counters also logged at 100/500/1000 ms while waiting.
+- 2026-11-18 RESULT camhw6: FIRST FRAME IN MEMORY. WM0 buffer done 90 ms after stream on; CSID RDI0 irq 0x1ff8
+  (SOF/EOF/SOL/EOL...), byte counter 15,000,000, IFE top 0x8000220 (RDI0 SOF, reg update, bus), bus status1 bit 0,
+  no SMMU fault; 1,878,000 of 2,097,152 words written, last byte 15,023,999: the WM pads each 5000-byte line to a
+  pitch of 5008 (16-byte aligned) -> 15,024,000 bytes. Decoded with pitch 5008 (outputs/camhw/frame.raw, Claude's
+  raw2png): every pixel at the black level 64 +- 3, all four Bayer phases equal -- a black frame (the first one
+  after stream on; Android's last AEC in the start table was integration 0x1a10, analog gain 0x3c0).
+  camhw7 changes: FRAME_PITCH 5008 (sysctl frame now 15,024,000 bytes), WM0 enabled only after the sensor has run
+  400 ms, sensor frame count / integration / gains read back over CCI every 100 ms before that.
+- 2026-11-18 RESULT camhw6, second run pointed at the laptop: A REAL PICTURE. The same kernel's first frame after
+  stream on is exposed (the earlier black one was the phone lying camera-down). Decoded (pitch 5008, 2995 rows: the
+  camhw6 sysctl export stops at 15,000,000 bytes): median 125/1023, highlights clip at 1023; green on the (0,1)/(1,0)
+  phases, so RGGB or BGGR (not settled: needs a known-colour target). Content: laptop screen + keyboard, rotated 90
+  degrees (sensor mounting), out of focus (the AF actuator is not driven), highlights clip pink after a gray-world
+  white balance. outputs/camhw/frame-lit.raw, first-photo-{bggr,rggb}.png; converter tools/camhw-raw2png.py
+  (python3 tools/camhw-raw2png.py FRAME.raw OUTPREFIX; needs numpy + Pillow).
+- 2026-11-18 camhw8 SOURCE (Claude, NOT BUILT): /dev/hakios-camera in sweet_camhw.c, HakiOS's protocol
+  (userland/camera/hakios.camera.h, copied to bsd/dev/sweet_hakios_camera.h). First open: power up, rx setup,
+  capture prepare, 4 x 16 MB buffers at IOVA 0x10000000 + n * 16 MB (34 table pages), WM0 cfg 3, sensor start, then
+  exposure 3647 lines / gain 2x / 30 fps. A kernel thread polls every 3 ms: RDI0 reg update done (top st0 0x20) ->
+  pending buffer latched, next free one given (WM0 image addr + reg update 0x2); WM0 buffer done (bus st1 bit 0) ->
+  oldest latched = newest frame, wakes readers; line_ns measured from frame intervals; a log line every 10 s
+  ("SWEET CAMHW: streaming: N frames ..."); SMMU fault -> EIO. read: header only = size; else waits <= 1 s
+  (EAGAIN) for a frame newer than the last read, invalidates it, copies header + 15,024,000 bytes (4000x3000 RAW10,
+  stride 5008, black 64, sensor 1, bayer from boot-arg sweetcambayer / sysctl kern.sweet_camhw_bayer, default 0
+  RGGB). write: EXPOSURE (lines, linear gain 256 = 1x -> IMX586 code 1024 - 262144/gain, max 960; frame lines
+  3695..14780, margin 48) under group hold 0x0104; SENSOR != 1 -> ENODEV; KEEP/FOCUS ignored. Last close: stream
+  off, WM/RDI off, sensor off. sysctl kern.sweet_camhw is EBUSY while it streams.
+  Userland: synth_camera.c's functions renamed synth_cam_*; new camera_source.c gives cam_* = the kernel's device
+  (else synth; /var/tmp/sweetcam.synth forces synth; ENODEV on SENSOR -> that handle goes to synth, so the front
+  camera stays the test pattern); camera_device.c logs which ("frames from the kernel's /dev/hakios-camera" or
+  "made-up frames ...").
