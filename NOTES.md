@@ -1,3 +1,9 @@
+# Active handoff — iOS 27 selector says “not installed” (2026-11-18)
+- User reports the known triple image boots the menu, but the menu says iOS 27 is not installed. That symptom is the shim’s payload discovery/counting path, not an iOS 27 kernel boot failure.
+- `shim/loader.c` was fixed to align each next payload offset relative to `linux,initrd-start`, matching `tools/mktripleboot.py`; absolute-address alignment can select the wrong second-payload location when the initrd base is not page-aligned.
+- Rebuilt with `PATH=/private/tmp/guac-llvm18-cross:$PATH BOARD=guacamole sh shim/build.sh`; rebuilt the triple image as `outputs/guacamole-ios27a-camhw12-thid-triple.img` from the existing iOS 16 payload and current `outputs/guacamole-ios27a-camhw12-thid.img` payload. Boot args sidecar: `outputs/guacamole-ios27a-camhw12-thid-boot-args.txt`.
+- Validation: the triple image embeds the rebuilt shim (matching SHA-256), and walking its actual ramdisk with the loader’s payload-span logic finds iOS 16 at offset 0 and iOS 27 at `0x103a000` (count 2); synthetic unaligned initrd-base checks also pass. This fix has **not** yet been tested on the phone; whether ABL supplies an unaligned initrd base remains unconfirmed. Flash only the triple image with `fastboot flash boot_b outputs/guacamole-ios27a-camhw12-thid-triple.img`.
+
 # Camera (Phase 1: Camera.app UI with a synthetic camera) - start (Claude, 2026-11-17)
 - Reference: wardevsa/ios-a5xelte (herolte; Galaxy S7, iOS 16) gpu/camera (from the Note FE / S9 ports, MIT HakiOS):
   their camera_device.c is a CoreMedia derived object FigCaptureDevice with two FigCaptureStreams (iOS 16.5 class
@@ -6651,3 +6657,61 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   with RGGB = bayer_front 0) but upside down. Fix in ISP.mediacapture: the Front Camera's `turned` = true
   (the picture turned half round in preview and photos), no kernel change.
 - 2026-11-18 RESULT: front camera upright in preview and photos with turned = true; rear still works after.
+
+# Subway Surfers black screen on iOS 27 (2026-11-18, Claude)
+
+- log-gpu=1 boot (outputs/subway2.log, game pid 494): no native-metal refusals in SubwaySurf; it opens the GPU,
+  holds 261 MB of pool, Unity says "Initializing Metal device caps: Turnip Adreno (TM) 640". From 06:08:00 the display
+  shows backboardd's single layer (surfaces 389/390/391), 45 swaps/s, GPU busy ~0, and EVERY frame 64/64 black
+  ("other top layer 225 frames, 225 black"). Unity's own log stops at 06:08:00.8 (missing-script warnings).
+- Open question: does the game draw black itself, draw nothing (Unity stalled), or does backboardd read its
+  drawables as black?
+- NEW boot-arg (UniXNU, SOURCE, NOT BUILT): research/ios27.2/adrenometal-dump-cb.diff (NativeAdrenoMetalPlugin.mm;
+  original kept as research/ios27.2/NativeAdrenoMetalPlugin.mm.before-dumpcb). dump-cb=NAME:FIRST[:COUNT] sets
+  NATIVE_METAL_DUMP_CB=FIRST:COUNT in processes whose name starts with NAME and sends their stderr to
+  /private/var/tmp/NativeAdrenoMetal.trace/dump-NAME-PID.log (or the app's own tmp dir if sandboxed; the path is
+  logged as "NativeAdrenoMetal: dump-cb ... into ..."). CODEX: rebuild NativeAdrenoMetal.bundle as for fnconst.
+- Test boot-args to add: log-gpu=1 diag=1 dump-cb=SubwaySurf:600:4
+- tsample (outputs/subway-tsample.txt, all 69 threads x 300, black screen): Unity is NOT stuck. Main thread runs
+  the display-link player loop (72/300 samples in CA update -> UnityFramework), 17 samples inside NativeAdrenoMetal
+  and 13 in Turnip submit (IOKit): the game keeps encoding and submitting GPU work. Workers idle. So the frames
+  are either drawn black or lost between the game's drawable and backboardd -> dump-cb decides.
+- 2026-11-18 RESULT dump-cb (outputs/dump-SubwaySurf-758.log, CBs 600-603, new bundle installed by the user): the game is
+  on its Unity loading screen. CB 600/602: ONE render pass straight into "CAMetalLayer Display Drawable" 828x1792
+  BGRA8 (c0 load 1 = Load, store; depth/stencil f260 cleared to 0), 20 draws: UI/Default (LoadingScreen_Current
+  1024x1024 RGBA8, Base_Square_*_SPLASH_ONLY ASTC, Logo_Subway_Mask), SYBO/UI/PanningShine, TextMeshPro SDF,
+  2x Hidden/InternalClearMetal (color mask 0: depth/stencil only), all blended, depth compare GreaterEqual
+  write 0, no stencil. Vertex colours opaque (alpha byte 0xff). READBACK of the drawable after the pass: every
+  channel 0..0, alpha too, "black 100.0%". CB 601/603: no passes. So the game's own draws leave the drawable
+  untouched (zero): the display path is fine, the draws produce nothing. Suspects: the sampled textures are empty
+  (uploads lost -> tex*colour has alpha 0 -> blend adds nothing), blend factors, or the draws are clipped.
+- NEXT (UniXNU, SOURCE, NOT BUILT): research/ios27.2/adrenometal-dump-sampled.diff (NativeBridgeMetalFrontend.mm;
+  original research/ios27.2/NativeBridgeMetalFrontend.mm.before-dumpsampled): dump-cb also reads back every texture
+  a fragment shader samples ("pass P draw D fragment texture N") and prints each blended attachment's
+  (rgbOp:src/dst alphaOp:src/dst). Same boot-args; only the bundle changes.
+- 2026-11-18 RESULT dump-sampled (outputs/dump-SubwaySurf-1237.log; the UI locked up with this bundle when the game
+  opened, probably the readback of 17 sampled textures): LoadingScreen_Current has a real picture (RGBA means
+  0.39/0.25/0.33/1.0, 0% black); UnityWhite is white. Blends are premultiplied (add One/OneMinusSrcAlpha).
+  So a full-screen opaque textured draw left the drawable at 0: the output never reached memory.
+- ROOT CAUSE (found in source): the render pass descriptor has the color/depth/stencil store action 4 =
+  MTLStoreActionUnknown (Unity's deferred store action) and Unity names it with setColorStoreAction:atIndex: before
+  endEncoding. NBRenderEncoder had NO setColorStoreAction:/setDepthStoreAction:/setStencilStoreAction: -> NBObject's
+  forwardInvocation swallowed them silently -> metal2vulkan lowers Unknown as DontCare (render.rs ~4401) -> the
+  pass ran in GMEM and was never stored. CoreAnimation/WebKit set Store in the descriptor, so they were fine.
+- FIX (UniXNU, SOURCE, NOT BUILT): research/ios27.2/adrenometal-late-store.diff: bridge nmb_encoder_set_store_action
+  (NativeMetalObjects.rs/.h -> RenderCommandEncoder::set_{color,depth,stencil}_store_action, which the runtime
+  already has, late_store), frontend setColorStoreAction:atIndex:/setDepthStoreAction:/setStencilStoreAction:
+  (refusals logged with log-gpu=1, not a refused command buffer) and the *StoreActionOptions as no-ops. Also takes
+  out the sampled-texture readback of dump-sampled (blend print kept).
+- 2026-11-18 RESULT late-store bundle: Subway Surfers DRAWS (loading screen visible), then dies at ~90 % loading.
+  outputs/subway4.log: kernel "EXC_GUARD AST: type=0x1 flavor=0x6 target=0x80000001 code=0x2000000680000001
+  subcode=0x106e" = mach port guard kGUARD_EXC_EXCEPTION_BEHAVIOR_ENFORCE: the app called task/thread
+  set_exception_ports with behavior 0x80000001 (MACH_EXCEPTION_CODES|EXCEPTION_DEFAULT, not identity-protected),
+  mask 0x106e (a crash-reporter SDK: Crashlytics/GAD register handlers then). ipc_tt.c exception_is_identity_protected
+  -> set_exception_behavior_violation kills it when the task's IPC policy is ENHANCED_V1+; kern_exec.c gives
+  platform binaries platform_restrictions_version 3, and on this port the sideloaded app runs as a platform binary
+  (a real App Store app has version 0 and is allowed). FIX without a rebuild: boot-arg thid_should_crash=0 (existing
+  TUNABLE: the violation is ignored and the port is set).
+- 2026-11-18 RESULT: late-store bundle + boot image guacamole-ios27a-camhw12-thid.img (thid_should_crash=0, no dump-cb/
+  diag): SUBWAY SURFERS WORKS (loads and plays). Diffs kept in xnu/ios27/adrenometal-late-store.diff and
+  adrenometal-dump-cb.diff.

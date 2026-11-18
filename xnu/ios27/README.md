@@ -53,6 +53,19 @@ Memory:
 GPU / Metal driver (`adrenometal-*.diff` are against `UniXNU/drivers/AdrenoMetal`):
 - `adrenometal-resopts.diff` - pass only defined MTLResourceOptions bits (heap refusals for 0x600200).
 - `adrenometal-recovery-exit.diff` - end a process whose VkDevice was recovered (it froze backboardd).
+- `adrenometal-late-store.diff` - render encoders take late store actions (`setColorStoreAction:atIndex:`,
+  `setDepthStoreAction:`, `setStencilStoreAction:`; bridge `nmb_encoder_set_store_action`). Unity begins every pass
+  with `MTLStoreActionUnknown` and names the action before `endEncoding`; the calls were swallowed, the pass was
+  lowered as DontCare and nothing reached the drawable (Subway Surfers all black). Also prints each blended
+  attachment's blend in `dump-cb` output. Confirmed: Subway Surfers renders and plays.
+- `adrenometal-dump-cb.diff` - boot-arg `dump-cb=NAME:FIRST[:COUNT]`: `NATIVE_METAL_DUMP_CB` for the processes whose
+  name starts with NAME, their stderr into `/private/var/tmp/NativeAdrenoMetal.trace/dump-NAME-PID.log` (passes,
+  draws, bindings and a brightness grid of each attachment read back after the command buffer).
+
+Boot-args: `thid_should_crash=0` (an existing xnu tunable) lets apps set non-identity-protected exception ports.
+Apps run as platform binaries on this port, so the iOS 18+ rule for platform tasks killed any app whose crash
+reporter (Crashlytics, Google ads) registers a Mach exception handler (EXC_GUARD, kGUARD_EXC_EXCEPTION_BEHAVIOR_ENFORCE):
+Subway Surfers died at 90 % loading.
 - `xnu12377-gpu-census.diff` - list every GPU pool holder when an allocation is refused.
 
 The other `xnu12377-*.diff` files are earlier iOS 27 fixes (PAC emulation, data-protection emulation in VFS,
