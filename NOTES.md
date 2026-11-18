@@ -1,3 +1,275 @@
+# Camera (Phase 1: Camera.app UI with a synthetic camera) - start (Claude, 2026-11-17)
+- Reference: wardevsa/ios-a5xelte (herolte; Galaxy S7, iOS 16) gpu/camera (from the Note FE / S9 ports, MIT HakiOS):
+  their camera_device.c is a CoreMedia derived object FigCaptureDevice with two FigCaptureStreams (iOS 16.5 class
+  tables: device RequestStreams/RelinquishStreams, stream Start/Stop/AddAttachments; frames through the stream's
+  VideoOutputHandlers), given to +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor] by a hook in mediaserverd;
+  MobileGestalt still-camera / front-facing-camera / rear-facing-camera set true; Portrait prewarm stubbed.
+- iOS 27.2: BWFigCaptureDeviceVendor +sharedCaptureDeviceVendorWithDefaultDeviceCreateFunction:,
+  -initWithDefaultDeviceCreateFunction:cmioExtensionDeviceCreateFunction:cmioDiscoverySession:;
+  FigCaptureGetCaptureDeviceCreateFunction (CMCapture 0x1b09d10c4) dlopens /System/Library/MediaCapture/
+  {H16,H13,H10,H9,H6,}ISP.mediacapture and takes ISPCaptureDeviceCreate. On the phone /System/Library/MediaCapture/
+  is EMPTY: no camera device at all -> plan: our own bundle there exporting ISPCaptureDeviceCreate (no injection).
+- cameracaptured crashes at every start (outputs/cameracaptured-2026-11-17-*.ips): FigCapturePreloadShaders ->
+  PrewarmThreadSafeSBPs -> SDOFRenderingV5 -> CCPortrait: "-[NBFunctionConstant required]: unrecognized selector".
+  FIX (UniXNU, SOURCE, NOT BUILT): research/ios27.2/adrenometal-fnconst-required.diff (also xnu/ios27/; backup
+  kernel-backup/NativeBridgeMetalFrontend.mm.before-fnconst): NBFunctionConstant has -required (Apple's getter) and
+  -isRequired. CODEX: rebuild and install NativeAdrenoMetal from work/UniXNU with it.
+- (Claude) The fnconst fix is built and installed (Codex); cameracaptured no longer crashes. Camera then opens the UI for a
+  minute and is SIGKILLed by RunningBoard: "Capture Application Requirements Unmet: Camera not actively used" (no device).
+- 27.2's selection, found: FigCaptureGetCaptureDeviceCreateFunction uses a table (CMCapture __DATA 0x1ee768998, triples
+  {IOService class, bundle path, symbol}): AppleCamera -> /System/Library/MediaCapture/ISP.mediacapture ->
+  ISPCaptureDeviceCreate; AppleH16CamIn -> H16ISP.mediacapture -> H16ISPCaptureDeviceCreate; H13/H10/H9/H6 likewise.
+  A dispatch_once registers IOService matching notifications for each (fcc_cameraDriverServiceMatchingCallback, "only one
+  camera driver service should..."); with none matched the create function is NULL. (H13ISP.mediacapture is even in the
+  shared cache: never publish AppleH13CamIn.) The bundle is a flat Mach-O at that path, dlopen(path, RTLD_LOCAL).
+  Called as create(kCFAllocatorDefault, options, &device) from -[BWFigCaptureDeviceVendor _createDevice:...].
+- 27.2's ABI (CMCapture's own CMIOExtensionFigCapture{Device,Stream}, local symbols from dsc .symbols, ~/scr/locsym.py):
+  base class unchanged {1, storage, equal, invalidate, finalize, debugdesc, copy_property, set_property, ...};
+  device class {1, NULL, RequestControlOfStreams, RelinquishControlOfStreams}; stream class {3, Start, Stop,
+  AddAttachmentsToSampleBuffer, EnqueueReactionEffect}. FigCapture{Device,Stream}GetClassID are exported from
+  CMCaptureDevice.framework; the metadata/port keys from CMCaptureCore.
+- D73/AVCaptureSession.plist (extracted to research/ios27.2/extras/cmcapture/): Back Photo 4224x3024 (60), Video-30
+  4224x2640; Front Photo 4032x3024, Video-30 4032x2528.
+- BUILT AS SOURCE: kernel xnu/ios27/xnu12377-camera.diff (SweetCamera.cpp: IOService "AppleCamera" on IOResources, no user
+  client, boot-arg sweetcamera=0 to leave out; files.arm64 + KernelConfigTables personality; applied to work/xnu-12377).
+  CODEX: build the kernel with it. Userland: userland/camera/ (HakiOS camera_device.c + camera_isp.c, "Note SWEET"
+  changes: 27.2 class versions, D73 formats, os_log, ISPCaptureDeviceCreate export; synth_camera.c gives RAW10 1600x1200
+  30 fps test frames - bars at the back, chequer at the front, a moving square - through the HakiOS ISP).
+  Build: sh userland/camera/build.sh -> userland/out/ISP.mediacapture. Not yet ported from HakiOS inject.c (needs
+  injection, none here): stabilization off, portrait prewarm stub, audio source 'nope' swallow - watch for those.
+- TEST 1 (camera-rebuild kernel + bundle, outputs/all.log): AppleCamera is in the registry; cameracaptured loads
+  ISP.mediacapture, the vendor makes our device (BWFigCaptureDevice with FigCaptureStreamRef Back and Front) - the 27.2 ABI
+  works. Bundle log: only via the full unified log (oslog -t N, no process filter; the sweetcam.log file is refused by the
+  sandbox). cameracaptured then crash-loops every ~6 s (no .ips: the 25-report limit is reached): SIGTRAP in CoreImage
+  CIKernelReflection::consolidate (brk: the first reflection's per-argument array is longer than the second's), from
+  +[CIKernel kernelWithString:fromMetalLibraryData:] in a dispatch_once of a filter outside the shared cache, under
+  -[CIImage imageByApplyingFilter:]. Each restart takes ~257 MB of GPU pool -> the screen glitches (bundle out: fine).
+  Also seen, not fatal: NRFV3 SoftISP compute pipeline refused (threadgroup memory 33408 > 32768); binary archives refused;
+  VideoDeghosting/ColourConstancy setup fail; StyleEngine "Unable to create a metal texture cache".
+  NEXT: which CI kernel, and which reflection NativeAdrenoMetal gives short (likely MTLFunction/pipeline argument reflection).
+- FOUND: CIKernelReflection::reflect(CIKernelLibrary*, name) takes [CIKernelLibrary functionWithName:] (= our MTLLibrary's
+  newFunctionWithName:, an NBFunction) and asks it -returnType.dataType, -functionType (5 = visible/stitchable), -arguments
+  (each: -type, -dataTypeDescription.dataType, -typeName compared with coreimage::sampler/Sampler/sampler_h/Sampler_h and
+  coreimage::{,priv::,group::}{d,D}estination{,_h}, -name, struct -members). NBFunction answers none of them (NBObject's
+  forwardInvocation answers nil/0) -> 0 arguments -> consolidate's bounds check traps against the string's N.
+  [MTLLibrary reflectionForFunctionWithName:] (asked via respondsToSelector:) is not implemented either.
+  Proper fix (later, UniXNU): NBFunction -returnType/-arguments for CI kernel functions from the AIR (metal2vulkan-air's
+  abi/visible.rs and abi/core_image.rs already parse air.arg_type_name/air.arg_name); Apple's exact -type values still to learn.
+- WORKAROUND NOW (userland/camera/capture_hooks.c, in the bundle; built by build.sh): the bundle's constructor in
+  cameracaptured makes HakiOS's inject.c replacements itself (no injection needed): +[BWCoreImageFilterRenderer
+  prewarmPortraitFilterVersion:semanticStyleFilters:] skipped, stabilization method/type 0, BWAudioSourceNode start: 'nope'
+  swallowed + _generateSamples skipped, emitSampleBuffer: NULL dropped, BWGNRNode pass-through, BWMultiFilterThumbnailNode
+  unprepared, qualityPrioritization <= 1. All 9 exist in 27.2 (dsc local symbols).
+- TEST 2 (hooks): cameracaptured stays up; our device is made; the session runs but "containsVideoSource: 0":
+  FigCaptureSourceManager "CaptureSource Back Camera is missing formats (1080p30, ..., 352x288)" (every one), FigCaptureSource
+  assert "defaultActiveFormat != NULL". 27.2 resolves each plist device format's CaptureStreamFormat name through
+  csu_resolveFormatIndexForNamedStreamFormat (CMCapture 0x1b0986934): the named FigCaptureStreamFormats entry's SensorWidth,
+  SensorHeight, FESWidth/FESHeight, Binned, HDR, FES, MaxFrameRate, SIFREnabled, SIFRBinningFactor,
+  OptimizedForMidFrameSynchronization, SecureSigningFaceIDSupported against each stream format's SensorWidth/Height,
+  FrontEndScalerOutputWidth/Height, VideoIsBinned, SensorHDRMode, VideoMaxFrameRate, QuadraBinningFactor, SIFREnabled,
+  SIFRBinningFactor, OptimizedForMidFrameSynchronization, SensorSigningEnabled (Experimental ones skipped).
+  CHANGE: camera_device.c plist_formats(): the stream offers one format per named FigCaptureStreamFormats entry of its own
+  device in D73/AVCaptureSession.plist (sorted by name), values copied (missing MaxFrameRate -> 30; FES formats' outputs at the
+  FES size). Fallback: the two built-in formats. Logs "formats: N name: ...".
+- TEST 3 (plist formats): no "missing formats"; the graph sets FormatIndex 11 (Video-FullSensor-FES-30) and the
+  VideoOutputHandlers, then every build fails -12780 (Graph start failed 3 times... loop): BWFigCaptureStream "failed to copy
+  ModuleInfo (-12787)", FigCaptureCameraParameters "portType && sensorIDString", BWFigVideoCaptureDevice "sensorIDDictionary",
+  FigMotionGetCameraCharacterizationData "sensorIDDict && moduleInfo" -> BWMultiStreamCameraSourceNode.m:1781.
+  ModuleInfo keys (CMCapture): sensorID (-> sensorIDString "0x%04x", +[FigCaptureCameraParameters
+  sensorIDStringFromModuleInfo:]), ModuleFocusID, ModuleLensID, ModuleActuatorID. D73/CameraSetup.plist DefaultSensorIDs:
+  Back 0x0803, Front 0x0714 (Super-wide 0x0633, Tele 0x0713); their FocalLengthCharacterization is LensID 0, ActuatorID 0.
+  CHANGE: stream property ModuleInfo {sensorID 0x803/0x714, lens/actuator/focus 0, scheme 1}. The bundle's log file
+  /var/tmp/sweetcam.log works (the camera daemon can write it).
+- TEST 4 (ModuleInfo): the -12780 is gone; now every build fails -12783 at FigMotionProcessingUtilities.c:1893
+  "lensIDcf && actuatorIDcf && integratorIDcf" (GetFocalLengthParametersFromArrayUsingModuleInfo): ModuleInfo also needs
+  ModuleIntegratorID (keys there: ModuleLensID, ModuleActuatorID, ModuleIntegratorID; nearby: ModuleSerialNumberString,
+  SensorCenterOffset, SensorSigningConfiguration). CHANGE: + ModuleIntegratorID 0, ModuleSerialNumberString.
+  Not fatal, seen: companion formats unresolved (ActionCamera/Depth/FullBinSIFR), 10-bit device formats missing
+  (pixelFormatIsSupported: x420/x422 not offered), no Tele/SuperWide/IR streams (those devices disabled),
+  WhiteBalanceGain not answered, no sync group, ANE/ImagingNetworks absent.
+- TEST 5: -12783 at FigMotionProcessingUtilities.c:1860 in GetFocalLengthParametersFromArrayUsingModuleLensID (wants a
+  number LensID + LensCoefficient). FigMotionGetCameraCharacterizationData (0x1b063e034) uses the ModuleInfo variant
+  (LensID/ActuatorID arrays, LensCoefficients - D73's format) only if ModuleFocusID != 0 and ModuleActuatorID != 0; each
+  variant is retried with NULL module info when the IDs match nothing. CHANGE: ModuleFocusID 1, ModuleActuatorID 1.
+- TEST 6: characterization passes; now -12780 from -[BWMultiStreamCameraSourceNode _updateOutputRequirements] (called by
+  -configure:, BWMultiStreamCameraSourceNode.m:1781). It fails when an enabled output (configuration
+  BWMultiStreamCameraSourceNodeConfiguration: sensorRawStillImageOutputEnabled, sensorRawOutputEnabled, depth, keypoint,
+  semantic masks, ...) has no stream output ID (ivars _stillImageSensorRawStreamOutputID, _sensorRawStreamOutputID,
+  _hueMapStreamOutputID, ...) or the active formats' SupportedOutputs lack it. Output IDs: kFigCaptureStreamVideoOutputID_*
+  (CMCaptureCore: PrimaryScaler, SecondaryScaler, StillImage, StillImageRaw, Raw, Depth, HueMap, Metadata, ...).
+  CHANGE (capture_hooks.c): sensorRawStillImageOutputEnabled, sensorRawOutputEnabled, depthOutputEnabled answer NO; the
+  method is wrapped to log, on failure, the configuration's enabled outputs and the node's output-ID ivars.
+- TEST 7: the three configuration hooks work (answered NO); _updateOutputRequirements is objc_direct (no runtime entry,
+  wrapper not installed). The build now fails earlier: FigCaptureSession.m:10761 "sensorRawPixelFormat != 0" in
+  _cs_stillImagePhotonicEngineSinkPipelineConfiguration (-> 11090 -> 16101, -12780); -[BWFigVideoCaptureDevice
+  sensorRawPixelFormat] reads the stream's SensorRawOutputBufferPoolRequirements (-12787: not answered) and its
+  PixelFormatType. Also seen: "sceneClassifierInferenceNode" assert (no ANE), BWFigVideoCaptureDevice.m:8582 -12787.
+  CHANGE: hook sensorRawPixelFormat -> 'rgg4'.
+- TEST 8: the graph builds through the photonic-engine still sink and the movie-file sink; fails in the preview sink:
+  BWNodeConnection "Passthrough outputs ... non-nil format ... BWInferenceNode:Segmentation Node + Optical Flow" ->
+  BWGraph.m:1395, err -16401. The segmentation node comes from -[FigCapturePreviewSinkPipeline _appendFilteredPreviewPipeline:]
+  for Photographic Styles (videoPreviewSinkConfiguration.semanticStyleRenderingEnabled / semanticStyle / filters).
+  CHANGE: semanticStyleRenderingEnabled NO (FigCaptureVideoPreviewSinkConfiguration, FigCaptureIrisSinkConfiguration,
+  FigCapturePhotonicEngineSinkPipelineConfiguration) and smartStyleRenderingEnabled NO (session, parsed, photonic, movie).
+- TEST 9: THE GRAPH BUILDS (0 "building graph" errors); the graph sets MaximumAllowedFrameRate, Min/MaxFrameRate 15/30,
+  AEMaxGain, ColorSpace 0, VideoOutputConfigurations, then starting fails -12780 at
+  -[BWMultiStreamCameraSourceNode _verifyColorSpacePropertiesForAllOutputs] (BWMultiStreamCameraSourceNode.m:15630 ->
+  _bringStreamUpToDate 4392 -> 7481 -> FigCaptureCameraSourcePipeline 1532 -> FigCaptureSession 13341): it reads the
+  stream's VideoOutputsColorInfo and, per enabled output ID, compares the entry with pixelBufferAttachmentsForColorSpace-
+  Properties: (or its CVImageBufferYCbCrMatrix / ColorPrimaries / TransferFunction / LogTransferFunction). We answered {}.
+  CHANGE: until the graph sets it, VideoOutputsColorInfo = { each output: BT.709 primaries/transfer/matrix }.
+- TEST 10: same failure. -[... _verifyColorSpacePropertiesForOutputID:matchVideoOutputsColorInfo:] (0x1b065c440, objc_direct
+  like _verifyColorSpacePropertiesForAllOutputs and _updateOutputRequirements: not swizzlable) returns 0 at once for colour
+  space 0; else the entry must isEqualToDictionary: +[BWVideoFormat pixelBufferAttachmentsForColorSpaceProperties:cs]
+  (cs 12 alone also accepts matching YCbCrMatrix/ColorPrimaries/TransferFunction/LogTransferFunction). So the Camera
+  app's outputs are not sRGB (the 14 Pro's wide colour, P3 = 1 presumably). CHANGE: entries = that method's answer for 1.
+- TEST 11: *** FRAMES FLOW *** The session starts: "the graph starts the stream (format 11)", "frames begin", synth
+  1600x1200 -> PrimaryScaler 1584x1188 / 1660x1188 420f and SecondaryScaler 1104x828 420f pictures given (sane Y/UV values),
+  "Displayed Frames: total 5". Camera shows GREEN. About 1 s later the session stops: "graph finished starting with error
+  -10868" (the deferred BWAudioSourceNode start; -10868 = kAudioUnitErr_FormatNotSupported) -> FigCaptureSessionStateManager
+  stops the session -> restart loop. Per-frame, not fatal: "cfISPMotionData" (FigMotionProcessingUtilities.c:355, no ISP
+  motion metadata), BWExposureAnalyticsMonitor "targetFNumber != 0", FigIrisAutoTrimmer "ispMotionData"; SoftISP (NRFV3)
+  compute pipeline refused (threadgroup memory 33408 > 32768) -> photonic engine "all processing will fail" (photos).
+  CHANGE: the audio start hook swallows any error (not only 'nope').
+- TEST 12: session stable (1 "frames begin" in 40 s, 30 fps, given 840/405), "Displayed Frames" sink gets frames; screen
+  still GREEN. Suspect the preview's VTPixelTransfer/rotation (Preview Scaler node): if it goes to our kernel CPU
+  AppleM2ScalerCSCDriver it is refused (420f->420f unsupported: BGRA/RGBA destinations only, rects must be zero) and the
+  destination stays zero = green. But CMCapture logged "TransferImage returned error code 0", and dmesg had no SWEET SCALER
+  lines (only the first 32 requests per boot are logged; the FB stats flood dmesg). DIAGNOSTIC: capture_hooks.c wraps
+  -[BWImageQueueSinkNode renderSampleBuffer:forInput:] and logs every 30th buffer's format, size, IOSurface ID and middle bytes.
+- After a reboot cameracaptured crash-loops again in CIKernelReflection::consolidate (same pc, CoreImage +0x18c1a4), BEFORE
+  our bundle is loaded (no sweetcam.log): FigCapturePreloadShadersInternal (CMCapture 0x1b0928fc8) prewarms the video effects
+  the model's plist enables (AVCaptureDeviceCommonSettings: BackgroundBlurSupported, StudioLightingSupported,
+  ReactionEffectsSupported, BackgroundReplacementSupported, SWFRVersion, Smart/TextureStyleRenderingVersion; per format
+  stillImageNoiseReductionAndFusionScheme, StillImageDepthDataType) at the daemon's start; the bundle (and its hooks) only
+  loads when the device vendor makes the device. Earlier runs survived only because those kernels were already in the
+  shader cache. FIX NOW: on the phone, D73/AVCaptureSession.plist with those four ...Supported = NO (backup
+  /var/root/AVCaptureSession.plist.orig). Proper fix later: NBFunction -arguments/-returnType for CI kernels (NativeAdrenoMetal).
+- TEST 13 (plist edited, rebooted): cameracaptured survives the boot (pid 68). Preview queue buffers: 420f 828x1792, IOSurfaces
+  390/396/397/400, middle bytes ALL ZERO in Y and UV -> confirmed: the graph's scale+rotate (Preview Scaler, VTPixelTransfer/
+  Rotation -> AppleM2ScalerCSCDriver CPU stand-in, which refuses 420f->420f) leaves the buffer empty = green.
+  WORKAROUND (userland): camera_device.c keeps the newest PrimaryScaler picture (sweet_camera_latest_picture); capture_hooks.c
+  preview_fill() draws each preview-queue buffer from it before -[BWImageQueueSinkNode renderSampleBuffer:forInput:]: quarter
+  turn clockwise, front mirrored, centre crop to the buffer's aspect, nearest neighbour. Proper fix (kernel, Codex): the
+  SweetM2Scaler stand-in should do 420f/420v -> 420f/420v with scaling and rotation (request rect/rotation fields to decode).
+- *** RESULT (user, 2026-11-17 07:40): CAMERA.APP SHOWS THE LIVE TEST PATTERN *** back: the colour bars (cropped to the middle:
+  blue/green/magenta/red stripes) with the moving white square; front: the grey/colour chequer with the square. Taking a photo
+  does NOT work yet (expected: the photonic engine's SoftISP pipeline is refused by our Metal - threadgroup memory 33408 >
+  32768 - "all processing will fail", and the sensor RAW format is faked). Open: photos; the kernel 2D scaler (420f->420f
+  scale+rotate) to replace preview_fill; NBFunction CI reflection (then the plist effects can go back on); real sensors.
+- PHOTOS, TEST 14: plist softISPSupported = NO too (phone copy; Mac copy outputs/AVCaptureSession-d73.plist; previous
+  /var/root/AVCaptureSession-d73.plist.prev, original /var/root/AVCaptureSession.plist.orig). The graph now enables the
+  StillImage output (VideoOutputsEnabled StillImage = 1). The shutter: Camera "commitMomentCapture as Photo ... HEIC HDR:2
+  quality:3"; cameracaptured reaches BWNRFProcessorController (processing type 1) in the photonic engine, then dies:
+  NSInvalidArgumentException "-[CMMTLDevice newBufferWithIOSurface:]: unrecognized selector" -> Camera gets -11819 and
+  the session recovers. CHANGE (capture_hooks.c): -newBufferWithIOSurface: added at load to the system Metal device's class
+  (no-copy buffer over the surface's pages, surface retained by the deallocator). Belongs in NativeAdrenoMetal later.
+  Also: metadata "originalWidth" / aspectRatioEnforcedFullRect asserts in FigCaptureMetadataUtilities (our frame metadata
+  lacks original dimensions) - watch.
+- TEST 15: newBufferWithIOSurface: added and used (surface 594, 6.3 MB, made); no crash; "the photograph is given" (our
+  StillImage output delivers). The capture then times out (5 s, -16800) and Camera gets -11800: BWNRFProcessorController
+  can't set up UBProcessorV3 (processing type 1, 2352x1776): STFLinearAlgebra "workSpaceLengthFloat > 0" (-73465, an MPS
+  linear-algebra workspace of 0 on our Metal) -> "Failed to setup private FigMetalAllocator" -> ToneMapping/DenoiseFuse fail.
+  Also VTVideoEncoderSelection -12908 / VTTileCompressionSession -12782: no HEVC encoder for HEIC. NEXT TRY: plist
+  stillImageNoiseReductionAndFusionScheme 5 -> 0 for Back (AVCaptureDevices.0) and Front (AVCaptureDevices.6), and Camera's
+  format Most Compatible (JPEG).
+- TEST 16: stillImageNoiseReductionAndFusionScheme 0 -> cameracaptured crash-loops at session build: NSGenericException
+  "Can't add a nil node" (-[BWGraph addNode:error:] from -[FigCapturePipeline addNode:error:]). REVERT to 5
+  (/var/root/AVCaptureSession-d73.plist.prev; Mac copy outputs/AVCaptureSession-d73-before-nrf.plist).
+  The NRF failure itself: -[STFLinearAlgebra _allocateMemory:commandBuffer:] (STF framework, 0x2c6429d70) asks
+  optimized_getrf<float> (0x2c6433618; a LAPACK-style workspace query: a=NULL, ipiv=NULL, work=&s, lwork, info) for the
+  workspace and gets 0.0 -> "workSpaceLengthFloat > 0". optimized_getrf takes a multithreaded path when [threadpool+32] >= 2
+  and min(m,n) >= 32 (0x2c642d9e8), else 0x2c64c4ee8, else lapack::reference::sgetrf. Which path fills the workspace on
+  Apple hardware and not here is still to find (CPU count / threadpool config is the suspect).
+  FOUND: STF's optimized_getrf<float> (0x2c6433618) answers the workspace query only on its SME path (commpage
+  cpu_capabilities kHasFeatSME2, min(m,n) >= 32) or its AMX path (optimized_getrf_amx, AMX version = caps bits 27-30);
+  with neither (Kryo) it falls to lapack::reference::sgetrf (0x2c64c7a40), which takes no workspace and never writes
+  the size, so 0.0 comes back and "workSpaceLengthFloat > 0" fails (-73465). Every Apple CPU has AMX or SME, so the
+  fallback is never seen there. TEST 17 (capture_hooks.c patch_stf_workspace): in cameracaptured only, the size load
+  `ldr s0,[sp,#12]` (0xbd400fe0) at STF 0x2c6429e68 (/System/Library/VideoProcessors/STF.bundle/STF +0x4e68; 24B119, + shared cache slide) becomes `fmov s0,#1.0` (0x1e2e1000)
+  via vm_protect VM_PROT_COPY, checked against the expected word first. The factorization itself then runs on the
+  reference path, which needs no workspace.
+  (First try matched "/STF.framework/": STF is /System/Library/VideoProcessors/STF.bundle/STF, so it never ran; fixed.)
+  With it in, the patch applied, then cameracaptured aborted (sig 6): -[BWStreamingFilterNode changeToSemanticStyle:animated:]
+  (from captureSession_updateGraphForVideoPreviewSinkConfigurationChanges) threw "%@ is not configured for semantic style
+  rendering" (the styles are answered off). TEST 18: that method made a no-op in capture_hooks.c. Also: the still output
+  asks for 2352x1764 pf20 (10-bit packed, full range) buffers, which deliver() refuses; it now logs their planes, rows and
+  CoreVideo format description so the writer can be done.
+  The patched site turned out to be "sgetrfWorkSpaceLength > 0" (_allocateMemory, line 216), which then passed; the photo
+  still failed on "workSpaceLengthFloat > 0" (line 115), the same query in +[STFLinearAlgebra prewarm:nWeights:nPoly:]
+  +0x1b4 (0x2c642a6b4, ldr s0,[sp,#48] 0xbd4033e0). TEST 17b: both sites patched.
+  TEST 19: pf20 measured on the phone: 2 planes, 2352 samples a row in 3136 bytes (3 x 10 bits to 32), plane 0 at +512,
+  BitsPerComponent 10, FullRange. deliver() now renders the still to an 8-bit NV12 scratch and packs it (pack_pf20_row,
+  samples low bits first; the order is assumed, so a swapped picture is the first thing to check).
+  RESULT (17b+19): NRF now sets up ("Processor set up for processing type '1' ... pf20"); the still is drawn (88 ms) and
+  given. It then waits: the capture is type 10 (UB, Unified Bracketing) and NRF wants 5 frames ("nrfp_addFrame: Skipped
+  adding frame number 1 of 5"); one comes per StillImageCaptureNow. SoftISP still fails in NRFV3's pipeline (H13FastBayerProc
+  shaders, -73705) even with softISPSupported NO. Also a first-open abort (FigCapturePreviewSinkPipeline "metalDevice" nil
+  -> "Output can't be nil"); cameracaptured relaunched and was fine.
+  TEST 20: StillImageCaptureNow's value is logged whole (say_value's 300-byte buffer gave nothing for long values; say's line
+  is 1600 now), and tools/camera-plist-single-frame.py turns DeepFusionSupported/HDRSupported off in every format, to get a
+  one-frame capture type.
+  RESULT 20: no change -- still capture type 10, NRF "frame 1 of 5". The still output is configured with
+  StillImage_TimeMachineEnabled 1, ring buffer 4, MaximumNumberOfBracketedSIFRFrames 1, and StillImageCaptureNow carries
+  BracketedCaptureOverrides (its log was cut off by AFWindowParams). TEST 21: StillImageCaptureNow logged in short, and as
+  many frames given as the longest BracketedCaptureOverrides array (one if none).
+  RESULT 21: StillImageCaptureNow = {UnifiedBracketedCaptureParams=[4 x {Type 0, ToneCurve 3, ExposureType 0,
+  MainExposureBias 0, ...}], PreBracketFrameCaptureParams={ToneCurve 0, HighlightRecoveryEnabled yes, ...},
+  AutoFocusTimeout 0, BracketedCaptureOverrides={AFWindowParams}}: 1 pre-bracket frame + 4 = the 5 NRF waits for.
+  TEST 22: that many frames given.
+  RESULT 22: 5 frames given and received; NRF skipped all five, then "_cntBracketSampleBuffers > 0" (-12782), and its
+  single-image fallback failed on GreenGhostV3 "TotalSensorCropRect" missing -> Camera error -11800 (the first full
+  round trip to didFinishProcessingPhoto). Why skipped: -[BWUBNRFProcessorRequest useFrameForMultiFrameProcessing:] drops
+  frames whose StillImageCaptureFrameFlags & 0x30 == 0x20; BWAddStillImageCaptureFrameMetadataToSampleBuffer sets them
+  from the stream metadata's BracketedCaptureSequenceNumber (missing -> 0 -> error-recovery frame, | 0x20) and
+  PreBracketingFrame. TEST 23: still frames carry BracketedCaptureSequenceNumber (0 for the pre-bracket frame, which has
+  PreBracketingFrame YES, then 1..4) and TotalSensorCropRect {0,0,w,h}.
+  RESULT 23: frames accepted ("Set reference frame index to 0", "Add frame for B1"), then UBProcessorV3 addFrameInternal
+  failed at UBProcessorV3.m:1676 (-1): -[UBProcessorV3 requestTuningParametersIfNeeded:cfp:] looks up two tuning dicts by
+  metadata[kFigCaptureStreamMetadata_SensorID] (an NSNumber; also reads PortType) and returns -1 if either is nil.
+  TEST 24: every frame's metadata carries SensorID (0x0803 back, 0x0714 front).
+  Same boot, two other crashes: cameracaptured killed by memorystatus at first open (per-process limit, 120 MB footprint,
+  "high band"), and the relaunched one aborted in NativeAdrenoMetal ("compute pipeline: NotImplemented(MadeBeforeRecovery)")
+  -- a pipeline made before the GPU recovery; plugin side.
+  RESULT 24: the tuning is found. UB (type 1) then fails "_nrfPlist->denoiseAndSharpening" (UBProcessorV3.m:1590; no
+  UB denoise tuning), and the single-image fallback (type 0) fails "inputLuma" (DenoiseFusePipelineV3.m:1552): the pf20
+  input is bound as +[LumaChromaImage getMetalLumaFormat:] 588 (an Apple packed 10-bit MTLPixelFormat; 'xf20' gives
+  576, '420f'/'420v' give 10 = R8Unorm), which NativeAdrenoMetal has not got. pf20 comes from the format's
+  UsesPacked10BitFirmwareStillImageOutputPixelFormat (-[FigCaptureSourceVideoFormat ...]).
+  TEST 25: tools/camera-plist-single-frame.py also turns that key off; deliver() also writes xf20/x420 (10 bits in 16).
+  RESULT 25: PHOTOS WORK. The still comes as 420f (2352x1764); UB fusion still fails (denoiseAndSharpening, then -73465 at
+  UBProcessorV3.m:1679), NRF's single-image path then succeeds, the photo encoder (JPEG, "Most Compatible") encodes it,
+  didFinishProcessingPhoto error=(null), 2246x1764, and Camera saves it.
+  Needs on the phone: the bundle (STF patch, 5 numbered frames with SensorID/TotalSensorCropRect, 420f still) and the
+  camera profile from tools/camera-plist-single-frame.py (UsesPacked10BitFirmwareStillImageOutputPixelFormat off; the
+  DeepFusion/HDR keys it also turns off made no difference and could go back on).
+
+# wland: nap when idle instead of polling every 1 ms (Claude, 2026-11-17)
+- wland's main loop (net -> link_poll(100)) ran rx_one + smp2p_service + radio_poll + ipnet_poll + bridge_poll +
+  join_poll and then usleep(1 ms), whatever happened: 10-13 % of a core all the time (ptop), several /dev/pmem and
+  non-blocking read syscalls per round.
+- CHANGE (source, userland/wland; diff research/ios27.2/wland-nap.diff, backups
+  research/ios27.2/kernel-backup/wland-before-nap/): global link_activity, bumped for a GLINK message (link.c rx_one),
+  CE RX completions (radio.c ce_poll) and CE TX (ce_send), kernel-bridge messages (bridge.c) and utun packets
+  (ipnet.c). The long idle loop (link_poll with ms >= 100) naps 1 ms while that moves, 2 ms after 20 ms without
+  activity, 4 ms after 100 ms (cap 4 ms: 32 RX buffers per CE ring). Short waits (sends, bring-up) stay at 1 ms.
+  WLAND_NAP=0 in the environment: always 1 ms. Replacing wland = reboot (the boot job runs "up 0" once per boot).
+  Expect wland ~3-5 % idle, unchanged throughput; the first packet after a quiet period up to ~4 ms later.
+
+# locationd boot spin: spinwatch watchdog (Claude, 2026-11-17)
+- locationd spins ~98 % of a core from every boot (libdispatch _dispatch_wait_for_enqueuer ->
+  _pthread_yield_to_enqueuer_4dispatch under LocationSupport, a dispatch_once path: a queue link that never appears);
+  a restarted locationd is fine. Root cause still open (not the LRCPC2 emulation; only the boot instance).
+- NEW userland/jb/spinwatch.c (sign with jb/tsample.plist): every 10 s checks the named processes' CPU
+  (proc_pidinfo); > 85 % of a core for 3 checks (30 s) -> SIGKILL (pid > 1, name re-checked), at most once per 5 min
+  per name; log /var/local/spinwatch.log. Boot job: tools/launchd-add-job.py ... spinwatch (com.sweet.spinwatch,
+  /var/local/bin/spinwatch locationd, Background). Installed (user): kills the boot locationd ~45 s after boot.
+  A restarted locationd CAN spin again (pid 367 in one boot). Bug fixed (source): the 5-min cooldown used time(),
+  and the wall clock jumps backwards at boot (sweettime, then network time), so "restarted less than 5 min ago"
+  held forever; now CLOCK_MONOTONIC.
+- wland nap measured (user): wland 12-13 % -> 7-8 % of a core at idle, Wi-Fi fine, ping 9-91 ms (avg 18).
+  Idle cpu0 66 %: assetsd 72 % (9,500 csw/s) and searchd 51 % (photo/Spotlight indexing after boot).
+
 # Hardware display scaling (QSEED3) instead of the GPU stretch blit; tu-cb=1 kept (Claude, 2026-11-17)
 - diag/tu-cb (outputs/gpu-diagB-run1.*, image B = diag=1 tu-cb=1; the run named diagA was B): Turnip renders
   21,895 passes in GMEM, 1 in sysmem (RM row) -> not a sysmem problem; ~10 render passes and 72 draws per frame,
