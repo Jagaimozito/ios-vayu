@@ -81,13 +81,19 @@ sudo python3 "$TOOLS/launchd-fips-noverify.py" "$R/sbin/launchd" /tmp/ios27-laun
 sudo sh -c 'cat /tmp/ios27-launchd.new > "$1"' _ "$R/sbin/launchd"	# keeps owner, mode, hard links
 sudo rm -f /tmp/ios27-launchd.new
 # launchd.plist: no FairPlay here; com.apple.fairplayd.H2 exits -42306 and KeepAlive restarts it forever.
+# 2026-11-19: com.apple.cameracaptured goes too: the synthetic camera kept restarting it (about 400 MB of GPU pool,
+# then a jetsam kill, every few seconds), which resprung SpringBoard when leaving a game. backboardd gets
+# MallocDeferredReclaim=1 MallocLargeCache=1: its frame buffers no longer go back to the kernel (madvise) every frame.
 sudo python3 - "$R/System/Library/xpc/launchd.plist" <<'PYEOF'
 import plistlib, sys
 p = sys.argv[1]
 d = plistlib.load(open(p, 'rb'))
-gone = [k for k, j in d['LaunchDaemons'].items() if j.get('Label') == 'com.apple.fairplayd.H2']
+gone = [k for k, j in d['LaunchDaemons'].items() if j.get('Label') in ('com.apple.fairplayd.H2', 'com.apple.cameracaptured')]
 for k in gone:
     del d['LaunchDaemons'][k]
+for j in d['LaunchDaemons'].values():
+    if j.get('Label') == 'com.apple.backboardd':
+        j.setdefault('EnvironmentVariables', {}).update(MallocDeferredReclaim='1', MallocLargeCache='1')
 data = plistlib.dumps(d, fmt=plistlib.FMT_BINARY)
 with open(p, 'r+b') as f:	# rewrite in place: owner and mode stay
     f.write(data)

@@ -94,6 +94,11 @@ GPU / Metal driver (`adrenometal-*.diff` are against `UniXNU/drivers/AdrenoMetal
 - `adrenometal-dump-cb.diff` - boot-arg `dump-cb=NAME:FIRST[:COUNT]`: `NATIVE_METAL_DUMP_CB` for the processes whose
   name starts with NAME, their stderr into `/private/var/tmp/NativeAdrenoMetal.trace/dump-NAME-PID.log` (passes,
   draws, bindings and a brightness grid of each attachment read back after the command buffer).
+- `adrenometal-roomstall.diff` (paths from the work tree, `UniXNU/...`) - bridge patch 0042 and its line in
+  `scripts/build-adreno-metal-bridge.py`: metal2vulkan's `wait_for_room` waits at most 50 ms at a time; with no progress
+  it hands its slot to the lowering thread again, and after 3 such waits lowers on its own thread
+  (`ROOM_STALLS` counts them). Candy Crush froze 5-10 s with its main thread in `wait_for_room` and the lowering
+  thread parked: a lost hand-off. Built in source only; not yet confirmed on the phone.
 
 Boot-args: `thid_should_crash=0` (an existing xnu tunable) lets apps set non-identity-protected exception ports.
 Apps run as platform binaries on this port, so the iOS 18+ rule for platform tasks killed any app whose crash

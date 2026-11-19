@@ -1243,7 +1243,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ iokit/Kernel/arm/SweetABP.cpp
-@@ -0,0 +1,1410 @@
+@@ -0,0 +1,1468 @@
 +/*
 + * ios-sweet iOS 27 (cell1): redfin's AppleBasebandPCI stand-in (DenialOfGravity/ios-redfin xnu patches 1061, 1063 and
 + * 1064, with 1194's prepare()/complete()) ported to xnu-12377 for the iOS 27.2 D73 (iPhone 14 Pro) userland:
@@ -2208,11 +2208,66 @@
 + * its CPMSSupported / CPMSThermalOnlyDevice numbers; without it "Could not find PPM service", "CPMS not supported on
 + * current platform", and ABM asserts (fCPMSAgent) right after its fake boot (CommCenter sig 5, every restart).
 + */
++/*
++ * cell5 (2026-11-19, Claude): CPMSSupported for CommCenter only. CPMS.framework has one global switch, this
++ * property, and audiomxd follows it too: with CPMSSupported 1 its haptics ask CPMS for power budgets
++ * (initializeCPMSForHaptics), which this stand-in cannot grant, so its haptic power manager is never made and the
++ * first system haptic aborts audiomxd (ServerManager.mm:1162 "mPowerManager != nullptr"; every audiomxd crash report
++ * is from after cell2). The dead audiomxd then left Settings waiting forever on com.apple.coremedia.routingcontext.xpc
++ * (HeadphoneSettings -> FigRoutingContextRemoteCopySystemAudioContext). Every other process now reads 0, as
++ * before cell2 (no ApplePPM = "CPMS not supported"); CommCenter (ABM's fCPMSAgent) still reads the stored 1.
++ */
++static OSNumber *ppm_zero;
++
++static bool
++ppm_caller_gets_cpms(void)
++{
++	char n[32] = "";
++	proc_selfname(n, (int)sizeof(n));
++	return strcmp(n, "CommCenter") == 0;
++}
++
 +class ApplePPM : public IOService
 +{
 +	OSDeclareDefaultStructors(ApplePPM);
++public:
++	OSObject *getProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
++	OSPtr<OSDictionary> dictionaryWithProperties(void) const APPLE_KEXT_OVERRIDE;
++	bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;
 +};
 +OSDefineMetaClassAndStructors(ApplePPM, IOService);
++
++/* every getProperty/copyProperty form (const char *, OSString, OSSymbol) ends here */
++OSObject *
++ApplePPM::getProperty(const OSSymbol *aKey) const
++{
++	if (ppm_zero && aKey && aKey->isEqualTo("CPMSSupported") && !ppm_caller_gets_cpms()) {
++		return ppm_zero;
++	}
++	return IOService::getProperty(aKey);
++}
++
++OSPtr<OSDictionary>
++ApplePPM::dictionaryWithProperties(void) const
++{
++	OSPtr<OSDictionary> d = IOService::dictionaryWithProperties();
++	if (d && ppm_zero && !ppm_caller_gets_cpms()) {
++		d->setObject("CPMSSupported", ppm_zero);
++	}
++	return d;
++}
++
++bool
++ApplePPM::serializeProperties(OSSerialize *s) const
++{
++	if (!ppm_zero || ppm_caller_gets_cpms()) {
++		return IOService::serializeProperties(s);
++	}
++	OSPtr<OSDictionary> d = dictionaryWithProperties();
++	bool ok = d && d->serialize(s);
++	OSSafeReleaseNULL(d);
++	return ok;
++}
 +
 +class SweetABPStubUserClient : public IOUserClient
 +{
@@ -2397,7 +2452,10 @@
 +		OSSafeReleaseNULL(ppm);
 +	}
 +	if (ppm) {
-+		ppm->setProperty("CPMSSupported", 1ULL, 32);
++		if (ppm_zero == NULL) {
++			ppm_zero = OSNumber::withNumber(0ULL, 32);
++		}
++		ppm->setProperty("CPMSSupported", 1ULL, 32);     /* cell5: only CommCenter sees it (ApplePPM::getProperty) */
 +		ppm->setProperty("CPMSThermalOnlyDevice", 0ULL, 32);
 +	}
 +	abp_publish(ppm, platform, NULL, "ApplePPMUserClient");

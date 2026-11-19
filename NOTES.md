@@ -1,3 +1,31 @@
+# Metal / UI performance work (2026-11-19, Claude)
+- UI scrolling runs at 37-39 fps on the 88 Hz panel (SWEET FB 5 s lines, measured after 8+ min uptime; earlier is
+  shader priming). GPU time is about 16-17 ms a frame, so the CPU side is not the limit; games feel fine.
+- backboardd: libmalloc returned its large frame allocations to the kernel (madvise) every frame. Environment
+  MallocDeferredReclaim=1 MallocLargeCache=1 on its launchd job stops that and lowers the lowering worker's CPU;
+  fps unchanged. tools/launchd-env.py sets job environments in a copy of launchd.plist.
+- Respring when leaving a game: com.apple.cameracaptured was restarted every few seconds by the synthetic camera
+  (about 400 MB of GPU pool, then a jetsam kill), and the memory pressure took SpringBoard down. Dropping the job
+  (tools/launchd-disable.py, reversible with --restore) fixed it; the camera app still works.
+  tools/mkios27root-mac.sh now applies both launchd changes when it builds a root.
+- In-game freeze of 5-10 s (Candy Crush): main thread in metal2vulkan wait_for_room, lowering thread parked with
+  work handed to it: a lost hand-off. Bridge patch 0042 (xnu/ios27/adrenometal-roomstall.diff) recovers it.
+  Not built or tested on the phone yet.
+
+# Cellular test image cell5-diag (2026-11-19)
+- Reused the cell5 kernel and `work/guacamole-ios27a-yuv.adt`; only the iOS 27 boot arguments changed. Added `diag=1`, refreshed `sweettime=1795099536`, and removed `ufslogsecs=1` to keep the command line at 596 characters (under the 607-character limit). All display, Wi-Fi, audio, passcode, `sweetabp=3`, `tu-cb=1`, and `sweetfb_scale=2` arguments remain.
+- Built `outputs/guacamole-ios27a-cell5-diag-triple.img`; its iOS 16 payload is byte-for-byte preserved from cell5-triple and the iOS 27 payload replaces only the prior iOS 27 payload. Boot args: `outputs/guacamole-ios27a-cell5-diag-triple-boot-args.txt`. SHA-256: `2e4fd322a16b5fd2daf36aafd98119bc70046f7f9f983d9dd31e8dba6492fa31`.
+- Not flashed. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-cell5-diag-triple.img`.
+
+# Cellular test image cell5 (2026-11-19)
+- Rebuilt `work/xnu-12377` as `DEVELOPMENT_ARM64_SWEET` with the cell5 `iokit/Kernel/arm/SweetABP.cpp` change. `ApplePPM` overrides `getProperty(const OSSymbol *)`, `dictionaryWithProperties()` and `serializeProperties()` so every process except `CommCenter` reads `CPMSSupported=0`. Build succeeded with no source fixes; log: `xnu12377-cell5-build.log`.
+- Refreshed `xnu/ios27/xnu12377-cell1.diff` to include the current `SweetABP.cpp`; applying its added-file section reproduced the source byte-for-byte.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `33ec8df7c3c164591e9e579721b19fca6a2eec65f9abaeec5f662099c7ea9678`. ADT unchanged from cell4d: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`.
+- Boot args match cell4d with refreshed `sweettime=1795097874`; `sweetabp=3` remains. Length: 602 characters. Sidecars: `outputs/guacamole-ios27a-cell5-boot-args.txt` and `outputs/guacamole-ios27a-cell5-triple-boot-args.txt`.
+- Standalone image: `outputs/guacamole-ios27a-cell5.img`, SHA-256 `a25ce18e3310b37b8fc355d3c5dc2307b72759cf162c6137d86933d7bd82456a`.
+- Triple image: `outputs/guacamole-ios27a-cell5-triple.img`, SHA-256 `267b793f811693509aee2ea12f20962343c2224068e57328de6cd8d130d15e66`. Verified the iOS 16 payload and padding match cell4d-triple, the selector shim and DTB are unchanged, and only the iOS 27 payload changes at `0x103a000`. Selector shim `shim/out/Image` SHA-256: `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`.
+- Not flashed. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-cell5-triple.img`.
+
 # GPS through the modem + fake signal bars + reset-loop fix (2026-11-19, Claude): all confirmed on the phone
 - Reset loop (CommCenter 400 % CPU, Settings frozen, ~5 baseband resets a second; outputs/cc-spin1..3): after the
   first baseband "crash" of a boot ABM resets the modem (AppleBaseband sel 0 via libTelephonyBaseband's safe reset)
