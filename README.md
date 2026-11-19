@@ -2,6 +2,8 @@
 
 **Apple's iOS 16 running on a OnePlus 7 Pro.**
 
+RETIRED TO FOCUS ON IOS 27.2
+
 This branch ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the OnePlus 7 Pro
 (`guacamole`, Qualcomm SM8150 / Snapdragon 855, 8 GB, UFS 3.0, 1440×3120 AMOLED). On top of it runs the
 **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd,
