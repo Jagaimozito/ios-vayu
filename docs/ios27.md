@@ -9,6 +9,7 @@
 - **System apps:** the rebuilt root image places staged system apps in `/Applications`, avoiding the iOS installer's APFS-only staging path on this HFS+ root. Filza was installed separately and the user confirmed it opens.
 - **Brightness and Night Shift:** the user confirmed both the brightness slider and Night Shift work through `sweet-displayd` and the D73 backlight properties.
 - **Haptics, partially:** keyboard haptics and ringtone haptics work. The motor also buzzed during an actuator/init test.
+- **Passcode (2026-11-18):** setting and changing a 4-digit or alphanumeric passcode in Settings, and locking and unlocking with it, work (turning it off is untested) (`xnu/ios27/xnu12377-passcode.diff`, boot-arg `sweetpasscode=1`). The kernel emulates the Secure Enclave credential manager (ACM) and the keystore's passcode calls and stores only a PBKDF2 verifier (`/var/local/passcode.v1`); data is not encrypted with the passcode. Clear it with `sysctl kern.sweet_passcode_reset=1`. No biometrics.
 - **Network access, intermittently:** Wi-Fi can associate with an access point, and SSH has worked over the resulting network connection.
 
 ## Partial or unreliable

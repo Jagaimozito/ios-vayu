@@ -46,6 +46,23 @@ Display and responsiveness:
 - `xnu12377-big-first2.diff` - `osfmk/kern/processor.c` + `sweet_cpufreq.c`: prefer the big cores (cpu4-7).
 - `xnu12377-emul-atomic.diff` - `sleh.c`: emulated LRCPC2 loads/stores use single-copy-atomic user accesses.
 
+Passcode (confirmed on the phone 2026-11-18: set, change, lock and unlock; number pad for numeric codes):
+- `xnu12377-passcode.diff` - the whole passcode port, against the tree before it (one diff: `bsd/conf/files`,
+  `iokit/conf/files.arm64`, new `bsd/dev/sweet_passcode.c`, `iokit/Kernel/arm/SweetACM.cpp`,
+  `iokit/Kernel/arm/SweetACMGCM.h`, changed `iokit/Kernel/arm/SweetKeyStore.cpp`). From the redfin branch's iOS 16
+  patches 0910/1195-1197, then adapted to iOS 27.2:
+  - `sweet_passcode.c`: PBKDF2-HMAC-SHA256 verifier in `/var/local/passcode.v1` (never the passcode), backoff after
+    failures, lock state for AKS; sysctls `kern.sweet_passcode`, `kern.sweet_passcode_reset`,
+    `kern.sweet_passcode_state`; boot-arg `sweetpasscode=1`.
+  - `SweetACM.cpp` (AppleCredentialManager stand-in): the iOS 27 commands coreauthd, profiled and Preferences use
+    (context pools, SEPControl, external forms, ContextSetData/GetData with the size-only flag, VerifyPolicy).
+    Settings wraps the new passcode as key 7 with ACMEncryptDataEx mode 2: AES-256-GCM under
+    HKDF-SHA256(seed = key 13, salt = the context id, info "acm_transport"); the kernel unwraps it (tag checked)
+    for profiled and for the keystore. `SweetACMGCM.h`: AES-256-GCM (this kernel has no corecrypto AES).
+  - `SweetKeyStore.cpp`: change_secret with the iOS 27 16-byte ACM-context secrets and a temporary bag handle,
+    verify_password with the packed buffer passed by address, output descriptors prepare()d before writing (a
+    keybagd panic otherwise).
+
 Memory:
 - `xnu12377-ram5g-gpupool.diff` - `sweet_gpu.c`: the GPU pool moves to free ranges outside XNU's RAM, for
   5 GB of RAM for iOS (`tools/mkadt.py --ram5g`) with a ~2 GB GPU pool.

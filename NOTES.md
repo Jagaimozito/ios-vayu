@@ -1,3 +1,154 @@
+# Passcode test image 19 (2026-11-18)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel after `SweetKeyStore.cpp` and `bsd/dev/sweet_passcode.c` changed so AKS `verify_password` selector 42 accepts the iOS 27 by-address packed buffer. Build completed; log: `xnu12377-passcode19-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `d07197e1a03fa09539e87bf57c7823b247fe601c23fab4aa3224af54f85890d9`.
+- Same ADT as passcode18: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args match passcode18 except refreshed `sweettime=1795061779`; `sweetpasscode=1` is retained. Standalone sidecar: `outputs/guacamole-ios27a-passcode19-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode19.img`, SHA-256 `485bad71591cbb934ca7ca4d968ea0f205fd17e4b71252477a9a4273c424b97f`.
+- Triple wrapper: `outputs/guacamole-ios27a-passcode19-triple.img`, SHA-256 `1fb7ae1d477a73d6d68248d0b609bdac97b8ad83daf606a8afd8c2eb6188f513`. It preserves the iOS 16 payload+padding and selector shim from passcode18-triple and replaces only the iOS 27 payload at `0x103a000`. Verified payload and args; shim SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`. Triple sidecar: `outputs/guacamole-ios27a-passcode19-triple-boot-args.txt`.
+- Not flashed, per request.
+
+# Passcode test image 18 (2026-11-18)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel after the `SweetACM.cpp` change making `ContextGetData` honor the size-only flag. Build completed; log: `xnu12377-passcode18-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `cd37c0024cba29be592608f216d32967fb635111c4861179227f12fa196dce2e`.
+- Same ADT as passcode17: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args match passcode17 except refreshed `sweettime=1795061129`; `sweetpasscode=1` is retained. Standalone sidecar: `outputs/guacamole-ios27a-passcode18-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode18.img`, SHA-256 `51b5805c34e412dd391c2ce3eec1556f18cc6d61e03d00c51e24720c7527a113`.
+- Triple wrapper: `outputs/guacamole-ios27a-passcode18-triple.img`, SHA-256 `12e11f323eaadbbe9a2762809a416b60e9a85357e71ad1179d1f08eb9ab31464`. It preserves the iOS 16 payload+padding and selector shim from passcode17-triple and replaces only iOS 27 at `0x103a000`. Verified payload and args; shim SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`. Triple sidecar: `outputs/guacamole-ios27a-passcode18-triple-boot-args.txt`.
+- Not flashed. Fastboot command: `fastboot flash boot_b outputs/guacamole-ios27a-passcode18-triple.img`.
+
+# Passcode test image 17 (2026-11-18)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel after changes to `SweetACM.cpp`, `SweetACMGCM.h`, and `bsd/dev/sweet_passcode.c`: key 7 unwrap uses HKDF-SHA256 and AES-GCM tag verification. Build completed; log: `xnu12377-passcode17-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `fd282e71fab065ff4faac0c9e2d87a4ee233242de8fc0365b9e6f4eb95af7fda`.
+- Same ADT as passcode16: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args match passcode16 except refreshed `sweettime=1795060529`; `sweetpasscode=1` is retained. Standalone sidecar: `outputs/guacamole-ios27a-passcode17-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode17.img`, SHA-256 `e80ec2479fcf1d0c5d3ded2f406f63a9401df66fe8fc0c0f847a0d50dd711c4e`.
+- Triple wrapper: `outputs/guacamole-ios27a-passcode17-triple.img`, SHA-256 `3e4f2053bda762c4cd9043fef9ba7bccc930382eee7d2cc3fb30a97d5cb7768f`. It preserves the iOS 16 payload+padding and selector shim from passcode16-triple and replaces only iOS 27 at `0x103a000`. Verified payload and args; shim SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`. Triple sidecar: `outputs/guacamole-ios27a-passcode17-triple-boot-args.txt`.
+- Not flashed, per request.
+
+# Passcode test image 16 (2026-11-18)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel after the `SweetACM.cpp` change making ACM key 13 a single per-boot key shared by all contexts. Build completed; log: `xnu12377-passcode16-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `abdf85b2bd0ee6013feedf43f7bed4fc81dab7fb2fba5e5b666a8d4f362117ac`.
+- Same ADT as passcode15: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args match passcode15 except refreshed `sweettime=1795058989`; `sweetpasscode=1` is retained. Standalone sidecar: `outputs/guacamole-ios27a-passcode16-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode16.img`, SHA-256 `41ddf994e0a82b87bd6609ce808dffecdf9c7ab95242c983be380b66cd11bea9`.
+- Triple wrapper: `outputs/guacamole-ios27a-passcode16-triple.img`, SHA-256 `181fdef054420aa803d4877d5070631f9b9353aca16d3465feaf8880d6e0a2c7`. It preserves the iOS 16 payload+padding and selector shim from passcode15-triple and replaces only iOS 27 at `0x103a000`. Verified payload and args; shim SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`. Triple sidecar: `outputs/guacamole-ios27a-passcode16-triple-boot-args.txt`.
+- Not flashed. Fastboot command: `fastboot flash boot_b outputs/guacamole-ios27a-passcode16-triple.img`.
+
+# Passcode test image 15 (2026-11-18)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel after changes to `SweetACM.cpp` and `bsd/dev/sweet_passcode.c`: 16-byte ACM context secrets now resolve to the passcode. Build completed; log: `xnu12377-passcode15-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `a4640b796dc57335c32c6d72d4c88e32399d708fc2d80453f2e2495a2369ba13`.
+- Same ADT as passcode14: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args are unchanged from passcode14 except refreshed `sweettime=1795058331`; `sweetpasscode=1` is retained. Standalone sidecar: `outputs/guacamole-ios27a-passcode15-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode15.img`, SHA-256 `334a3fb606050b8870cf7b9a62e67441770f242e8e16b0892a6caf1a7e844123`.
+- Triple wrapper: `outputs/guacamole-ios27a-passcode15-triple.img`, SHA-256 `aff0b01c9ce35e6b45d5e30b0635b7e6659c350c7d739e99c83e8debcdcdf526`. It preserves the iOS 16 payload+padding and selector shim from passcode14-triple and replaces only iOS 27 at `0x103a000`. Verified payload and args; shim SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`. Triple sidecar: `outputs/guacamole-ios27a-passcode15-triple-boot-args.txt`.
+- Not flashed, per request.
+
+# Passcode test image 14 (2026-11-18)
+- Rebuilt `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` after the `SweetKeyStore.cpp` change that prepares the output descriptor before `writeBytes`. Build completed; log: `xnu12377-passcode14-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `3435067be4e1d1d041b9e5e3bdf2bd5d738fdf90bee4e2e36266222c055f7b34`.
+- Same ADT as passcode13: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args are otherwise unchanged from passcode13, including `sweetpasscode=1`; refreshed `sweettime=1795057684`. Standalone sidecar: `outputs/guacamole-ios27a-passcode14-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode14.img`, SHA-256 `4a8eaecbbf1aa67634dd1b2a3f94060126c5c839ddf9ada8d7df8a2990b758ed`.
+- Triple wrapper: `outputs/guacamole-ios27a-passcode14-triple.img`, SHA-256 `dde75ea2adb0d948d5f54c76bb16fb091ec139e1df615a480b3dd8790c6019b8`. It preserves the iOS 16 payload+padding and selector shim from passcode13-triple and replaces only iOS 27 at `0x103a000`. Verified payload/args; shim SHA-256 is `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`. Triple sidecar: `outputs/guacamole-ios27a-passcode14-triple-boot-args.txt`.
+- Not flashed, per request.
+
+# Passcode test image 13 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetKeyStore.cpp` change making AKS `change_secret` return a non-zero temporary bag handle. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode13-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `4cc05a9bd98bdfcb7e3062ee73a3e85d205584e0cb711e97df9f06619965141e`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode12 except refreshed `sweettime=1795057246`; sidecar `outputs/guacamole-ios27a-passcode13-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode13.img`, SHA-256 `9f1a314f67825957727a0d9e6e23bc4f23bd5640e91405810c852b4db4c5569d`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode13-triple.img`, SHA-256 `166d622d75075425170ea0915f0fd05d9fbae80bb699ba7489f7f51b692d0cb3`. It preserves the iOS 16 payload+padding from passcode12-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode13-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode13-triple.img`.
+
+# Passcode test image 12 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` ACM context-pool answer change for environment variable `0x45`. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode12-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `8e15ac92abf6dad3f9de70c211e051e42c59f542d9c09a54b7b1919df6597497`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode11 except refreshed `sweettime=1795056803`; sidecar `outputs/guacamole-ios27a-passcode12-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode12.img`, SHA-256 `9bdb5e1765186af30c04a52b3e234f1a58dd660e784d10d2c8cd16ce71265f6c`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode12-triple.img`, SHA-256 `c0aa490e96addf840d2be4e46eeaa262548c0b9f3bf71443ed09f5cec22807e1`. It preserves the iOS 16 payload+padding from passcode11-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode12-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode12-triple.img`.
+
+# Passcode test image 11 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` change that unwraps key 7 only for short reads. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode11-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `7159249cb0d1b69f0863e9de36651311b4a946452e9abc380928828ee65c92ca`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode10 except refreshed `sweettime=1795056239`; sidecar `outputs/guacamole-ios27a-passcode11-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode11.img`, SHA-256 `cb67ecd7cb7868b75d1cc8b0913b1a139b9aa246b42bc18ac9d1cd1e57b81e26`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode11-triple.img`, SHA-256 `222fb7b3ab118066fd32de196c0e7d486916070cb4673c2a1106e987b9d2943e`. It preserves the iOS 16 payload+padding from passcode10-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode11-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode11-triple.img`.
+
+# Passcode test image 10 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel with the `SweetACM.cpp` updates and new `iokit/Kernel/arm/SweetACMGCM.h` (included by the source; no build-file change). Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode10-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `0e75340731aa5fc14788b3cb81d0582943249abf8943c528bd9f28f734da76e2`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode9 except refreshed `sweettime=1795055683`; sidecar `outputs/guacamole-ios27a-passcode10-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode10.img`, SHA-256 `34b4454fe08b26ab751d2b29b3bf33cfc1a2c6e4fc2069e7a56380994f946a63`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode10-triple.img`, SHA-256 `ffc8f78eb3ee37fedb515efceb37ba0f1b50bccf56d53a677a98007b5083a7fc`. It preserves the iOS 16 payload+padding from passcode9-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode10-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode10-triple.img`.
+
+# Passcode test image 9 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` short `ContextCreateWithExternalForm` answers change. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode9-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `c24c4ef9ad1bcfe7f9913e61be556ba2d0b658f5824917439d14cb319fd1ffd7`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode8 except refreshed `sweettime=1795055084`; sidecar `outputs/guacamole-ios27a-passcode9-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode9.img`, SHA-256 `b519dfcaddb1c5139ee9a6bcb08d4dd33f7ebe848c88cb4b41687105a3a233dc`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode9-triple.img`, SHA-256 `bb4e9b23957f2feceedc47f586c0f91c77e03902aee56f9f2928e9ae8e420a9a`. It preserves the iOS 16 payload+padding from passcode8-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode9-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode9-triple.img`.
+
+# Passcode test image 8 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` change making `ContextGetData` return the bare property bytes. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode8-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `1d14496f6d1958b8b3a8dd4e86d2ad374ec38f6e8cd8f96ee10a5ca2f755e16c`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode7 except refreshed `sweettime=1795054445`; sidecar `outputs/guacamole-ios27a-passcode8-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode8.img`, SHA-256 `6e70977e70767b76e67595af98327d0015e83fde138bb9c17d2ed70643db2b42`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode8-triple.img`, SHA-256 `034d77d9dd0d9f25c5c14a31aa51e2b53a9fd17a0377f6edf9f8c55b23c23b8d`. It preserves the iOS 16 payload+padding from passcode7-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode8-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode8-triple.img`.
+
+# Passcode test image 7 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` per-context key 13 data change. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode7-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `393967c3401210265f11fbb0b6d5e36025b73c2294f641a3b739e4c6b927d18d`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode6 except refreshed `sweettime=1795053867`; sidecar `outputs/guacamole-ios27a-passcode7-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode7.img`, SHA-256 `4991539d817fa3f7cf58676488d15b1775dd96ee4d355374c5f668d363083fdd`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode7-triple.img`, SHA-256 `db972fded404e2b5b42032eb09d429a2bea428025b6ec0f756fd31ff48f4c622`. It preserves the iOS 16 payload+padding from passcode6-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode7-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode7-triple.img`.
+
+# Passcode test image 6 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` 4-byte `ContextGetData` property-answer change. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode6-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `2d0137f1678aba3a9bdd08f776c11ff6d1c7a495190c9d76374d9257ec5a2f12`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode5 except refreshed `sweettime=1795053435`; sidecar `outputs/guacamole-ios27a-passcode6-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode6.img`, SHA-256 `54643e3d6783cfe08c41819de1ad8c63165b0a96ce0113022d12396d621ceaf3`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode6-triple.img`, SHA-256 `1fadeb7a58568c2365eab89842476b25c1cddd3ac459662256ef4a014cf3733c`. It preserves the iOS 16 payload+padding from passcode5-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode6-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode6-triple.img`.
+
+# Passcode test image 5 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` updates for VerifyPolicy answer layout, `BiometricRatchetAuthentication` satisfied, and `<string.h>`. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode5-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `66163250f08bb754fc8da5edd83473fa84fed8aa7e840ff56e525ab165ef9524`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode4 except refreshed `sweettime=1795053005`; sidecar `outputs/guacamole-ios27a-passcode5-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode5.img`, SHA-256 `49455f384f75bbedea0d9528d36a1583af754fd9b7c4b4ac5a0a593f19823447`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode5-triple.img`, SHA-256 `58fd07b034f39f81e21b2579416907abf86e08ffd9a6ada5c8d8e06a4f8452b0`. It preserves the iOS 16 payload+padding from passcode4-triple, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode5-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode5-triple.img`.
+
+# Passcode test image 4 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` changes for ACM `ContextGetExternalForm`, `ContextSetData`, and `ContextGetData`. Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode4-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `f59fb803cffbd95cf10e7e354308baad3f1ee9171b851d621fe00b7d61d93c0b`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode3 except refreshed `sweettime=1795014057`; sidecar `outputs/guacamole-ios27a-passcode4-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode4.img`, SHA-256 `dfaccfda4e729345037dc8b76c60e6d48b11d5cb08c686005d9b8444afc3aaa8`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode4-triple.img`, SHA-256 `3b795c520f60c2ba79e0e8058b3acc0fc9951e536329216f85ba8fa8c7e0a90b`. It preserves the iOS 16 payload+padding from passcode3-triple byte-for-byte, replaces only iOS 27 at offset `0x103a000`, and embeds current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified the iOS 27 payload and its boot args. Sidecar: `outputs/guacamole-ios27a-passcode4-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode4-triple.img`.
+
+# Passcode test image 3 (2026-11-18)
+- Rebuilt the current `work/xnu-12377` kernel after the `SweetACM.cpp` SEPControl ratchet response change (response begins with a u32 length). Local `DEVELOPMENT_ARM64_SWEET` build completed; log: `xnu12377-passcode3-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `b7bf841ae856899e8a6601847f340d8feaebce86e0340a3bd840a0b14c59f9e2`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot arguments match passcode2 except refreshed `sweettime=1795013459`; sidecar `outputs/guacamole-ios27a-passcode3-boot-args.txt` (591 chars).
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode3.img`, SHA-256 `68d33a6e49403ccb620ebd68c6cd87339b51cbe32f38091f555278384412c26d`.
+- Also built selector-compatible `outputs/guacamole-ios27a-passcode3-triple.img`, SHA-256 `da39a71db56a376a2bc8dc8ac3a1068afc6788f0e45f1cc1fe2b0124fc0eb24c`. It preserves the iOS 16 payload+padding from passcode2-triple byte-for-byte, replaces only iOS 27 at offset `0x103a000`, and embeds the current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Verified its iOS 27 payload and boot args. Sidecar: `outputs/guacamole-ios27a-passcode3-triple-boot-args.txt`.
+- Not flashed or boot-tested. Use the triple image with the selector: `fastboot flash boot_b outputs/guacamole-ios27a-passcode3-triple.img`.
+
+# Passcode test image 2 (2026-11-18)
+- Rebuilt `work/xnu-12377` after the `SweetACM.cpp` changes: ACM `GetEnvironmentVariable` returns `-7`, and the SEPControl ratchet query returns 512 zero bytes. Local `DEVELOPMENT_ARM64_SWEET` kernel build completed successfully; build log: `xnu12377-passcode2-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `9a73f588815da92ef5ea92750eb5626d81f1cb96ed762f8ff4f6dfe9abdfe454`.
+- Reused `work/guacamole-ios27a-yuv.adt` unchanged (SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`). Boot args are `outputs/guacamole-ios27a-passcode2-boot-args.txt` (591 chars), same as passcode1 with only `sweettime` refreshed to `1795012372`.
+- Standalone wrapper: `outputs/guacamole-ios27a-passcode2.img`, SHA-256 `6d5163ba3b557c21e97cc549e63911cd6853aee7e61bd0951658a6865fc52e6e`.
+- Current selector requires the combined triple image. Also created `outputs/guacamole-ios27a-passcode2-triple.img`, SHA-256 `c409f455dc545b1bfa9f9e6251679c7387abc3ffaa2737e561fce23eaa49cd8f`, by preserving the iOS 16 payload prefix from `guacamole-ios27a-camhw12-thid-triple.img` byte-for-byte and replacing only the iOS 27 payload. Verified iOS 27 begins at `0x103a000`, its bytes match the new passcode2 payload, and its boot args match the 591-character sidecar. The image uses the current selector shim (`shim/out/Image`, SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Triple boot-args sidecar: `outputs/guacamole-ios27a-passcode2-triple-boot-args.txt`.
+- Not flashed or boot-tested. Flash the selector/triple image, not the standalone image: `fastboot flash boot_b outputs/guacamole-ios27a-passcode2-triple.img`.
+
+# Passcode test image (2026-11-18)
+- Built the current `work/xnu-12377` kernel with the passcode changes already in the tree using the local iOS 26 kernel SDK build (`DEVELOPMENT_ARM64_SWEET`, `-j4`). Build completed successfully; kernel SHA-256: `42afdbb95f05f06c837d97848e1084cab983bdaaac3c62ecf20ea13217445ba2`.
+- Packaged `outputs/guacamole-ios27a-passcode1.img` using the exact ADT embedded in `guacamole-ios27a-camhw12-thid.img` (109040 bytes, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`), stock template `dtb/android-boot_a.img`, and `shim/out/Image`. The shim hash matches the one embedded in the current triple image.
+- Boot args are in `outputs/guacamole-ios27a-passcode1-boot-args.txt` (591 chars): refreshed `sweettime`, removed `log-gpu=1` per user instruction, retained `thid_should_crash=0`, and added `sweetpasscode=1`. Payload args and embedded ADT verified after wrapping.
+- Image SHA-256: `b7e77275493509c8f39b7fec6b2d0b4698e703e7e6c57828cc360d01de4480bc`. Not flashed or boot-tested. Flash command: `fastboot flash boot_b outputs/guacamole-ios27a-passcode1.img`.
+- Selector correction (2026-11-18): the standalone image above contains one SWEETXNU payload, while the current selector shim requires the combined triple image. Rebuilt `outputs/guacamole-ios27a-passcode1-triple.img` by preserving the iOS 16 payload and selector shim from `guacamole-ios27a-camhw12-thid-triple.img` and replacing only its iOS 27 payload with the passcode1 payload. Validation finds iOS 16 at offset 0 and iOS 27 at `0x103a000`; shim SHA-256 matches the prior triple image (`69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`). Triple SHA-256: `70be698759548e04d0a5617af2bf781902c5abcecf2d2095647fb0f44cf416f6`. Boot args: `outputs/guacamole-ios27a-passcode1-triple-boot-args.txt`. Not flashed/tested; flash the triple image with `fastboot flash boot_b outputs/guacamole-ios27a-passcode1-triple.img`.
+
 # Active handoff — iOS 27 selector says “not installed” (2026-11-18)
 - User reports the known triple image boots the menu, but the menu says iOS 27 is not installed. That symptom is the shim’s payload discovery/counting path, not an iOS 27 kernel boot failure.
 - `shim/loader.c` was fixed to align each next payload offset relative to `linux,initrd-start`, matching `tools/mktripleboot.py`; absolute-address alignment can select the wrong second-payload location when the initrd base is not page-aligned.
@@ -6715,3 +6866,171 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - 2026-11-18 RESULT: late-store bundle + boot image guacamole-ios27a-camhw12-thid.img (thid_should_crash=0, no dump-cb/
   diag): SUBWAY SURFERS WORKS (loads and plays). Diffs kept in xnu/ios27/adrenometal-late-store.diff and
   adrenometal-dump-cb.diff.
+
+# Device passcode, ported from ios-redfin (2026-11-18, Claude)
+
+- Source: github.com/DenialOfGravity/ios-redfin branch redfin-int (MIT, an ios-sweet fork for the Pixel 5 on iOS 16),
+  xnu/patches 0910 (SweetKeyStore part: AKS state 0x6/sls 3, log 5 lines a selector), 1195 (bsd/dev/sweet_passcode.c +
+  iokit/Kernel/arm/SweetACM.cpp, AppleCredentialManager stand-in), 1196 (keybag status events 0xe3ffd00d so
+  SpringBoard notices), 1197 (aks_assert_hold refused while locked). Their SweetKeyStore.cpp has the same ancestry:
+  after 0910 the 1195-1197 SweetKeyStore hunks applied cleanly to ours; only the build-file hunks were placed by hand.
+- Changes for this tree: verifier at /var/local/passcode.v1 (no sweet_vfs_mkdir here; redfin used
+  /var/local/keystore/). Combined diff: xnu/ios27/xnu12377-passcode.diff; backups
+  research/ios27.2/kernel-backup/{SweetKeyStore.cpp,bsd-conf-files,files.arm64}.before-passcode.
+- Behaviour: kern.sweet_passcode / boot-arg sweetpasscode=N, default 0 = exactly as before (verifier not read, no ACM
+  service). 1 = passcode + lock state; 2 = passcode, never reported locked; 3 = 1, locked at boot. sweetpasscode=0
+  pins it off. kern.sweet_passcode_reset=1 stores "no passcode". PBKDF2-HMAC-SHA256 100000 iterations; backoff after
+  5 failures (60 s doubling, cap 15 min), never a wipe. The passcode protects NOTHING: no data is encrypted with it.
+- iOS 27 unknowns: the AKS selector numbers/arguments (verify_password packed struct, change_secret scalars 3..6)
+  and ACM 'DRCS' commands were taken from iOS 16; the D73 identity is a Face ID phone ("Face ID & Passcode").
+  Unhandled selectors and ACM commands are logged ("SWEET AKS", ACM -3 lines) -> read dmesg after a try.
+- CODEX: build the kernel with it (camhw12 tree + xnu12377-passcode.diff), image = the thid image's boot-args plus
+  sweetpasscode=1.
+- 2026-11-18 RESULT passcode1 (outputs/passcode.log): kernel fine (kern.sweet_passcode=1, ACM published), but
+  "Turn Passcode On" closes at once. Preferences' LAPasscodeChangeService first runs LACDTORatchetManager
+  performArmRequest (Stolen Device Protection): evaluatePolicy 1026 -> "ACM failed to query the value: -3", then
+  "Failed to fetch ratchet state and config (stat: -3)" -> LARatchetErrorDomain 1 -> LAPasscodeServiceErrorDomain 4.
+  iOS 16 had no DTO, so redfin's SweetACM never met these.
+- Reverse-engineered from the 27.2 shared cache (tools: python dsc parser in the VM ~/dsc/dsc.py + llvm-objdump):
+  * ACM cmd 51 = SEPControl (LibCall_ACMSEPControl 0x207c58a40, mov w1,#0x33). The ratchet query (LAC 0x207b36c08)
+    sends ACMSEPControl(data {1,2,0}, 12) and needs EXACTLY 512 bytes back (cmp x0,#0x200).
+  * ACM cmd 25 GetEnvironmentVariable: LAC's KVS read (0x207ae6030) takes -7 as "not set" (nil value), -14 and
+    anything else as an error. We answered -3.
+- FIX (SOURCE, NOT BUILT): SweetACM.cpp cmd 25 -> -7 for every variable; cmd 51 with data {1,2,0} -> 512 zero
+  bytes (ratchet not started, feature off); other SEPControl logged. research/ios27.2/xnu12377-passcode-acm27.diff,
+  combined xnu/ios27/xnu12377-passcode.diff updated; backup research/ios27.2/kernel-backup/SweetACM.cpp.before-acm27.
+  Still unanswered (not blocking so far): AKS sel 142 aks_get_configuration (MKBGetDeviceConfigurations -1),
+  ACM cmd 36 ContextCreate2 (falls back to 1), cmd 19.
+
+# Installing apps on iOS 27: uicache no longer works, use lsreg -r (2026-11-18, Claude + user)
+- `uicache -p /Applications/X.app` fails "Unable to register": iOS 27's CoreServices refuses
+  -[LSApplicationWorkspace registerApplicationDictionary:] ("You cannot use ... to register applications anymore").
+- Working route: copy the .app (ad-hoc signed, Info.plist never edited after signing) to /Applications, then
+  `/var/local/lsreg -r` (userland/flame/lsreg.m: _LSPrivateRebuildApplicationDatabasesForSystemApps rescans
+  /Applications as system apps), check with `/var/local/lsreg -l`. Confirmed with Candy Crush
+  (com.midasplayer.apps.candycrushsaga, with its braze appex). lsreg was not on the 27 root; copied from
+  userland/out/lsreg to /var/local/lsreg.
+- 2026-11-18 RESULT passcode2 (outputs/settings-freeze.log): BROKE Settings. coreauthd logs "Ratchet config-and-status
+  payload anomaly (reason=1)" then SIGSEGV far 0x120 at every start; Preferences' main thread waits in a sync XPC to
+  it (LocalAuthentication+0x271c -> xpc_connection_send_message_with_reply_sync) -> 0x8badf00d. Workaround on the
+  phone: `sysctl kern.sweet_passcode=0; killall coreauthd` (ACM refuses everything again).
+  Cause: ACMLib's output is a serialized parameter, u32 length + bytes (0x207c5253c); bare zeros = length 0 =
+  reason 1 (0x207b12dac: 1 empty, 2 short, 3 long vs 512), and LAC dereferences the nil data.
+- passcode3 (SOURCE, NOT BUILT): SEPControl ratchet answer = u32 512 + 512 zero bytes (olen 516). Contents of the
+  512 bytes still unknown (zeros = guess for "not started / feature off").
+- 2026-11-18 RESULT passcode3 (outputs/passcode3.log): no crash, Settings fine. Ratchet state parses
+  (LACDTORatchetStateRawValueNotStarted), isFeatureEnabled NO, "Stolen Device Protection is not available when
+  Passcode is not set". Next refusal: coreauthd "DTOConfig update ... Failed to set ACM credential data: -3" =
+  ACM cmd 40 ContextSetData (id16, key 9, len 20) -> passcode change still cancelled (LARatchetErrorDomain 1).
+  Also 140x cmd 19 = ContextGetExternalForm (LAC 0x207c41b58, 16-byte id in, no out) -> "ACMContextGetExternalForm
+  failed" in every externalizedContextWithReply.
+- passcode4 (SOURCE, NOT BUILT): cmd 19 -> 0 for a known context (-7 otherwise); cmd 40 ContextSetData stores up to
+  4 keys x 64 bytes per context, cmd 41 ContextGetData returns u32 len + bytes (-7 if not set).
+- 2026-11-18 RESULT passcode4 (outputs/passcode4.log): ContextSetData stored, ContextGetExternalForm ok, DTOConfig
+  update ok. Next: "ACM verification of BiometricRatchetAuthentication on ACMContext 0 failed: -16" (evaluation
+  -1000) -> still cancelled before the keypad.
+  RE: VerifyPolicy output = u32 satisfied + requirement {u32 type, u32 state, u32, u32 data length, data}
+  (0x207ae1858 -> parser 0x207ae2218); the parser returns -16 when the data length is below the size its type
+  needs. redfin's iOS 16 answer had length 0.
+- passcode5 (SOURCE, NOT BUILT): VerifyPolicy answers 4 + 16 + 512 bytes (type 1, data length 512, zeros);
+  'BiometricRatchetAuthentication' always satisfied (Stolen Device Protection is off). #include <string.h> for strcmp.
+- 2026-11-18 RESULT passcode5 (outputs/passcode5.log): THE SET PASSCODE KEYPAD OPENS. Entering a passcode aborts
+  Preferences: setCredential type -9 -> coreauthd ACMContextGetDataProperty (LAC 0x207c438b4, cmd 41 with a 4-byte
+  answer) for key 13 on a fresh context -> our -7 -> "Failed to create LACSExtractablePassword ... Not found" ->
+  NSInternalInconsistencyException 'Failed to create extractable password'.
+- passcode6 (SOURCE, NOT BUILT): cmd 41 with a 4-byte answer = data property -> u32 (stored length, else 0).
+- 2026-11-18 RESULT passcode6 (outputs/passcode6.log): property answered 0 -> Preferences still aborts, now
+  "Failed to create extractable password: ... Failed to obtain encryption size -3". RE: LAC 0x207b35aac calls
+  ACMEncryptDataEx(mode 2, ...) to size the wrapped passcode; the size query (0x207c53310, userspace only) returns -3
+  when one of its inputs is empty; size = plaintext + 32 (mode 1) / 33. The empty input is the key-13 data.
+- passcode7 (SOURCE, NOT BUILT): key 13 made on first use per context (32 random bytes): property -> 32, GetData ->
+  u32 32 + bytes. The encrypt command itself is still unknown: expect it in the log as an unsupported cmd with its
+  first bytes.
+- 2026-11-18 RESULT passcode7 (outputs/passcode7.log): key-13 property -> 32 accepted; then ContextGetData key 13
+  with exactly 32 bytes of room (out 0/32) -> our u32-length form did not fit -> -7 -> "Not found" abort again.
+- passcode8 (SOURCE, NOT BUILT): ContextGetData answers the bare bytes (size known from the property query).
+- 2026-11-18 RESULT passcode8 (outputs/passcode8.log): NO CRASH. The extractable password is made ("setCredential:1
+  type:-9 ... returned success", key 7 len 37 stored = the wrapped passcode). Next: profiled checks the passcode
+  against profile rules from the externalized context: ACM cmd 37 / 18 ContextCreateWithExternalForm(2) with 9 / 5
+  bytes of room -> -3 -> "Couldn't create wrapper context for externalized context" -> Preferences shows an alert.
+  RE (LAC 0x207c55698): answer u32 (0 = nil context), u8 flag, (+ u32 for 37); the id is the one sent.
+- passcode9 (SOURCE, NOT BUILT): cmd 18/37 short answers for a known context (u32 serial, u8 0, u32 serial).
+- 2026-11-18 RESULT passcode9 (outputs/passcode9.log): ContextCreateWithExternalForm2 works for profiled; profiled
+  then reads key 7 (37 bytes = the wrapped passcode) and crashes 'nil argument': ManagedConfiguration+0x64734 makes
+  an NSString (UTF-8) from those bytes, i.e. it expects the plain passcode (the SEP unwraps it).
+  RE: ACMEncryptDataEx mode 2 (LAC 0x207c52d78) = 0x02 | 16-byte random IV | ciphertext | 16-byte tag, AES-256-GCM
+  (ccgcm init with the 32-byte key 13, set_iv 16, update, finalize 16). Also seen: "isn't enough space" (profiled
+  cannot write its plists: the root is full again) and aks_get_configuration (AKS selector 31) still unsupported
+  ("MKBDeviceGetGracePeriod: MKBGetDeviceConfigurations failed to return a dictionary").
+- passcode10 (SOURCE, NOT BUILT): new iokit/Kernel/arm/SweetACMGCM.h (AES-256 + GHASH for J0, counter-mode decrypt,
+  no tag check; checked against Python cryptography AESGCM with 16-byte nonces: 4, 6, 58 bytes). ContextGetData
+  key 7 with a 0x02 blob and key 13 present answers the unwrapped passcode (property = its length).
+- 2026-11-18 RESULT passcode10 (outputs/passcode10.log): profiled no longer crashes (gets the 4-byte plain size).
+  Preferences now aborts "Failed to extract passcode data: ... Failed to obtain plain data size -16": coreauthd reads
+  key 7 with a 34-byte payload (in 42) and passes it on; Preferences unwraps it itself with key 13 (size = len - 33),
+  so that reader needs the WRAPPED blob. profiled's reads have a 25-byte payload (in 33).
+- passcode11 (SOURCE, NOT BUILT): unwrap key 7 only for payloads under 32 bytes (profiled); others get the blob.
+- 2026-11-18 RESULT passcode11 (outputs/passcode11.log): first entry of the new passcode goes through (profiled gets
+  the plain size, coreauthd/Preferences the wrapped blob 37 bytes). The confirm entry aborts: "Failed to extract
+  passcode data: ... Invalidated due to exceeded number of allocated contexts": coreauthd's pool query (ACM
+  GetEnvironmentVariable 0x45) got -7 -> "Disposable pool has no free slots" -> it invalidates the oldest context at
+  every new one, here the one holding the first entry.
+  RE (LAC 0x207acfab0): raw 26-byte answer of u16s, +0 all, +2 disposable, +6 used, +8 disposable used ->
+  LACContextPool initWithSize:(+0 - +8) used:+6 / initWithSize:+2 used:+8.
+- passcode12 (SOURCE, NOT BUILT): var 0x45 answered (64 contexts, 16 disposable, used = our live contexts).
+- 2026-11-18 RESULT passcode12 (outputs/passcode12.log): both entries go through, profiled checks it, and keybagd
+  calls AKS sel 15 change_secret: "SWEET PASSCODE: change (old len 16, new len 16) -> 0: verifier stored" (iOS 27
+  sends 16-byte secrets, not the typed passcode). Then keybagd "KBChangeSystemNonSeSecret: changing non-SE passcode
+  two phase" -> "temp handle is invalid: 0" -> "Failed to set new passcode" (MCPasscodeErrorDomain 5014).
+  Note: the verifier WAS stored, so /var/local/passcode.v1 holds a passcode now -> reset before the next try.
+  Unsupported, not blocking yet: AKS sel 155 (keybagd, 3 scalars, 128-byte out: seshat/SE derivation), sel 57.
+- passcode13 (SOURCE, NOT BUILT): SweetKeyStore sel 15 outputs temp bag handle 0x51 on success.
+- passcode13 result: panic "IOGMD: not wired for the IODMACommand @IOMemoryDescriptor.cpp:3537", task keybagd (pid 55),
+  at the end of setting the passcode (step after change_secret).
+- passcode14 (SOURCE, NOT BUILT): SweetKeyStore sweet_aks_struct_out now prepare()s the output descriptor before
+  writeBytes and complete()s after (like SweetACM md_copy). Large AKS outputs (keybag save etc.) come as descriptors.
+  Staged as outputs/pc14-*; diff refreshed in xnu/ios27/xnu12377-passcode.diff.
+- passcode14 result: no panic; "change passcode success", verifier stored, lock works. Unlock refused every time:
+  SpringBoard sel 9 sends the 4 typed digits, but change_secret had stored a verifier of 16 bytes. profiled uses
+  MKBKeyBagChangeSystemSecretWithACM: the 16-byte secrets are ACM context ids (old ctx key 7 empty, new ctx key 7
+  = wrapped 4-digit passcode). Also the lock screen showed a full keyboard for a 4-digit passcode (keyboardType
+  lives in the keybag opaque data, "OpaqueStuff" of the on-disk systembag; not yet looked at).
+- passcode15 (SOURCE, NOT BUILT): SweetACM sweet_acm_resolve_secret(): a 16-byte secret naming a live context
+  becomes that context's key 7 passcode (GCM unwrap with key 13; empty key 7 = empty). sweet_passcode.c pc_resolve()
+  applies it to change (old and new) and sel 9/12 checks, logging "16-byte ACM context #N -> passcode len L".
+  Staged as outputs/pc15-*.
+- passcode15 result: resolution works ("change new: 16-byte ACM context #30 -> passcode len 4", verifier stored) but
+  unlock still WRONG; an alphanumeric passcode crashed profiled ('nil argument', invalid UTF-8). Cause: key 13 was
+  random per context, while Preferences takes key 13 from one context (the confirm entry's ctx #31) and stores the
+  wrapped key 7 on another (ctx #30), so the unwrap gave garbage. systembag.kb is 147 bytes (no plutil on the phone).
+- passcode16 (SOURCE, NOT BUILT): SweetACM key 13 is one random key per boot shared by all contexts (key13()); both
+  unwraps (profiled's GetData and sweet_acm_resolve_secret) use it. Staged as outputs/pc16-*.
+- passcode16 result: unlock still WRONG. systembag.kb OpaqueStuff is an empty dict; the user session's
+  MKBUserSessionKeybagOpaqueData = {keyboardType 2, simpleType -1}: profiled saw a non-digit passcode, i.e. the
+  unwrap was garbage all along (the full keyboard on the lock screen is the same bug).
+- Reverse engineered (LocalAuthenticationCore 27.2): -[... encodeData:seed:externalizedContext:error:] (0x207b35aac,
+  selector found via relative method list + libobjc __objc_scoffs base) -> ACMEncryptDataEx(2, extContext, seed,
+  data) -> crypto_deriveKeyAndEncryptData (0x207c53310) -> 0x207c527ac: cchkdf(sha256, ikm = seed (key 13),
+  salt = externalized context, info = "acm_transport", 32) -> crypto_encryptText mode 2 (0x207c52d78): 0x02, random
+  IV16, AES-256-GCM, no AAD, tag16.
+- passcode17 (SOURCE, NOT BUILT): sweet_pc_hkdf32() (HMAC/HKDF on the existing in-kernel SHA-256) in
+  sweet_passcode.c; gcm_open16() with tag check in SweetACMGCM.h; SweetACM acm_unwrap() tries salt = own context,
+  every live context, the last 16 deleted contexts, zero id, no salt, and keeps the one whose GCM tag matches. Key 7
+  is unwrapped once when stored (ctx pw/pwlen); profiled's read and the AKS secret resolution use that; an
+  unverifiable blob is refused (-3) instead of handing out garbage. Log: "key 7 len N stored, ctx #X, unwrapped (L
+  bytes, salt ...)". Tested in user space against Python cryptography (HKDF + AESGCM, tamper rejected).
+- passcode17 result: PASSCODE WORKS. "key 7 len 37 stored, ctx #16, unwrapped (4 bytes, salt own ctx)" (salt = the
+  context the wrapped passcode is stored on), change old len 0 / new len 4, lock, "check (len 4, unlock) -> ok" twice.
+  Lock screen still a full keyboard.
+- Cause: ACMContextGetDataEx (LAC 0x207c551f8) calls LibCall_ACMContextGetData twice, size-only flag 1 then 0; the
+  request is id16 | u32 key | u8 size-only (serializer 0x207c51f98). SweetACM decided "size" by a 4-byte buffer,
+  so a 4-character passcode's bytes came back as "\4\0\0\0" to profiled -> keyboardType 2.
+- passcode18 (SOURCE, NOT BUILT): cmd 41 answers the size only when byte 20 of the payload (size-only flag) is set.
+  Staged as outputs/pc18-*. Needs the passcode set again (reset first) so profiled rewrites the opaque data.
+- passcode18 result: number pad on the lock screen for a 4-digit passcode; alphanumeric passcode sets and unlocks.
+  "Change Passcode" fails right after the current passcode is entered: Preferences sel 42 (5 scalars, no struct)
+  -> 0xe00002c2, LAPSErrorDomain 9.
+- AppleKeyStore 27.2 aks_verify_password(_with_acm) (0x23fefc98c): sel 42 scalars = handle, memento, user address
+  and length of the packed buffer (0x23fea9b80: u32 count, items u32 len + data padded to 4), with_acm flag.
+- passcode19 (SOURCE, NOT BUILT): pc_verify_packed takes the by-address form via sweet_pc_verify_packed_user()
+  (copyin, item 0, ACM-context resolution, check). Staged as outputs/pc19-*.
