@@ -1,3 +1,7 @@
+# macOS 27 branch started (2026-11-19, Claude)
+- Branch macos27 from ios27 (rebased onto 9f37afc). Target macOS 27.2 26B123, Mac17,5 IPSW. Plan in docs/macos27.md, working
+  area macos27/. Apple artifacts go to research/macos27/ (git-ignored).
+
 # Metal / UI performance work (2026-11-19, Claude)
 - UI scrolling runs at 37-39 fps on the 88 Hz panel (SWEET FB 5 s lines, measured after 8+ min uptime; earlier is
   shader priming). GPU time is about 16-17 ms a frame, so the CPU side is not the limit; games feel fine.

@@ -1,5 +1,9 @@
 # iOS 27.2 on OnePlus 7 Pro (guacamole)
 
+> **Branch `macos27`:** this branch starts the macOS 27.2 (26B123, Mac17,5) port on the same phone, on top of the
+> iOS 27 work below. Plan and status: [`docs/macos27.md`](docs/macos27.md); working area: [`macos27/`](macos27/).
+> Nothing macOS-specific boots yet; the rest of this README describes the iOS 27 port this branch inherits.
+
 This branch ports the **iOS 27.2 (24B119) userland for iPhone 14 Pro (iPhone15,2 / D73AP)** to the OnePlus 7 Pro (`guacamole`, Qualcomm SM8150 / Snapdragon 855, Adreno 640, 8 GB RAM). The device tree presents the D73 identity while the custom XNU kernel and userland drivers adapt the phone's hardware.
 
 This is an experimental bring-up, not a daily-use phone OS. Many hardware features are incomplete, performance and graphics are unreliable, and the port disables or replaces parts of Apple's normal security and device stack. The iOS 16 port is maintained on a separate branch; this README describes the iOS 27 branch only.
