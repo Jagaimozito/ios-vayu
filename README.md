@@ -22,6 +22,7 @@ Status snapshot: **2026-11-18**. For detailed evidence, caveats, and engineering
 - **Wi-Fi:** joining works and networks are remembered for auto-join; SSH works over Wi-Fi.
 - **Camera:** both cameras work in the Camera app, for the preview and photos. The rear main camera (Sony IMX586) has contrast autofocus through its lens/OIS controller (LC898124EP3). The front camera (Sony IMX471) rises on its pop-up motor when selected and lowers when you switch away or close the app. The kernel drives the sensors, receivers, image front end and SMMU itself and hands raw frames to `ISP.mediacapture` through `/dev/hakios-camera` (`xnu/ios27/xnu12377-camhw.diff`, `userland/camera/`). The lens controller's program comes from OnePlus's GPL driver and is kept out of git: `tools/lc898124-fw.py` makes it, and it goes to `/var/local/fw/lc898124-so2820.fw` on the phone.
 - **Passcode:** a device passcode can be set (4-digit or alphanumeric confirmed) and changed in Settings (turning it off is untested), and the lock screen asks for it with the matching number pad or keyboard. The kernel stands in for the Secure Enclave's credential manager and the keystore (`SweetACM`, `SweetKeyStore`, `bsd/dev/sweet_passcode.c`; `xnu/ios27/xnu12377-passcode.diff`, boot-arg `sweetpasscode=1`). It keeps only a PBKDF2 verifier in `/var/local/passcode.v1`: the passcode gates the UI but does not encrypt data. `sysctl kern.sweet_passcode_reset=1` (root) clears it. Ported from the redfin branch's iOS 16 passcode support. Face ID / Touch ID are not supported.
+- **Cellular (no SIM):** iOS sees a modem: Settings shows Cellular, iOS reports "No SIM", and Settings > General > About shows the phone's real IMEI. The kernel publishes stand-ins for Apple's baseband drivers (from the redfin branch, boot-arg `sweetabp=3`) and answers CommCenter's QMI questions itself as a modem with no SIM; `wland` asks the real modem for the IMEI (`userland/wland/dms.c`). Needs MobileGestalt `HasBaseband`, `cellular-data`, `telephony` and `CellularTelephonyCapability` set (`mgtool setbool`). Only SIM slot 1; no calls, SMS or mobile data (CommCenter never reaches the real modem). See `xnu/ios27/xnu12377-cell1.diff`.
 - **Memory:** iOS manages 5 GB (`hw.memsize=5367660544`), with a GPU pool of about 2 GB placed outside it.
 
 ### Partial or unreliable
@@ -37,7 +38,7 @@ Status snapshot: **2026-11-18**. For detailed evidence, caveats, and engineering
 ### Not working or not implemented
 
 - **Full memory capacity:** about 5 of the phone's 8 GB go to iOS; giving it more needs XNU to use non-contiguous RAM ranges.
-- **Suspend (system sleep), cellular calls/data, GPS, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated.
+- **Suspend (system sleep), cellular calls/SMS/data with a SIM, GPS, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated. Location Services work from Wi-Fi.
 
 ## Booting
 

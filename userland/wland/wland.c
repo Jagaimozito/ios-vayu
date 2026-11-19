@@ -43,6 +43,7 @@
 #include "radio.h"
 #include "ipnet.h"
 #include "bridge.h"
+#include "dms.h"
 
 /* cmd-db aux levels (as in the GPU's arc votes) */
 /* Every cmd-db entry: name, RPMh slave (3 ARC, 4 VRM, 5 BCM), address. */
@@ -542,6 +543,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			pdmapper_handle(h, d, n);
 			return;
 		}
+		if (h->dst_port == DMS_PORT) {
+			dms_handle(h, d, n);	/* cell3: the IMEI for the kernel's baseband stand-in */
+			return;
+		}
 		if (h->dst_port == TFTP_PORT || (h->dst_port >= TFTP_XFER_PORT0 && h->dst_port < TFTP_XFER_PORT0 + TFTP_XFERS)) {
 			tftp_handle(h, d, n);
 			return;
@@ -558,6 +563,8 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 		printf("qrtr:   server service %#x instance %#x at %u:%x\n", w[1], w[2], w[3], w[4]);
 		if (w[1] == WLFW_SERVICE)
 			wlfw_new_server(w[3], w[4]);
+		else if (w[1] == DMS_SERVICE)
+			dms_new_server(w[3], w[4]);
 	}
 }
 

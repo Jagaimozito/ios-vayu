@@ -1,3 +1,106 @@
+# Cellular cell3 result (2026-11-19, Claude): IMEI in Settings, "No SIM" alert at boot
+- wland's dms.c got the IMEI from the modem and wrote /var/local/cell/imei (16 bytes: 15 digits + newline; the
+  modem sent no SV). First boot: CommCenter's 4 early DMS 0x0054 requests came before the file existed (answered
+  0x5e) and it did not ask again; after a reboot the file is there at once: Settings > General > About shows the
+  IMEI and iOS shows its "No SIM" alert at boot. So 0x0054's answer layout (TLV 0x11 IMEI string) is right.
+- Known gap: the first boot after a fresh install / modem change still misses the IMEI (needs one more reboot);
+  fix later by holding 0x0054 in the kernel until the file appears.
+
+# Cellular test image cell3 (2026-11-19)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel with the cell3 `bsd/dev/sweet_abp.c` change, and ran `sh userland/build.sh` to rebuild `userland/out/wland` with the new `userland/wland/dms.c`. Both builds succeeded; no compile fixes were needed. Logs: `xnu12377-cell3-build.log` and `userland-cell3-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `04e8d26547e7ae79b059a8a6e79dd330596d08aac727cd83b7e5e7aa62b61186`. `wland`: `userland/out/wland`, SHA-256 `78abce4a07661f9db72a07099eca44dbc6557b0081b616c0287e24debaa8c98e`.
+- Same ADT as cell2: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args match cell2 with `sweettime=1795087500` refreshed; `sweetabp=3` and `sweetpasscode=1` remain. The arguments are 602 characters. Standalone sidecar: `outputs/guacamole-ios27a-cell3-boot-args.txt`.
+- Standalone image: `outputs/guacamole-ios27a-cell3.img`, SHA-256 `3caeb2fcf3ef184fa2f15af2e7ed3894b0812062ecd829063d2f867d8291ea2c`.
+- Triple image: `outputs/guacamole-ios27a-cell3-triple.img`, SHA-256 `9411d7ffc24605a3d3149626e1b6650938f3058eda2e974162e4b42a00ab3c3d`. It preserves the iOS 16 payload and selector shim from cell2-triple byte-for-byte and replaces only the iOS 27 payload at `0x103a000`; the payload and boot args were verified. Selector shim `shim/out/Image` SHA-256: `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`. Triple sidecar: `outputs/guacamole-ios27a-cell3-triple-boot-args.txt`.
+- Not flashed, per request. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-cell3-triple.img`.
+
+# Cellular step 3: the phone's IMEI (cell3, 2026-11-19, Claude)
+- CommCenter: "Unable to supply dictionary; MEID(ready=0) and IMEI(ready=0)", "CSN missing". It asks DMS 0x0054
+  (TLV 0x01 u32 subscription 1/2; libCommCenterMCommandDrivers "GetDeviceSerialNumbers returned error") - answered
+  0x5e until now. CSN is the eSIM chip's serial (Vinyl): none on this phone, stays missing.
+- cell3 (built; see **Cellular test image cell3** above): sweet_abp.c answers DMS 0x0025 and 0x0054 with TLV 0x11 = the IMEI from
+  /var/local/cell/imei (line 1: 15 digits; optional line 2: 2-digit SVN -> TLV 0x13), read with the kernel's
+  credentials, re-tried every ~5 s while missing, never logged. TLV ids are Qualcomm's DMS GetDeviceSerialNumbers
+  ones (0x10 ESN, 0x11 IMEI, 0x12 MEID, 0x13 SVN); that 0x0054 uses the same layout is a guess to verify in the log.
+  CTL ReleaseClientId no longer logged (it filled the 400-line log budget in cell2). The IMEI never goes into git.
+  Revised again (user: IMEI from the modem, not typed in; one SIM slot only): userland/wland/dms.c (new, + dms.h)
+  asks the modem's DMS service (QRTR NEW_SERVER of service 2 -> GET_DEVICE_SERIAL_NUMBERS 0x0025 from port 0x13,
+  read-only, up to 5 tries on an error) and writes /var/local/cell/imei (tmp + rename, 0600, only when it changes;
+  never printed). Hooks: wland.c net_cb (DMS_PORT data, DMS_SERVICE NEW_SERVER) and dms.c in userland/build.sh.
+  Kernel: only subscription 1 is answered (slot 2 QMI error), UIM card status back to 1 empty slot, SV sent as a
+  2-character string (libqmi's TLV 0x13 format).
+- Status bar: SpringBoard.app's executable is a 140 KB stub; on Dynamic Island iPhones "No SIM" is shown in Control
+  Center's top-left status line, not the main status bar (to confirm on the phone).
+
+# Cellular test image cell2 (2026-11-19)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel with the cell2 `iokit/Kernel/arm/SweetABP.cpp` change that publishes an ApplePPM stand-in. The build succeeded without source fixes; log: `xnu12377-cell2-build.log`.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `a4d969fd7c2b5e0c043aa63d5bcb63dde35bcb58b1c8ebc4fa11abcb04f86bf2`.
+- Same ADT as cell1: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args match cell1 with `sweettime=1795084894` refreshed; `sweetabp=3` and `sweetpasscode=1` remain. The arguments are 602 characters. Standalone sidecar: `outputs/guacamole-ios27a-cell2-boot-args.txt`.
+- Standalone image: `outputs/guacamole-ios27a-cell2.img`, SHA-256 `99d3d6984e25bdb698b850aa41ccd2fc1e52d33ca4041fdac9f257107f24d272`.
+- Triple image: `outputs/guacamole-ios27a-cell2-triple.img`, SHA-256 `7dfb9382ac510b9ffcab0b3191005a3e6228bf6a52581a6463a778fe84582fc8`. It preserves the iOS 16 payload and padding from cell1-triple, retains selector shim `shim/out/Image` (SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`), and replaces only the iOS 27 payload at `0x103a000`; payload and args were verified. Triple sidecar: `outputs/guacamole-ios27a-cell2-triple-boot-args.txt`.
+- Not flashed, per request. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-cell2-triple.img`.
+
+# Cellular test image cell1 (2026-11-19)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel with cell1 from `xnu/ios27/xnu12377-cell1.diff`: new `bsd/dev/sweet_abp.c` and `iokit/Kernel/arm/SweetABP.cpp`, plus the existing file-list and hook changes. Build succeeded; log: `xnu12377-cell1-build2.log`.
+- Compile-only fixes in `bsd/dev/sweet_abp.c`: (1) renamed the QMI control counter `qa_ctl` to `qa_ctl_count` so it no longer collides with the `qa_ctl()` handler; (2) replaced undeclared `current_map()` with `get_task_map(proc_task(p))` for the target process and included `<kern/task.h>` for its declaration. No behavior changes beyond selecting that process's map.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `7e329edcbf7d8f80b6834768d4dd757a790d33a7e010428855f46f8ee586a0ad`.
+- Same ADT as passcode19: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`. Boot args match passcode19 with `sweettime=1795083870` refreshed and `sweetabp=3` added; `sweetpasscode=1` remains. The arguments are 602 characters. Standalone sidecar: `outputs/guacamole-ios27a-cell1-boot-args.txt`.
+- Standalone image: `outputs/guacamole-ios27a-cell1.img`, SHA-256 `b8d363bf6d7420ace0f04e00954d7e11ee9e70ca4aec74f3dfb83f658a173b44`.
+- Triple image: `outputs/guacamole-ios27a-cell1-triple.img`, SHA-256 `d50fbaf434ac4b3ce9313c3e5ac420646d1282239cacd86eaaf791d899eba31f`. It preserves the iOS 16 payload and padding from passcode19-triple, retains selector shim `shim/out/Image` (SHA-256 `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`), and replaces only the iOS 27 payload at `0x103a000`; payload and boot args were verified. Triple sidecar: `outputs/guacamole-ios27a-cell1-triple-boot-args.txt`.
+- Not flashed, per request.
+
+## Cellular step 2 results (cell2 on the phone, 2026-11-19, Claude)
+- CommCenter stable with sweetabp=3 + MobileGestalt HasBaseband=true: baseband boots (Not Booted -> Booting -> Booted
+  -> IsReady, radio Online), UIM GetCardStatus (our "absent") -> "publishing sim info ... state:kSimStateNoSim
+  tray:kInsertedNoSim", simStatusDidChange kCTSIMSupportSIMStatusNotInserted. Cellular appears in Control Center.
+  kern.sweet_abp_qmi_stats after boot: ~370 frames, all on qmux2; 0x5556 (Apple NAS) asked 38 x.
+- `killall CommCenter` while it runs: the old one takes ~24 s to shut down (CTLocationBasedCountryDetermination
+  shutdown timeout) and Wi-Fi + Settings wedged (no SSH) until a reboot. Use reboot, not killall, after changes.
+- Settings' Cellular row is gated by MobileGestalt cellular-data / telephony (SettingsFoundation, SettingsCellular);
+  SpringBoard also reads CellularTelephonyCapability. `mgtool setbool` of the three + reboot -> Cellular row shows.
+  The page shows only the "no SIMs or activated plans" group: SettingsCellularUI "0 plan items exist",
+  isCarrierItemFlowSupported / isActivationCodeFlowSupported NO (no eSIM), carrierspace XPC missing.
+- Still missing: "missing csn + imeis + meid" (no IMEI/serial answers yet); status bar unchanged (no "No SIM").
+- Rollback: mgtool unset HasBaseband / cellular-data / telephony / CellularTelephonyCapability, reboot.
+
+# Cellular step 2: ApplePPM for CPMS (cell2, 2026-11-19, Claude)
+- cell1 result (boot-arg sweetabp=3, then mgtool setbool HasBaseband true + killall CommCenter): the stand-ins
+  publish, the fake-boot patch works ("shouldBoot() ... now returns 0"), CommCenter now runs the real cellular stack
+  ("Can't get Sim File kSimFile_IMSI because there is no SIM"), AppleBaseband sel 3/0xf/0x17 answered. Then every
+  restart: CPMS "Could not find PPM service" / "CPMS not supported on current platform" -> ABM ASSERT (fCPMSAgent)
+  -> CommCenter sig 5, before any QMUX pipe was opened (kern.sweet_abp_qmi_stats empty).
+- CPMS.framework 27.2: IOServiceMatching("ApplePPM"), reads CFNumber properties CPMSSupported (non-zero = supported)
+  and CPMSThermalOnlyDevice, opens a user client and adds an interest notification (PPMCallbackHandler).
+- cell2 (built; image details above): SweetABP.cpp publishes ApplePPM (CPMSSupported 1, CPMSThermalOnlyDevice 0) under the
+  platform expert with an accept-all logging user client (ApplePPMUserClient, "SWEET ABP: ... ApplePPM sel ...").
+  Only SweetABP.cpp changed (Codex's cell1 compile fixes in sweet_abp.c kept); cumulative diff
+  xnu/ios27/xnu12377-cell1.diff regenerated; the cell1 SweetABP.cpp is in research/ios27.2/kernel-backup/SweetABP.cpp.cell1.
+
+# Cellular "No SIM" + Cellular settings, step 1: baseband stand-ins (cell1, 2026-11-19, Claude)
+- Goal (user): Cellular settings and "No SIM" (no SIM card in the phone), plus Location Services. Wi-Fi location in
+  Maps already works ("pretty close").
+- Why no Cellular now: libTelephonyUtilDynamic 27.2 (0x1a7f10c0c) reads MobileGestalt IsVirtualDevice, then
+  HasBaseband: false -> "Detected an unsupported non-baseband device" -> unknown product -> CommCenter in
+  NetworkAccessPolicyController_wifiOnlyDevice ("iPhone15,2 device has no RadioModuleType"). True -> HWModelStr
+  (D73AP) -> a real product, and CommCenter then needs AppleBaseband (iOS 16: "Unable to communicate with
+  AppleBaseband driver" crash loop).
+- 27.2 findings: libPCITransport picks the transport by which control service exists (pci::transport::kernel::
+  probeVariant, table at 0x2d9e67c78: AppleBasebandPCIControl = 1, AppleConvergedIPCBBControl = 2, a third = 3);
+  D73 /baseband (research/ios26/d73ap.adt) is compatible baseband,n41 on apcie, config fa 1f4 0 3e8 64 64 0 0 0 64.
+  ABM "Faking bootup" still exists; capabilities::abs::shouldBoot() (libTelephonyCapabilities 0x1cdf873b0) returns a
+  static initialised to 1.
+- cell1 (built; image details above): redfin's AppleBasebandPCI stand-in (ios-redfin xnu 1061+1063+1064, 1194's prepare) ported:
+  new bsd/dev/sweet_abp.c + iokit/Kernel/arm/SweetABP.cpp, hooks in bsd/conf/files, iokit/conf/files.arm64,
+  bsd/vm/vm_unix.c (shared_region_check_np -> fake-boot patch in CommCenter), iokit/KernelConfigTables.cpp
+  (SweetABPLoader on IOResources calls sweet_abp_init). Boot-arg sweetabp (default 0 = nothing): 1 services, 2 fake
+  boot (shouldBoot's `ldrb w0,[x8,#0x942]` -> `mov w0,#0`, words checked first). With no /dev/abpbridge opener the
+  kernel answers QMI itself: CTL, UIM card status absent, DMS online, NAS not registered, Apple 0xe1/e4/e7 ok, 0xe2
+  err, everything else QMI_ERR_NOT_SUPPORTED (kern.sweet_abp_qmi_default=1: ok). Logs "SWEET ABP:" / "SWEET ABP:
+  QMI"; kern.sweet_abp_stats, kern.sweet_abp_qmi_stats. readyms default 1500 (sweetabpready).
+  Diff: xnu/ios27/xnu12377-cell1.diff. Backups research/ios27.2/kernel-backup/*.before-cell1.
+- Test plan: boot with sweetabp=3, then `mgtool setbool HasBaseband true`, `killall CommCenter`, log. Rollback:
+  `mgtool unset HasBaseband` + reboot (or boot without sweetabp).
+
 # Passcode test image 19 (2026-11-18)
 - Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel after `SweetKeyStore.cpp` and `bsd/dev/sweet_passcode.c` changed so AKS `verify_password` selector 42 accepts the iOS 27 by-address packed buffer. Build completed; log: `xnu12377-passcode19-build.log`.
 - Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `d07197e1a03fa09539e87bf57c7823b247fe601c23fab4aa3224af54f85890d9`.

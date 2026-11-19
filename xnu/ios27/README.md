@@ -63,6 +63,18 @@ Passcode (confirmed on the phone 2026-11-18: set, change, lock and unlock; numbe
     verify_password with the packed buffer passed by address, output descriptors prepare()d before writing (a
     keybagd panic otherwise).
 
+Cellular, no SIM (confirmed on the phone 2026-11-19: Cellular in Settings, "No SIM" alert, IMEI in About):
+- `xnu12377-cell1.diff` - redfin's AppleBasebandPCI stand-in (ios-redfin xnu 1061/1063/1064 + 1194's prepare())
+  ported to xnu-12377 and iOS 27.2 D73: new `bsd/dev/sweet_abp.c` and `iokit/Kernel/arm/SweetABP.cpp`, hooks in
+  `bsd/conf/files`, `iokit/conf/files.arm64`, `bsd/vm/vm_unix.c` and `iokit/KernelConfigTables.cpp`. Boot-arg
+  `sweetabp` (default 0: nothing): 1 publishes the baseband nub (D73 `/baseband` properties), AppleBaseband,
+  AppleBasebandPCIControl with the qmux1/qmux2 pipes (libPCITransport picks the ABP transport by this service),
+  trace and PDP stubs, and ApplePPM (CPMS needs it or ABM asserts); 2 is the fake boot (in CommCenter only,
+  capabilities::abs::shouldBoot() in the 27.2 cache returns 0, words checked first). With no bridge on
+  /dev/abpbridge the kernel answers QMI itself: CTL, UIM card status (one empty slot), DMS online/revision/IMEI (from
+  `/var/local/cell/imei`, written by `userland/wland/dms.c` from the modem), NAS not registered, Apple services as
+  redfin's policy, everything else QMI_ERR_NOT_SUPPORTED. Sysctls `kern.sweet_abp_stats`, `kern.sweet_abp_qmi_stats`.
+
 Memory:
 - `xnu12377-ram5g-gpupool.diff` - `sweet_gpu.c`: the GPU pool moves to free ranges outside XNU's RAM, for
   5 GB of RAM for iOS (`tools/mkadt.py --ram5g`) with a ~2 GB GPU pool.

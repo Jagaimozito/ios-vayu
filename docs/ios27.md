@@ -38,7 +38,7 @@
 
 - **Bluetooth:** the Settings toggle has been unstable (including becoming greyed out); usable Bluetooth connections have not been confirmed. The current investigation points to BlueTool/controller profile and service matching, not a finished Bluetooth port.
 - **Full 8 GB RAM use:** iOS currently reports about 4.24 GB managed (`hw.memsize=4239392768`) despite 8 GB installed. Safely adding the other DRAM ranges while preserving GPU reservations remains unresolved.
-- **Cellular calls/data, camera, GPS, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated.
+- **Cellular calls/SMS/data, camera, GPS, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated. (Since 2026-11-19 iOS sees a no-SIM modem: Cellular in Settings, "No SIM", the real IMEI; see README.)
 - **Complete iOS haptic coverage:** system UI and CoreHaptics patterns remain incomplete, as described above.
 
 ## Build and boot notes
