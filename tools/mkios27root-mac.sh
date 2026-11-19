@@ -106,6 +106,8 @@ PYEOF
 #   research/ios27.2/extras/fw/tfa98xx.cnt                          -> /var/local/fw/tfa98xx.cnt
 #   userland/out/wland, userland/out/netsvc                         -> /var/local/bin; launchd job com.sweet.wland
 #   userland/out/sweet-displayd                                      -> /var/local/bin; launchd job com.sweet.displayd
+#   userland/out/sweet-gnssfeed                                      -> /var/local/bin; launchd job com.sweet.gnssfeed
+#   userland/out/sweet-bars                                          -> /var/local/bin; launchd job com.sweet.bars
 #   userland/out/HakiosAudio.driver                                  -> system HAL plugin; ADSP job only if TFA container exists
 X="$PWD/extras"
 U="$TOOLS/../userland/out"
@@ -177,6 +179,18 @@ if [ -f "$U/sweet-displayd" ]; then
 	jobs+=(displayd)
 	echo "sweet-displayd: installed signed userland daemon"
 fi
+if [ -f "$U/sweet-gnssfeed" ]; then
+	sudo install -d -m 0755 "$R/private/var/local/bin"
+	sudo install -m 0755 "$U/sweet-gnssfeed" "$R/private/var/local/bin/sweet-gnssfeed"
+	jobs+=(gnssfeed)
+	echo "sweet-gnssfeed: installed; boot job enabled (GPS needs /var/local/gnss.on, see userland/wland/gnss.c)"
+fi
+if [ -f "$U/sweet-bars" ]; then
+	sudo install -d -m 0755 "$R/private/var/local/bin"
+	sudo install -m 0755 "$U/sweet-bars" "$R/private/var/local/bin/sweet-bars"
+	jobs+=(bars)
+	echo "sweet-bars: installed; boot job enabled (bars from /var/local/bars.conf)"
+fi
 if [ -d "$U/HakiosAudio.driver" ]; then
 	plugin="$R/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver"
 	sudo install -d -m 0755 "$plugin"
@@ -229,6 +243,16 @@ J['displayd'] = ('/System/Library/LaunchDaemons/com.sweet.displayd.plist', {
     'Label': 'com.sweet.displayd', 'ProgramArguments': ['/var/local/bin/sweet-displayd'], 'RunAtLoad': True,
     'KeepAlive': True, 'POSIXSpawnType': 'Interactive', 'StandardOutPath': '/var/local/displayd.out',
     'StandardErrorPath': '/var/local/displayd.out'})
+J['gnssfeed'] = ('/System/Library/LaunchDaemons/com.sweet.gnssfeed.plist', {
+    # GPS through the modem (userland/wland/gnss.c -> /var/local/gnss.fix -> userland/jb/sweet-gnssfeed.m -> locationd)
+    'Label': 'com.sweet.gnssfeed', 'ProgramArguments': ['/var/local/bin/sweet-gnssfeed'], 'RunAtLoad': True,
+    'KeepAlive': True, 'POSIXSpawnType': 'Interactive', 'StandardOutPath': '/var/local/gnssfeed.out',
+    'StandardErrorPath': '/var/local/gnssfeed.out'})
+J['bars'] = ('/System/Library/LaunchDaemons/com.sweet.bars.plist', {
+    # fake cellular bars / carrier text from /var/local/bars.conf (userland/jb/sweet-bars.m)
+    'Label': 'com.sweet.bars', 'ProgramArguments': ['/var/local/bin/sweet-bars'], 'RunAtLoad': True,
+    'KeepAlive': True, 'POSIXSpawnType': 'Interactive', 'StandardOutPath': '/var/local/bars.out',
+    'StandardErrorPath': '/var/local/bars.out'})
 J['adspd'] = ('/System/Library/LaunchDaemons/com.sweet.adspd.plist', {
     'Label': 'com.sweet.adspd', 'ProgramArguments': ['/var/local/bin/adspd', 'serve'], 'RunAtLoad': True,
     'KeepAlive': True, 'EnvironmentVariables': {'ADSPD_BOOT': '30'}, 'POSIXSpawnType': 'Interactive',

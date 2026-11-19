@@ -74,6 +74,10 @@ Cellular, no SIM (confirmed on the phone 2026-11-19: Cellular in Settings, "No S
   /dev/abpbridge the kernel answers QMI itself: CTL, UIM card status (one empty slot), DMS online/revision/IMEI (from
   `/var/local/cell/imei`, written by `userland/wland/dms.c` from the modem), NAS not registered, Apple services as
   redfin's policy, everything else QMI_ERR_NOT_SUPPORTED. Sysctls `kern.sweet_abp_stats`, `kern.sweet_abp_qmi_stats`.
+  cell4d (confirmed 2026-11-19): AppleBaseband sel 0/1 (ABM resets / powers on the modem) send the 0xe3ff8000
+  "reset detected" message 10 ms later. Without it the first baseband "crash" of a boot became an endless reset loop
+  (ABM's 'Baseband Crash Recovery' check fired while ResetDetection still said "alive"): CommCenter at 400 % CPU and
+  Settings frozen. Sending "alive" or "wake" after resets instead (cell4, cell4c) did not help.
 
 Memory:
 - `xnu12377-ram5g-gpupool.diff` - `sweet_gpu.c`: the GPU pool moves to free ranges outside XNU's RAM, for

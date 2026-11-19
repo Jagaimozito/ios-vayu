@@ -44,6 +44,7 @@
 #include "ipnet.h"
 #include "bridge.h"
 #include "dms.h"
+#include "gnss.h"
 
 /* cmd-db aux levels (as in the GPU's arc votes) */
 /* Every cmd-db entry: name, RPMh slave (3 ARC, 4 VRM, 5 BCM), address. */
@@ -547,6 +548,10 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			dms_handle(h, d, n);	/* cell3: the IMEI for the kernel's baseband stand-in */
 			return;
 		}
+		if (h->dst_port == GNSS_PORT) {
+			gnss_handle(h, d, n);	/* gnss1: the modem's GNSS fixes for Location Services */
+			return;
+		}
 		if (h->dst_port == TFTP_PORT || (h->dst_port >= TFTP_XFER_PORT0 && h->dst_port < TFTP_XFER_PORT0 + TFTP_XFERS)) {
 			tftp_handle(h, d, n);
 			return;
@@ -565,6 +570,8 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
 			wlfw_new_server(w[3], w[4]);
 		else if (w[1] == DMS_SERVICE)
 			dms_new_server(w[3], w[4]);
+		else if (w[1] == GNSS_SERVICE)
+			gnss_new_server(w[3], w[4]);
 	}
 }
 
@@ -701,6 +708,7 @@ static void net_idle(void)
 	ipnet_poll();
 	bridge_poll();
 	join_poll();
+	gnss_poll();
 }
 
 static int net(unsigned secs)

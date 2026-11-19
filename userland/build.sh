@@ -73,7 +73,7 @@ if [ -f bt/bluetoothd-ents.plist ]; then
 fi
 # Wi-Fi: ios-flame's wland (userland/wland/README.md): modem + WLFW + WCN3990 radio from userland over /dev/pmem
 (cd wland && $CC -Wno-unused-parameter -o ../out/wland wland.c smem.c pmem.c glink.c link.c qmi.c rmtfs.c pdmapper.c \
-	tftp.c scm.c wlfw.c radio.c ipnet.c bridge.c dms.c) && codesign -f -s - out/wland && echo out/wland
+	tftp.c scm.c wlfw.c radio.c ipnet.c bridge.c dms.c gnss.c) && codesign -f -s - out/wland && echo out/wland
 # Audio from the Guacamole branch: ADSP/APR playback daemon, TFA9874 amp controller, and Hakios HAL plugin.
 # SweetCodec publishes the HAL mix through /var/local/pcm.ring; adspd feeds it to the ADSP ASM stream.
 build adspd adsp/adspd.c adsp/edge.c wland/smem.c wland/qmi.c wland/pmem.c -Iwland -Wno-unused-parameter
@@ -94,6 +94,15 @@ build sbprobe jb/sbprobe.m -fobjc-arc -framework Foundation
 build caprobe jb/caprobe.c -framework CoreFoundation -framework IOSurface
 build nosim jb/nosim.m -fobjc-arc -framework Foundation
 codesign -f -s - --entitlements jb/tsample.plist out/nosim
+# locationd's simulation interface test (GPS through the modem, step 1): simloc LAT LON [ACC] | simloc stop
+build simloc jb/simloc.m -fobjc-arc -framework Foundation -framework CoreLocation
+codesign -f -s - --entitlements jb/simloc-ents.plist out/simloc
+# sweet-gnssfeed: the modem's GNSS fixes (wland gnss.c -> /var/local/gnss.fix) into locationd's simulation interface
+build sweet-gnssfeed jb/sweet-gnssfeed.m -fobjc-arc -framework Foundation -framework CoreLocation
+codesign -f -s - --entitlements jb/simloc-ents.plist out/sweet-gnssfeed
+# sweet-bars: fake cellular signal bars through SystemStatus' status-bar-overrides domain (probe | daemon on /var/local/bars.conf)
+build sweet-bars jb/sweet-bars.m -fobjc-arc -framework Foundation -framework Security
+codesign -f -s - --entitlements jb/sweet-bars-ents.plist out/sweet-bars
 codesign -f -s - --entitlements flame/oslog-ents.plist out/oslog
 build netsvc flame/netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
 codesign -f -s - --entitlements flame/netsvc-ents.plist out/netsvc

@@ -1241,9 +1241,9 @@
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_abp_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_abp_stats, "A",
 +    "redfin 1061: AppleBasebandPCI stand-in counters");
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
---- /dev/null	2026-11-19 01:47:59.520000000 +0000
-+++ iokit/Kernel/arm/SweetABP.cpp	2026-11-19 10:40:40.817246466 +0000
-@@ -0,0 +1,1368 @@
+--- /dev/null
++++ iokit/Kernel/arm/SweetABP.cpp
+@@ -0,0 +1,1410 @@
 +/*
 + * ios-sweet iOS 27 (cell1): redfin's AppleBasebandPCI stand-in (DenialOfGravity/ios-redfin xnu patches 1061, 1063 and
 + * 1064, with 1194's prepare()/complete()) ported to xnu-12377 for the iOS 27.2 D73 (iPhone 14 Pro) userland:
@@ -1688,6 +1688,43 @@
 +
 +static void abb_ready_fire(thread_call_param_t, thread_call_param_t);
 +
++/*
++ * cell4d (2026-11-19, Claude): "reset detected" after every reset / power-on ABM asks for.
++ * After any "baseband crash" ABM resets the modem (AppleBaseband sel 0 / sel 1, via libTelephonyBaseband's safe
++ * reset) and runs its 'Baseband Crash Recovery' check; with ResetDetection still at "alive" (the boot-time
++ * 0xe3ff8001) that check reported a new crash, so the first crash of a boot turned into an endless reset loop
++ * (~5 a second, CommCenter at 400 % CPU, Settings frozen; outputs/cc-spin1..3, cell4*). A real modem that is reset
++ * reports it with 0xe3ff8000; sending exactly that by hand (kern.sweet_abp_bbmsg=1) stopped the loop for good
++ * (outputs/cc-spin3: 0 crashes; cell4d: 1 reset in 20 s). cell4/4c tried "alive" after resets and a "wake"
++ * message instead: both kept the loop going and were dropped. The message goes out from a thread call 10 ms after
++ * the selector returns (not from inside externalMethod); several resets in a row send one message.
++ */
++static thread_call_t abb_rst_tc;
++static uint32_t abb_resets, abb_rstmsgs;
++
++static void
++abb_rst_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	abb_rstmsgs++;
++	SweetABPBasebandMessage(0xe3ff8000u);
++}
++
++static void
++abb_reset_requested(uint32_t selector)
++{
++	abb_resets++;
++	if (abb_rst_tc == NULL) {
++		abb_rst_tc = thread_call_allocate(abb_rst_fire, NULL);
++	}
++	if (abb_rst_tc == NULL || thread_call_isactive(abb_rst_tc)) {
++		return;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(10, kMillisecondScale, &deadline);
++	thread_call_enter_delayed(abb_rst_tc, deadline);
++	IOLog("SWEET ABP: ABM %s the baseband (sel %u): 'reset detected' follows\n", selector ? "powers on" : "resets", selector);
++}
++
 +class AppleBasebandUserClient : public IOUserClient
 +{
 +	OSDeclareDefaultStructors(AppleBasebandUserClient);
@@ -1757,6 +1794,11 @@
 +		break;
 +	case 0x17:
 +		out = abb_manager_state;
++		break;
++	case 0x00:      /* cell4d: reset modem */
++	case 0x01:      /* cell4d: power on modem */
++		abb_reset_requested(selector);
++		out = 0;
 +		break;
 +	case 0x1b:
 +		abb_baseband_state = in0;
@@ -2572,9 +2614,9 @@
 +SweetABPStats(char *buf, size_t len)
 +{
 +	size_t o = 0;
-+	o += snprintf(buf + o, len - o, "%s (%u services, published %u x, un-published %u x) | bootstage %u mgr %llu bb %llu reset %u readyms %u readies %u",
++	o += snprintf(buf + o, len - o, "%s (%u services, published %u x, un-published %u x) | bootstage %u mgr %llu bb %llu reset %u readyms %u readies %u resets %u reset-msgs %u",
 +	    abp_nservices ? "published" : "NOT published", abp_nservices, abp_publishes, abp_unpublishes, sweet_abp_bootstage,
-+	    abb_manager_state, abb_baseband_state, abb_in_reset, sweet_abp_readyms, abb_readies);
++	    abb_manager_state, abb_baseband_state, abb_in_reset, sweet_abp_readyms, abb_readies, abb_resets, abb_rstmsgs);
 +	for (unsigned i = 0; i < ABP_NPIPES && o < len; i++) {
 +		abp_pipe *pp = &abp_pipes[i];
 +		if (pp->lock == NULL) {

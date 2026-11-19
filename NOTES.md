@@ -1,3 +1,54 @@
+# GPS through the modem + fake signal bars + reset-loop fix (2026-11-19, Claude): all confirmed on the phone
+- Reset loop (CommCenter 400 % CPU, Settings frozen, ~5 baseband resets a second; outputs/cc-spin1..3): after the
+  first baseband "crash" of a boot ABM resets the modem (AppleBaseband sel 0 via libTelephonyBaseband's safe reset)
+  and its 'Baseband Crash Recovery' check fired at once while ResetDetection still held the boot-time "alive". A
+  hand-sent 0xe3ff8000 (kern.sweet_abp_bbmsg=1) stopped it; cell4d sends that 10 ms after sel 0/1. Boot: 3 resets,
+  then none; CommCenter at 0 %. cell4 ("alive" after resets) and cell4c ("wake" 0xe3ff8007 after sel 0x0b, no
+  in-reset on sel 0) kept the loop going. 0xe3ff8007 does end the safe reset's 10 s "wait for wake"; 0xe3ff8012 is
+  the GNSS wake ACK, not wake.
+- GPS: userland/wland/gnss.c (QMI LOC 0x10, client port 0x14). The modem refused START (QMI error 0x2e, session
+  status 7 engine locked) with lockClient 0x2 on both DD and DV: our client counts as non-framework (NFW). With
+  "unlock=all" in /var/local/gnss.on: originals saved to /var/local/gnss.lock-orig, SET_ENGINE_LOCK NONE per
+  subscription, session runs, first fix ~80 s indoors, about +-100 m. sweet-gnssfeed (boot job com.sweet.gnssfeed)
+  feeds /var/local/gnss.fix to locationd's CLSimulationManager (entitlement com.apple.locationd.simulation).
+- Bars: userland/jb/sweet-bars.m publishes STStatusBarDataCellularEntry (factory entryWithType:...displayRawValue:)
+  with -setEntry:forKey:@"cellularEntry" on SystemStatus' status-bar-overrides publisher (server: systemstatusd;
+  entitlement com.apple.systemstatus.publisher.domains = [status-bar-overrides]). Type values from `sweet-bars
+  types`: 0 none ... 4 UMTS, 5 4G, 6 LTE, 7 5GE, 10 5G. Boot job com.sweet.bars reads /var/local/bars.conf.
+- Lesson: scp over an existing signed binary on the phone keeps the kernel's cached signature of the old contents:
+  the new file runs with csops flags 0 and every entitlement read is empty ("missing entitlement" rejections). Copy
+  to NAME.new and mv. tools/launchd-add-job.py knows gnssfeed and bars (that file stays uncommitted).
+
+# Cellular test image cell4d (2026-11-19)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel with the cell4d `iokit/Kernel/arm/SweetABP.cpp` change: `abb_reset_requested` / `abb_rst_fire` send the `0xe3ff8000` reset-detected message 10 ms after AppleBaseband sel 0/1, via a thread call. Cell4 and cell4c were test images that did not fix the reset loop. Kernel build succeeded with no source fixes; log: `xnu12377-cell4d-build.log`.
+- Refreshed `xnu/ios27/xnu12377-cell1.diff` with the current `SweetABP.cpp` implementation. Its added-file patch section was applied to an empty path and compared byte-for-byte with the source.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `758bbd7bfef25e61fb1e7b8e3e021ddb0633ff11fdf412fa590fa6caf15e7fdd`. Same ADT as cell3: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`.
+- Boot args match cell3 with `sweettime=1795093257` refreshed; `sweetabp=3` remains. They are 602 characters. Sidecars: `outputs/guacamole-ios27a-cell4d-boot-args.txt` and `outputs/guacamole-ios27a-cell4d-triple-boot-args.txt`.
+- Standalone image: `outputs/guacamole-ios27a-cell4d.img`, SHA-256 `60ba68d184b5cdc2908df89d23868f08d7b2047d3ffe7e725e3af1f69af37544`.
+- Triple image: `outputs/guacamole-ios27a-cell4d-triple.img`, SHA-256 `0e55e2c03b5e79148753384329946224b6f499c220c20c3a714995b44807043b`. It preserves the iOS 16 payload prefix and selector shim from cell3-triple byte-for-byte and replaces only iOS 27 at `0x103a000`; payload and boot args were verified. Selector shim `shim/out/Image` SHA-256: `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`.
+- Ran `sh userland/build.sh`; it succeeded with no compile fixes. No changes were made to `bridge.c`, `ipnet.c`, `link.c`, `link.h` or `radio.c`. MD5s: `userland/out/wland` `73ba83b40c3ea421558a25ad278979b1`; `userland/out/sweet-gnssfeed` `a98d0a0e87d265e0c89e4dcbcca8af70`. Build log: `userland-cell4d-build.log`.
+- Not flashed, per request. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-cell4d-triple.img`.
+
+# Cellular test image cell4c (2026-11-19)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel with the cell4c `iokit/Kernel/arm/SweetABP.cpp` change: `abb_schedule_alive(why, in_reset)`; `abb_schedule_wake` / `abb_wake_fire` send `0xe3ff8007` after AppleBaseband sel `0x0b` input 1; sel 0/1 schedule alive without marking the modem in reset. Build succeeded with no source fixes; log: `xnu12377-cell4c-build.log`.
+- Refreshed `xnu/ios27/xnu12377-cell1.diff` with the current `SweetABP.cpp` implementation. The patch’s added-file section was applied to an empty path and compared byte-for-byte with the source.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `6dd3d8d7b9be294a062f989f3034bbc84a2a30b7d7f1a7cf8bd7612e53950b82`. Same ADT as cell3: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`.
+- Boot args match cell3 with `sweettime=1795091789` refreshed; `sweetabp=3` remains. They are 602 characters. Sidecars: `outputs/guacamole-ios27a-cell4c-boot-args.txt` and `outputs/guacamole-ios27a-cell4c-triple-boot-args.txt`.
+- Standalone image: `outputs/guacamole-ios27a-cell4c.img`, SHA-256 `343cc0750667d8e76db8a2142fe4b3e5f73964da78acf389b39b6845c6373fc2`.
+- Triple image: `outputs/guacamole-ios27a-cell4c-triple.img`, SHA-256 `d88b7079118f01e9f99c109cd5c9384ec6ea82dfc1b1c2b82d6ead9604c1d387`. It preserves the iOS 16 payload prefix and selector shim from cell3-triple byte-for-byte and replaces only iOS 27 at `0x103a000`; embedded args and payload were verified. Selector shim `shim/out/Image` SHA-256: `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`.
+- `userland/out/wland` and `userland/out/sweet-gnssfeed` were already built from the current sources (their build times postdate all their source inputs), so userland was not rebuilt. MD5s: `wland` `5c750e10150f9fd1dd9bdf48012bb5de`; `sweet-gnssfeed` `a98d0a0e87d265e0c89e4dcbcca8af70`. No changes were made to `bridge.c`, `ipnet.c`, `link.c`, `link.h` or `radio.c`.
+- Not flashed, per request. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-cell4c-triple.img`.
+
+# Cellular test image cell4 (2026-11-19)
+- Rebuilt the `work/xnu-12377` `DEVELOPMENT_ARM64_SWEET` kernel with the cell4 `iokit/Kernel/arm/SweetABP.cpp` change: AppleBaseband selectors 0/1 schedule the `0xe3ff8001` alive message through `abb_schedule_alive`, which checks `thread_call_isactive` so the timer is not re-armed. The kernel build succeeded; log: `xnu12377-cell4-build.log`. No source fixes were needed.
+- Refreshed `xnu/ios27/xnu12377-cell1.diff` using the current `SweetABP.cpp`; its cumulative patch now includes the cell4 alive scheduling change.
+- Kernel: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `c309ff4dbbba5f1fc98dadc47353bcf6fb05202c021d4608d9dba725746a63b3`. Same ADT as cell3: `work/guacamole-ios27a-yuv.adt`, SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`.
+- Boot args match cell3 with `sweettime=1795090681` refreshed; `sweetabp=3` remains. The arguments are 602 characters. Sidecars: `outputs/guacamole-ios27a-cell4-boot-args.txt` and `outputs/guacamole-ios27a-cell4-triple-boot-args.txt`.
+- Standalone image: `outputs/guacamole-ios27a-cell4.img`, SHA-256 `1ef2f63b8a4ae7318b83c792f3be2d4340e63ede26b9645038e96d2d94996479`.
+- Triple image: `outputs/guacamole-ios27a-cell4-triple.img`, SHA-256 `55b59f7c7df26265eb6d3eae338a0f2e1ccba65f0a2591bcd6f5f3583048d201`. It preserves the iOS 16 payload prefix and selector shim from cell3-triple byte-for-byte and replaces only iOS 27 at `0x103a000`; embedded args and payload were verified. Selector shim `shim/out/Image` SHA-256: `69ff7a06eb507471440ef10b00e6e43d3a979b812ab4e80efb1d6d1c7501b97b`.
+- `./build.sh` is not executable in this checkout, so the requested userland build was run as `sh ./build.sh`; it succeeded with no compile fixes. `userland/out/wland` MD5: `5c750e10150f9fd1dd9bdf48012bb5de`. `userland/out/sweet-gnssfeed` MD5: `a98d0a0e87d265e0c89e4dcbcca8af70`. The protected wland files (`bridge.c`, `ipnet.c`, `link.c`, `link.h`, `radio.c`) were not edited.
+- Not flashed, per request. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-cell4-triple.img`.
+
 # Cellular cell3 result (2026-11-19, Claude): IMEI in Settings, "No SIM" alert at boot
 - wland's dms.c got the IMEI from the modem and wrote /var/local/cell/imei (16 bytes: 15 digits + newline; the
   modem sent no SV). First boot: CommCenter's 4 early DMS 0x0054 requests came before the file existed (answered
