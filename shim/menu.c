@@ -197,15 +197,49 @@ static void blit_icon(const uint8_t *px, int y, int on)
 	}
 }
 
-static void draw_icon(int i, const struct menu_entry *e, int selected)
+/* Horizontal inset of row j in a rounded rectangle of height h and corner radius r. */
+static int rr_inset(int j, int h, int r)
+{
+	if (j < r)
+		return r - isqrt(r * r - (r - j) * (r - j));
+	if (j >= h - r)
+		return r - isqrt(r * r - (j - (h - r) + 1) * (j - (h - r) + 1));
+	return 0;
+}
+
+/* Only the band between a rounded rectangle and the same one shrunk by t on each side. */
+static void ring_band(int x, int y, int w, int h, int r, int t, uint32_t c)
+{
+	for (int j = 0; j < h; j++) {
+		int o = rr_inset(j, h, r);
+		volatile uint32_t *p = con_fb + (y + j) * (FB_STRIDE / 4);
+		if (j < t || j >= h - t) {
+			for (int k = x + o; k < x + w - o; k++)
+				p[k] = c;
+			continue;
+		}
+		int in = t + rr_inset(j - t, h - 2 * t, r - t);
+		for (int k = x + o; k < x + in; k++)
+			p[k] = c;
+		for (int k = x + w - in; k < x + w - o; k++)
+			p[k] = c;
+	}
+}
+
+/*
+ * The selection ring: 12 px wide, 10 px outside the picture. full = 0 (selection moved): only the
+ * ring band is painted, blue or background; the picture and the gap stay as they are.
+ */
+static void draw_icon(int i, const struct menu_entry *e, int selected, int full)
 {
 	int y = ICON_Y0 + i * (MENU_ICON + ICON_GAP);
-	fill(ICON_X - 24, y - 24, MENU_ICON + 48, MENU_ICON + 48, BG);	/* clears the old ring */
-	if (selected) {
-		round_rect(ICON_X - 22, y - 22, MENU_ICON + 44, MENU_ICON + 44, ICON_R + 22, CARD_SEL);
-		round_rect(ICON_X - 10, y - 10, MENU_ICON + 20, MENU_ICON + 20, ICON_R + 10, BG);
+	if (full) {
+		fill(ICON_X - 24, y - 24, MENU_ICON + 48, MENU_ICON + 48, BG);
+		blit_icon(e->icon, y, e->enabled);
 	}
-	blit_icon(e->icon, y, e->enabled);
+	if (selected || !full)
+		ring_band(ICON_X - 22, y - 22, MENU_ICON + 44, MENU_ICON + 44, ICON_R + 22, 12,
+			  selected ? CARD_SEL : BG);
 }
 
 /* Small buttons (Restart, Power off): one row in the bottom right corner, in entry order. */
@@ -230,7 +264,7 @@ static void draw_button(const struct menu_entry *all, int n, int i, int selected
 	text(x + BTN_PAD, BTN_Y + (BTN_H - 16 * BTN_SCALE) / 2, BTN_SCALE, all[i].title, TEXT);
 }
 
-static void draw_entry(const struct menu_entry *all, int n, int i, int selected)
+static void draw_entry(const struct menu_entry *all, int n, int i, int selected, int full)
 {
 	const struct menu_entry *e = &all[i];
 	if (e->small) {
@@ -238,7 +272,7 @@ static void draw_entry(const struct menu_entry *all, int n, int i, int selected)
 		return;
 	}
 	if (e->icon) {
-		draw_icon(i, e, selected);
+		draw_icon(i, e, selected, full);
 		return;
 	}
 	int y = CARD_Y0 + i * (CARD_H + CARD_GAP);
@@ -269,7 +303,7 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 		text_c(300 + 16 * 7 + 40, 3, "Volume up / down to choose, power to start", TEXT_DIM);
 	}
 	for (int i = 0; i < n; i++)
-		draw_entry(e, n, i, i == sel);
+		draw_entry(e, n, i, i == sel, 1);
 	if (apid_pon < 0 || (apid_vup < 0 && apid_vdn < 0))
 		text_c(BAR_Y + 80, 3, "keys not found: starting the default", TEXT_DIM);
 
@@ -303,8 +337,8 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 				s = (s + move + n) % n;
 			while (!e[s].enabled && s != sel);
 			if (s != sel) {
-				draw_entry(e, n, sel, 0);
-				draw_entry(e, n, s, 1);
+				draw_entry(e, n, sel, 0, 0);
+				draw_entry(e, n, s, 1, 0);
 				sel = s;
 			}
 		}
