@@ -24,4 +24,13 @@ make -j4 MAKEJOBS=-j4 \
 	2>&1 | tee "$REPO/work/xnu12377-macos27-build.log"
 K=$X/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet
 [ -f "$K" ] || { echo "no kernel: see work/xnu12377-macos27-build.log" >&2; exit 1; }
+# Must be plain arm64 like the iOS 27 kernel (makedefs: SWEET -> -arch arm64, -march=armv8.2-a+crypto):
+# the Kryo 485 has no pointer authentication, so an arm64e (PAC) kernel would fault on its first PAC instruction.
+python3 - "$K" <<'PY'
+import struct, sys
+magic, cputype, cpusub = struct.unpack_from('<III', open(sys.argv[1], 'rb').read(12))
+sub = cpusub & 0xff
+print('kernel cputype %#x cpusubtype %d (%s)' % (cputype, sub, 'arm64e' if sub == 2 else 'arm64'))
+sys.exit(1 if sub == 2 else 0)
+PY
 shasum -a 256 "$K"
