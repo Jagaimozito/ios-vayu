@@ -1,3 +1,19 @@
+# iOS 27 root script audit: everything the old phone root had by hand (2026-11-20, Claude)
+- A fresh 80g root came up with Setup, no GPU, no Bluetooth, no Wi-Fi IP, no Cellular row: the old root had been fixed
+  by hand (boxes, SSH, mgtool, launchd-*.py) and tools/mkios27root-mac.sh never got those changes. Audited NOTES from
+  the start of iOS 27 and the last launchd.plist pulled from the phone (outputs/launchd.plist.nocamera, 11-19 14:57):
+  its job differences against the fresh image are exactly btbridge, spinwatch, bootlog added and PerfPowerServices
+  removed. The script now installs (files in tools/ios27root/, binaries from userland/out, GPU bundle from the plugin
+  build folder): Setup-skip prefs; CoreAnimation no deep/compressed framebuffer prefs (backboardd + global) + en-US;
+  SystemConfiguration preferences.plist with the en0 Wi-Fi service; NativeAdrenoMetal.bundle + .publish +
+  .primelist; sweet-rs-atcall, sweet-rotate-flip, gnss.on (unlock=all); btbridge, spinwatch, bootlog, mgfix jobs;
+  tsample, ptop, oslog, mgtool; sweet-mgfix (MobileGestalt: WifiVendor USI, HasBaseband, cellular-data, telephony,
+  CellularTelephonyCapability, haptics x2, ringer-switch, ArtworkDeviceSubType 1792, ArtworkDeviceScaleFactor 2 -
+  reboot once after the first boot); PerfPowerServices dropped. wland/netsvc/etc. in the old 07:24 root were already
+  byte-identical to userland/out. Left out on purpose: the synthetic camera (cameracaptured stays removed; its
+  AVCaptureSession.plist edits not carried), bars.conf (user's own text).
+- Rule from now on: anything installed on the phone by hand goes into mkios27root-mac.sh in the same change.
+
 # iOS 27 root flash: the .simg was wrong (2026-11-20, Claude) -- fixed converter, re-flash pending
 - Symptom: after flashing research/ios27.2/ios27-root-80g.simg, iOS 27 panicked "initproc failed to start -- exit
   reason namespace 2 subcode 0xb" (launchd SIGSEGV at pc 0x1000000000100, no shared region mapped).

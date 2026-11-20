@@ -103,14 +103,27 @@ with open(p, 'r+b') as f:	# rewrite in place: owner and mode stay
 print('launchd.plist: removed', gone)
 PYEOF
 
-# 2026-11-20: no Setup on a fresh root. On the old phone a box installed these by hand; the 80g root ran Setup again
-# (and resprang). purplebuddy + purplebuddy.notbackedup: SetupDone, SetupFinishedAllSteps, ForceNoBuddy,
-# UserChoseLanguage, SetupVersion/TVSetupVersion 99, and every "<Pane>Presented" key in 27.2's Setup binary.
-sudo install -d -o 501 -g 501 -m 0755 "$R/private/var/mobile/Library/Preferences"
-for f in com.apple.purplebuddy.plist com.apple.purplebuddy.notbackedup.plist; do
-	sudo install -o 501 -g 501 -m 0600 "$TOOLS/nobuddy27/$f" "$R/private/var/mobile/Library/Preferences/$f"
+# 2026-11-20: files the old phone root was given by hand (boxes, SSH), all kept in tools/ios27root/:
+#  - no Setup: purplebuddy + purplebuddy.notbackedup (SetupDone, SetupFinishedAllSteps, ForceNoBuddy, UserChoseLanguage,
+#    SetupVersion/TVSetupVersion 99, every "<Pane>Presented" key in 27.2's Setup binary);
+#  - CoreAnimation: no deep / compressed framebuffers (else backboardd makes '&BGA' surfaces and colours go wrong,
+#    NOTES 2026-11-14 18:15): com.apple.backboardd (backboardd runs as mobile) and .GlobalPreferences, + en-US;
+#  - Wi-Fi: SystemConfiguration preferences.plist with a Wi-Fi service on en0 in set "Automatic" (27.2 does not create
+#    one; without it configd never configures en0 and there is no IP, NOTES 2026-11-14 20:45);
+#  - GPU: NativeAdrenoMetal.primelist (the 310 .metallibs to prime; else backboardd walks the whole disk, 2026-11-17).
+F="$TOOLS/ios27root"
+pref="$R/private/var/mobile/Library/Preferences"
+sudo install -d -o 501 -g 501 -m 0755 "$pref"
+for f in com.apple.purplebuddy.plist com.apple.purplebuddy.notbackedup.plist com.apple.backboardd.plist .GlobalPreferences.plist; do
+	sudo install -o 501 -g 501 -m 0600 "$F/$f" "$pref/$f"
 done
-echo "Setup skipped: purplebuddy prefs installed"
+echo "Setup skipped: purplebuddy prefs installed; CoreAnimation framebuffer prefs installed"
+sc="$R/private/var/preferences/SystemConfiguration"
+sudo install -d -o 0 -g 0 -m 0755 "$sc"
+sudo install -o 0 -g 0 -m 0644 "$F/preferences.plist" "$sc/preferences.plist"
+echo "Wi-Fi: network service for en0 installed"
+sudo install -o 0 -g 0 -m 0644 "$F/NativeAdrenoMetal.primelist" "$R/System/Library/Extensions/NativeAdrenoMetal.primelist"
+echo "GPU: shader priming list installed"
 
 # Network extras (all optional; local files only, never in git: research/ is ignored).
 #   research/ios27.2/extras/bootstrap-ssh-iphoneos-arm64.tar.zst   Procursus rootless bootstrap with OpenSSH
