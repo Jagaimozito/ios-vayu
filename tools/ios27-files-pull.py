@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""ios27-files-pull.py OUTDIR [/path ...] : copy files off the iOS 27 root (HFS+, partition ios26) with the phone
+"""ios27-files-pull.py OUTDIR [/path ...] : copy files off the iOS 27 root (HFS+, partition ios27) with the phone
 booted into ANDROID (adb + su). No iOS, screen, Wi-Fi or SSH needed. Only reads. Run on the Mac in the repo folder.
 Reads the volume header and the whole catalog, finds each path, then reads that file's data extents.
 A path ending in "/" means a folder: its 2 newest files (by modification date) are copied.
 With no paths it copies the Setup preferences and the newest unified-log files (DEFAULT below).
-PART=name picks another partition (default ios26)."""
+PART=name picks another partition (default ios27; ios26 before the 2026-11-20 split)."""
 import os, struct, subprocess, sys, time
 
 DEFAULT = ['/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist',
@@ -22,7 +22,7 @@ def sh(cmd, binary=False):
 
 out = sys.argv[1] if len(sys.argv) > 1 else sys.exit(__doc__)
 paths = sys.argv[2:] or DEFAULT
-part = os.environ.get('PART', 'ios26')
+part = os.environ.get('PART', 'ios27')
 img = os.environ.get('IMG')  # test against a raw image file instead of the phone
 dev = img or sh("su -c 'readlink -f /dev/block/by-name/%s'" % part)
 if not img and not dev.startswith('/dev/'): sys.exit('no partition %s (is the phone in Android with root?): %r' % (part, dev))
