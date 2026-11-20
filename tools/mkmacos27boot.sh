@@ -16,7 +16,7 @@ set -euo pipefail
 abs() { case "$1" in /*) echo "$1" ;; *) echo "$PWD/$1" ;; esac; }
 IOS=$(abs "$1")
 cd "$(dirname "$0")/.."
-K=${2:-work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet}
+K=${2:-work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet}
 [ -f "$K" ] || { echo "no kernel $K: run tools/mkmacos27kernel.sh" >&2; exit 1; }
 [ -f shim/out/Image ] || { echo "no shim/out/Image: BOARD=guacamole shim/build.sh" >&2; exit 1; }
 ARGS=$(python3 - "$IOS" <<'PY'
