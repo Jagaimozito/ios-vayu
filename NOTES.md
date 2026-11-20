@@ -1,3 +1,118 @@
+# macOS 27.2 arm64e userland lowering (UniversalMac_27.2_26B123_Restore, 2026-11-20)
+
+Unpacked and decrypted the OS, SystemOS and AppOS volumes from the Universal Mac restore IPSW for the
+Guacamole/Kryo 485 arm64 target (no FEAT_PAuth). The original IPSW, extracted AEA payloads and source tars
+remain under ignored `research/macos27/`; no root image was assembled and the phone was not touched. The
+SystemOS arm64e cache is in `System/Library/dyld/dyld_shared_cache_arm64e*` (not the iOS
+`com.apple.dyld` path). `ipsw dyld info` reports NewFormatTLVs, 4,115 images and 81 subcaches. The
+DriverKit cache has 66 images and no subcaches.
+
+Archive creation (after `ipsw fw aea` decrypted the OS and SystemOS `.aea` files; AppOS is a plain DMG):
+```
+# Extract from the IPSW ZIP into research/macos27/ (the component paths are listed in BuildManifest.plist):
+python3 - <<'PY2'
+import zipfile
+ipsw='research/macos27/UniversalMac_27.2_26B123_Restore.ipsw'
+with zipfile.ZipFile(ipsw) as z:
+    for name in ('141-12228-170.dmg.aea','141-12293-172.dmg.aea','141-12233-175.dmg'):
+        with z.open(name) as src, open('research/macos27/'+name, 'wb') as dst:
+            while b := src.read(8 << 20): dst.write(b)
+PY2
+ipsw fw aea research/macos27/141-12228-170.dmg.aea -o research/macos27
+ipsw fw aea research/macos27/141-12293-172.dmg.aea -o research/macos27
+mkdir -p research/macos27/mnt/{os,systemos,appos}
+hdiutil attach -readonly -nobrowse -mountpoint research/macos27/mnt/os research/macos27/141-12228-170.dmg
+hdiutil attach -readonly -nobrowse -mountpoint research/macos27/mnt/systemos research/macos27/141-12293-172.dmg
+hdiutil attach -readonly -nobrowse -mountpoint research/macos27/mnt/appos research/macos27/141-12233-175.dmg
+bash research/macos27/archive-volumes.sh
+# The archive script uses sudo tar --format pax --mac-metadata --acls --xattrs; then detach the three images.
+hdiutil detach research/macos27/mnt/os
+hdiutil detach research/macos27/mnt/systemos
+hdiutil detach research/macos27/mnt/appos
+```
+
+Source archive sizes: OS root 22,600,830,464 bytes; SystemOS cryptex 7,696,975,360 bytes; AppOS cryptex
+52,854,272 bytes. All three passed `tar -tf ... >/dev/null` integrity checks. Counts came from
+`python3 research/ios26/tools/macho-census.py <tar> <out.tsv>`; PAC census used
+`python3 research/ios26/tools/pac-census2.py` for caches and the macOS local tar lowerer for volume slices.
+Mach-O census before lowering:
+
+| Volume | Mach-O files | Fat files | arm64e subtype 2 slices | arm64e ABI-v2 subtype 12 slices |
+| --- | ---: | ---: | ---: | ---: |
+| OS root | 5,292 | 5,196 | 5,166 | 5,034 |
+| SystemOS cryptex | 81 | 21 | 60 | 0 |
+| AppOS cryptex | 30 | 30 | 29 | 30 |
+
+Volume lower/overlay and validation commands:
+```
+python3 research/macos27/lower-tar-macos.py research/macos27/os-root.tar research/macos27/low-os-root lower 300
+python3 research/macos27/lower-tar-macos.py research/macos27/systemos-cryptex.tar research/macos27/low-systemos-cryptex lower 300
+python3 research/macos27/lower-tar-macos.py research/macos27/appos-cryptex.tar research/macos27/low-appos-cryptex lower 300
+python3 research/macos27/lower-tar-macos.py research/macos27/os-root.tar research/macos27/low-os-root overlay research/macos27/overlay/os-root-lowered.tar
+python3 research/macos27/lower-tar-macos.py research/macos27/systemos-cryptex.tar research/macos27/low-systemos-cryptex overlay research/macos27/overlay/systemos-cryptex-lowered.tar
+python3 research/macos27/lower-tar-macos.py research/macos27/appos-cryptex.tar research/macos27/low-appos-cryptex overlay research/macos27/overlay/appos-cryptex-lowered.tar
+# Repeat lower against each *-lowered.tar into a fresh verify-* directory; it found no new convertible PAC words.
+```
+
+The macOS SDK also contains arm64e ABI-v2 subtype 12. I made an ignored, local copy
+`research/macos27/lower-tar-macos.py` of the iOS tar lowerer and expanded its slice filter to subtypes 2 and
+12; no shared/iOS lowerer was edited. It uses the same `zeta_userland_pauth.py` lowering routine and keeps
+original signatures’ CodeDirectory page hashes refreshed. Volume lowering results: OS root 5,292 inspected,
+5,057 changed, 19,281,625 PAC words lowered, 0 refused; SystemOS standalone 81 inspected, 58 changed,
+141,006 lowered, 0 refused; AppOS 30 inspected, all 30 changed, 26,175 lowered, 0 refused. The second
+pass over each lowered volume overlay inspected 5,057 / 58 / 30 Mach-Os respectively and found 0 further
+lowerable PAC words and 0 refused instructions.
+
+Cache lowering commands (system cache processed in resumable 500-image ranges through image 4,115):
+```
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-system research/macos27/dsc-system-arm64 copy
+for START in 0 500 1000 1500 2000 2500 3000 3500 4000; do
+  END=$((START + 500)); test "$END" -le 4115 || END=4115
+  python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-system research/macos27/dsc-system-arm64 lower "$START" "$END"
+done
+python3 research/ios26/tools/lower-stubs.py research/macos27/dsc-system-arm64 apply
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-system research/macos27/dsc-system-arm64 sign
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-driverkit research/macos27/dsc-driverkit-arm64 copy
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-driverkit research/macos27/dsc-driverkit-arm64 lower 0 66
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-driverkit research/macos27/dsc-driverkit-arm64 sign
+python3 research/macos27/dsc-overlay-system.py research/macos27/systemos-cryptex.tar research/macos27/dsc-system-arm64 research/macos27/overlay/dsc-system-lowered
+python3 research/macos27/dsc-overlay-driverkit.py research/macos27/systemos-cryptex.tar research/macos27/dsc-driverkit-arm64 research/macos27/overlay/dsc-driverkit-lowered
+```
+
+System cache: 31,533,961 PAC instructions lowered across 8,194 code sections / 4,115 images; 563,597 stub
+island `BRAA X16,X17` instructions changed to `BR X16` across 37 cache files. CodeDirectory page hashes
+were refreshed in 82 system-cache files. DriverKit cache: 144,234 PAC instructions lowered across 129 code
+sections / 66 images; one cache file had its CodeDirectory hashes refreshed. Post-lowering PAC census found
+0 convertible PAC instructions and 0 remaining stub-island matches in either cache. It found one refused
+instruction in each cache; both are the same `LDRAB` encoding that has no exact one-word lowering:
+
+- System: `/usr/lib/system/libsystem_m.dylib`, `__text` VA `0x2ce01d518`, word `0xf8e397b6` — `ldrab offset -3640 fits no ordinary load`.
+- DriverKit: `/System/DriverKit/usr/lib/system/libsystem_m.dylib`, `__text` VA `0x181028ab8`, word `0xf8e397b6` — `ldrab offset -3640 fits no ordinary load`.
+
+Those two words remain untouched. Volume overlays are `research/macos27/overlay/{os-root,systemos-cryptex,appos-cryptex}-lowered.tar`
+(5.60 GiB / 21.5 MiB / 12.8 MiB respectively). Cache overlays are `dsc-system-lowered-0.tar` through
+`dsc-system-lowered-5.tar` (6.72 GiB total) and `dsc-driverkit-lowered-0.tar` (24.4 MiB). System and
+DriverKit `.atlas` data is included; `.map` and `.symbols` metadata is not overlaid. Apple CMS signatures are not re-signed; CodeDirectory page hashes were refreshed. The iOS 27.2 x86_64
+cache was left untouched. No combined macOS root image was built.
+
+# macOS 27 kernel, first boot: physmap_end assertion in arm_vm_init (2026-11-20, Claude) -- fix in source, not built
+- Panic (photo): SWEET EARLY 7 entering arm_vm_init, then arm_vm_init.c:1643 assert (temp_ptov_table[ptov_index-1].va +
+  .len) <= physmap_end. MacOSX builds get ARM_LARGE_MEMORY (makedefs/MakeInc.def); with no PPL that path sets
+  physmap_end = physmap_base + real_phys_size, no room for ARM64_GRANULE_ALLOW_BLOCK moving each ptov region up to a
+  twig (32 MiB) so VA and PA offsets match. Fine on Apple's VMs, not here.
+- Fix: xnu/macos27/0002-physmap-end-block-room.patch (already applied to work/xnu-12377): under
+  ARM64_BOARD_CONFIG_SWEET the ARM_LARGE_MEMORY non-PPL physmap_end gets + PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE, as the
+  !ARM_LARGE_MEMORY case. iOS builds are not ARM_LARGE_MEMORY: unchanged.
+
+# iOS 27 Bluetooth loop: BlueTool profile alias was missing from the root (2026-11-20, Claude)
+- Fresh root: BlueTool picks fwPos 62 (D73's own BCM4387C2/PCIe row), sees the bridge's BCM4357B1, logs "HCD file
+  corrupt!", then "no firmware for this platform ... BCM4357B1 USI"; Settings restarts Bluetooth forever. The old root
+  had tools/patch-bluetool27-profile.py applied by hand (2026-11-15, research/ios27.2/bluetooth/d73-profile-bridge.md).
+- The legacy BCM4357B1 rows carry their HCD inside BlueTool (row +48 data pointer, Tuborg USI 162013 bytes), so the
+  file under /usr/share/firmware/bluetooth is never read for them; the stand-in .hcd files are not needed.
+- patch-bluetool27-profile.py now refreshes the CodeDirectory page hashes itself (no codesign, entitlements kept), and
+  mkios27root-mac.sh runs it on $R/usr/sbin/BlueTool. Live phone: outputs/ios27-bluetooth/BlueTool + outputs/bt-fix.sh.
+
 # iOS 27 root script audit: everything the old phone root had by hand (2026-11-20, Claude)
 - A fresh 80g root came up with Setup, no GPU, no Bluetooth, no Wi-Fi IP, no Cellular row: the old root had been fixed
   by hand (boxes, SSH, mgtool, launchd-*.py) and tools/mkios27root-mac.sh never got those changes. Audited NOTES from
@@ -60,6 +175,16 @@
   prefers MASTER.arm64.sweet.MacOSX over MASTER.arm64.sweet). Objects: BUILD/obj-macos27-sweet (iOS build untouched).
 - tools/mkmacos27kernel.sh builds it (log work/xnu12377-macos27-build.log). Source fixes for macOS only go under
   #if XNU_TARGET_OS_OSX so the iOS kernel still builds.
+- REBUILD (2026-11-20): applied the SWEET-only `physmap_end` block-room change in
+  `work/xnu-12377/osfmk/arm64/arm_vm_init.c` (patch `xnu/macos27/0002-physmap-end-block-room.patch`).
+  `bash tools/mkmacos27kernel.sh` succeeded; plain arm64 (cputype `0x100000c`, subtype 0), 21,280,088 bytes,
+  SHA-256 `7de63bf0232ea21065408739366ca70aaa5ee3c5b8f37d65e58310a7fcf75aeb`. Rewrapped with
+  `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`: packaged macOS kernel image
+  `outputs/guacamole-macos27-kernel.img`, 29,155,328 bytes, SHA-256
+  `36e9618874c635a5e4f3aaeb0bfbf0205eba4a71acec07234c4dffa9ea6bf771`; menu image
+  `outputs/guacamole-menu-ios27-macos27.img`, 49,377,280 bytes, SHA-256
+  `233063f5b435f8dbd8c36602e6c848ec6ff5c86d41345b0e3f02a391d7c898ca`. Combined ramdisk is 41,612,096 bytes
+  of 48,234,496 (under the 46 MiB limit). No iOS kernel rebuild or modification.
 - tools/mkmacos27boot.sh IOS27.img: ADT and boot-args from the iOS 27 image (ufsroot=macos, no rootrw, console on
   screen, -v), then outputs/guacamole-menu-ios27-macos27.img. `macos` starts mid-way through the old iOS 16 image,
   so no HFS volume header is expected there: the kernel should stop at the root mount. Log: PART=macos.
