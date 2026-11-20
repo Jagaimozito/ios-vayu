@@ -13,7 +13,7 @@ import os, sys
 from PIL import Image, ImageChops, ImageDraw
 
 ICON = 600
-BG = (0x0e, 0x0e, 0x12)
+BG = (0, 0, 0)
 NAMES = ("ios27", "macos27", "android")
 SS = 4  # supersampling for the edge mask
 

@@ -388,7 +388,10 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
-	con_clear(MENU_BG);	/* 2026-11-17: was red, a red flash before the menu */
+	con_clear(MENU_BG);	/* black (2026-11-20); 2026-11-17: was red, a red flash before the menu */
+#if defined(BOARD_GUACAMOLE)
+	con_quiet = 1;	/* black until the menu; an error turns the text back on */
+#endif
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_str("BOARD", BOARD_NAME);
 	con_skip();

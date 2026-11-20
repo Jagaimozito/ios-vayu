@@ -93,7 +93,7 @@ static unsigned keys_now(void)
 }
 
 /* ---- drawing ---- */
-#define BG		0xff0e0e12u
+#define BG		0xff000000u	/* black (2026-11-20; was 0xff0e0e12) */
 #define CARD		0xff24242bu
 #define CARD_SEL	0xff0a84ffu
 #define TEXT		0xffffffffu
@@ -182,9 +182,8 @@ static uint32_t dim(uint32_t c, int on)
 {
 	if (on)
 		return c;
-	/* 35 % picture, 65 % background */
-	uint32_t r = (((c >> 16) & 0xff) * 35 + 0x0e * 65) / 100, g = (((c >> 8) & 0xff) * 35 + 0x0e * 65) / 100;
-	uint32_t b = ((c & 0xff) * 35 + 0x12 * 65) / 100;
+	/* 35 % picture over the black background */
+	uint32_t r = ((c >> 16) & 0xff) * 35 / 100, g = ((c >> 8) & 0xff) * 35 / 100, b = (c & 0xff) * 35 / 100;
 	return 0xff000000u | r << 16 | g << 8 | b;
 }
 
@@ -317,6 +316,6 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 /* "Booting ..." on the menu background, centred: the screen until the kernel draws its own. */
 void menu_booting(const char *what)
 {
+	(void)what;	/* 2026-11-20: plain black, no "Booting ..." line */
 	fill(0, 0, FB_W, FB_H, BG);
-	text_c(FB_H / 2 - 16 * 6 / 2, 6, what, TEXT);
 }

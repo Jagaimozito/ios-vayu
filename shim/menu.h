@@ -18,5 +18,5 @@ extern const uint8_t menu_icon_ios27[], menu_icon_macos27[], menu_icon_android[]
  */
 int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms);
 
-/* Clear to the menu background and show one centred line, e.g. "Booting iOS 16". */
+/* Clear to the menu background (black); what, e.g. "Booting iOS 27", is no longer drawn. */
 void menu_booting(const char *what);

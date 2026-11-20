@@ -10,7 +10,7 @@
 #define YELLOW	0xffffff00U
 #define GREEN	0xff00ff00U
 #define BLACK	0xff000000U
-#define MENU_BG	0xff0e0e12U	/* menu.c BG: the shim's first screen, so nothing flashes before the menu */
+#define MENU_BG	0xff000000U	/* menu.c BG: the shim's first screen, so nothing flashes before the menu */
 
 extern volatile uint32_t *con_fb;
 
