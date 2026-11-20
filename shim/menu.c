@@ -187,6 +187,16 @@ static uint32_t dim(uint32_t c, int on)
 	return 0xff000000u | r << 16 | g << 8 | b;
 }
 
+/* One MENU_ICON picture at ICON_X, y (dimmed when !on). */
+static void blit_icon(const uint8_t *px, int y, int on)
+{
+	for (int j = 0; j < MENU_ICON && y + j < FB_H; j++) {
+		volatile uint32_t *p = con_fb + (y + j) * (FB_STRIDE / 4) + ICON_X;
+		for (int k = 0; k < MENU_ICON; k++, px += 3)
+			p[k] = dim(0xff000000u | (uint32_t)px[0] << 16 | (uint32_t)px[1] << 8 | px[2], on);
+	}
+}
+
 static void draw_icon(int i, const struct menu_entry *e, int selected)
 {
 	int y = ICON_Y0 + i * (MENU_ICON + ICON_GAP);
@@ -195,12 +205,7 @@ static void draw_icon(int i, const struct menu_entry *e, int selected)
 		round_rect(ICON_X - 22, y - 22, MENU_ICON + 44, MENU_ICON + 44, ICON_R + 22, CARD_SEL);
 		round_rect(ICON_X - 10, y - 10, MENU_ICON + 20, MENU_ICON + 20, ICON_R + 10, BG);
 	}
-	const uint8_t *px = e->icon;
-	for (int j = 0; j < MENU_ICON && y + j < FB_H; j++) {
-		volatile uint32_t *p = con_fb + (y + j) * (FB_STRIDE / 4) + ICON_X;
-		for (int k = 0; k < MENU_ICON; k++, px += 3)
-			p[k] = dim(0xff000000u | (uint32_t)px[0] << 16 | (uint32_t)px[1] << 8 | px[2], e->enabled);
-	}
+	blit_icon(e->icon, y, e->enabled);
 }
 
 /* Small buttons (Restart, Power off): one row in the bottom right corner, in entry order. */
@@ -314,8 +319,10 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 }
 
 /* "Booting ..." on the menu background, centred: the screen until the kernel draws its own. */
-void menu_booting(const char *what)
+void menu_booting(const uint8_t *icon)
 {
-	(void)what;	/* 2026-11-20: plain black, no "Booting ..." line */
+	/* 2026-11-20: the chosen OS's picture in the centre of a black screen, no "Booting ..." line */
 	fill(0, 0, FB_W, FB_H, BG);
+	if (icon)
+		blit_icon(icon, (FB_H - MENU_ICON) / 2, 1);
 }

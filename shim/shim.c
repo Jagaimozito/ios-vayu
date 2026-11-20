@@ -458,7 +458,7 @@ void shim_main(uint64_t dtb)
 	con_quiet = 1;	/* only "Booting ..." until the kernel takes the screen; errors turn it back on */
 	if (choice == 2) {
 		stage = "android";
-		menu_booting("Booting Android");
+		menu_booting(menu_icon_android);
 		const char *afail = android_boot(dtb);
 		con_quiet = 0;
 		con_clear(BLACK);
@@ -475,9 +475,9 @@ void shim_main(uint64_t dtb)
 	int pay_index = 0;
 	if (choice == 1 && entries[1].enabled) {
 		pay_index = 1;
-		menu_booting("Booting macOS 27");
+		menu_booting(menu_icon_macos27);
 	} else {
-		menu_booting("Booting iOS 27");
+		menu_booting(menu_icon_ios27);
 	}
 #else
 	int pay_index = 0;

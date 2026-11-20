@@ -18,5 +18,5 @@ extern const uint8_t menu_icon_ios27[], menu_icon_macos27[], menu_icon_android[]
  */
 int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms);
 
-/* Clear to the menu background (black); what, e.g. "Booting iOS 27", is no longer drawn. */
-void menu_booting(const char *what);
+/* Black screen with the chosen OS's picture (MENU_ICON, shim/art.S) in the centre; 0 = black only. */
+void menu_booting(const uint8_t *icon);
