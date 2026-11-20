@@ -88,7 +88,9 @@ sudo python3 - "$R/System/Library/xpc/launchd.plist" <<'PYEOF'
 import plistlib, sys
 p = sys.argv[1]
 d = plistlib.load(open(p, 'rb'))
-gone = [k for k, j in d['LaunchDaemons'].items() if j.get('Label') in ('com.apple.fairplayd.H2', 'com.apple.cameracaptured')]
+# 2026-11-20: com.apple.PerfPowerServices too: it loops forever over SMC keys (no AppleSMC here), a core at 100 %.
+gone = [k for k, j in d['LaunchDaemons'].items() if j.get('Label') in ('com.apple.fairplayd.H2', 'com.apple.cameracaptured',
+                                                                   'com.apple.PerfPowerServices')]
 for k in gone:
     del d['LaunchDaemons'][k]
 for j in d['LaunchDaemons'].values():
@@ -268,10 +270,17 @@ fi
 # Tools and helper jobs: spinwatch (restarts locationd when it spins a core), bootlog (first 4 min of oslog per boot),
 # tsample / ptop / oslog for debugging.
 sudo install -d -m 0755 "$R/private/var/local/bin"
-for t in spinwatch tsample ptop oslog; do
+for t in spinwatch tsample ptop oslog mgtool; do
 	[ -f "$U/$t" ] && sudo install -m 0755 "$U/$t" "$R/private/var/local/bin/$t" && echo "tool: $t"
 done
 [ -f "$U/spinwatch" ] && jobs+=(spinwatch)
+# MobileGestalt answers (Bluetooth's WifiVendor, cellular, haptics, @2x layout): the cache only exists after the first
+# boot, so a boot job applies them whenever the cache is new (userland/jb/sweet-mgfix.sh).
+[ -f "$U/mgtool" ] || { echo "ERROR: no userland/out/mgtool: Bluetooth and cellular need it" >&2; exit 1; }
+sudo install -m 0755 "$TOOLS/../userland/jb/sweet-mgfix.sh" "$R/private/var/local/bin/sweet-mgfix"
+jobs+=(mgfix)
+# GPS through the modem (userland/wland/gnss.c): on, with the engine lock lifted for our client.
+echo unlock=all | sudo tee "$R/private/var/local/gnss.on" >/dev/null
 [ -f "$U/oslog" ] && jobs+=(bootlog)
 if [ ${#jobs[@]} -gt 0 ]; then
 sudo python3 - "$R/System/Library/xpc/launchd.plist" "${jobs[@]}" <<'PYEOF'
@@ -318,6 +327,10 @@ J['spinwatch'] = ('/System/Library/LaunchDaemons/com.sweet.spinwatch.plist', {
     'Label': 'com.sweet.spinwatch', 'ProgramArguments': ['/var/local/bin/spinwatch', 'locationd'], 'RunAtLoad': True,
     'KeepAlive': True, 'ProcessType': 'Background',
     'StandardOutPath': '/var/local/spinwatch.log', 'StandardErrorPath': '/var/local/spinwatch.log'})
+J['mgfix'] = ('/System/Library/LaunchDaemons/com.sweet.mgfix.plist', {
+    'Label': 'com.sweet.mgfix', 'ProgramArguments': ['/var/local/bin/sweet-mgfix'], 'RunAtLoad': True,
+    'KeepAlive': False, 'POSIXSpawnType': 'Interactive',
+    'StandardOutPath': '/var/local/mgfix.out', 'StandardErrorPath': '/var/local/mgfix.out'})
 J['bootlog'] = ('/System/Library/LaunchDaemons/com.sweet.bootlog.plist', {
     'Label': 'com.sweet.bootlog', 'RunAtLoad': True, 'KeepAlive': False, 'POSIXSpawnType': 'Interactive',
     'ProgramArguments': ['/bin/zsh', '-c', 'exec > /var/local/boot-oslog.txt 2>&1; '
