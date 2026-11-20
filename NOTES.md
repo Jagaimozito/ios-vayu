@@ -1,10 +1,54 @@
-# Landscape games black: CA's rotated framebuffer (2026-11-19, Claude) -- system landscape fixed, Minecraft open
+# Landscape games black: CA's rotated framebuffer (2026-11-19, Claude) -- fixed: Minecraft runs (low fps)
 - Summary: landscape now works through the system (backboardd's rotated framebuffer, apps' rotated drawables, the
   kernel scaler's rotation); diffs in xnu/ios27/ (adrenometal-landscape, adrenometal-vertex-absent = bridge 0043,
   adrenometal-vattr-dumpfile, xnu12377-scaler-rotate). Minecraft still black (test 14, outputs/land17/): its descriptors
   are filled and it draws, but every vertex buffer it binds reads all zero at the bound offset on the CPU (title cube
   at offset 0 of a 4 MB buffer included), and its frame reads back black. Next: how Minecraft fills its vertex buffers
   (private storage + blit? a buffer we answer contents for wrongly?).
+- FOUND (tests 15-26, outputs/land18-26, outputs/minecraftpe.bin): Minecraft's vertex (4 MiB) and index (1 MiB) buffers
+  are made with newBufferWithLength, never mapped (contents asked 0 until our dump), never copied into as far as the
+  driver saw; the binary uses newBufferWithBytes + blitCommandEncoderWithDescriptor: + copyFromBuffer:toBuffer:.
+  NBCommandBuffer had no blitCommandEncoderWithDescriptor: -> nil encoder -> every upload copy was a message to nil.
+  Added blitCommandEncoderWithDescriptor: and computeCommandEncoderWithDescriptor: (descriptors' sample buffer
+  attachments ignored). Diagnostics kept (dump-cb only): per-buffer made-by/contents/gpuAddress counts, buffer watch,
+  buffer uses by caller offset, copy log, missing selectors to stderr. Codex: rebuild, outputs/NativeAdrenoMetal-blitdesc.
+- Test 27 (blitdesc): Minecraft launches and renders, at a very low frame rate.
+- Test 15 setup (outputs/NativeAdrenoMetal-bufdiag): the dump now prints, for each bound buffer, how it was made
+  (options, heap offset, no-copy), its contents pointer and where in the whole buffer the CPU sees nonzero words; and
+  with dump-cb on, the first 24 copyFromBuffer:toBuffer: calls go to the dump file (sizes, options, offsets).
+  Backup: research/ios27.2/metal/NativeBridgeMetalFrontend.mm.before-bufdiag.
+- Test 15 plugin built for iOS 27 with `--no-replay`; no bridge source changes. The successful plugin link reused the
+  current bridge archive. Fixed two ARC compile errors in the buffer diagnostic by using non-owning `__bridge void *`
+  casts for the source and destination `MTLBuffer` pointers. Bundle signature verification passed. Executable copied
+  byte-for-byte to `outputs/NativeAdrenoMetal-bufdiag`, SHA-256
+  `64673d82e77953e1d90d338532aceae16b3725da3a049067044dc2fc55bba39f`. Not installed on the phone.
+- Test 15 plugin rebuilt again for iOS 27 with the existing bridge archive and `--no-replay`; signature verification passed.
+  Executable copied byte-for-byte to `outputs/NativeAdrenoMetal-bufdiag2`, SHA-256
+  `0d9189764f8d1de7d4e228d95749247acd2919a31227a2f34240e5f2c28047fb`. Not installed on the phone.
+- Test 15 plugin rebuilt once more for iOS 27 against the existing bridge archive; signature verification passed.
+  Executable copied byte-for-byte to `outputs/NativeAdrenoMetal-bufdiag3`, SHA-256
+  `af15975ea6a3c97bb2e25d9fc779f43f5e600bc83e071fdc6f406b8b99e24174`. Not installed on the phone.
+- Test 15 plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed. Added two
+  non-owning `__bridge void *` casts to the new buffer-dump log calls to satisfy ARC. Executable copied byte-for-byte
+  to `outputs/NativeAdrenoMetal-bufdiag4`, SHA-256
+  `47611f240fe6ab774688a86e6aa3ad569346adf19bf4ec674cffb35cafb5ca8d`. Not installed on the phone.
+- Test 15 plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed. Added one
+  non-owning `__bridge void *` cast to the buffer-watch diagnostic log to satisfy ARC. Executable copied byte-for-byte
+  to `outputs/NativeAdrenoMetal-bufdiag5`, SHA-256
+  `ed8d3cb15fd3a90c091148b780404e5ad4245a42e3cb9fd93f798c2808d2fc43`. Not installed on the phone.
+- Missing-buffer diagnostic plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed.
+  Executable copied byte-for-byte to `outputs/NativeAdrenoMetal-missing`, SHA-256
+  `a4d24a93c2250c8f4a22814bb619f37b66d1221b2bd367cdbc7fc54f11f45e42`. Not installed on the phone.
+- Buffer-use trace plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed. The
+  plugin compile suppresses only `-Wframe-address` for the requested parent-frame return-address trace, and the logged
+  Objective-C resource uses a non-owning `__bridge void *` cast. The dSYM is retained at
+  `work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.dSYM` (DWARF binary present). Executable copied
+  byte-for-byte to `outputs/NativeAdrenoMetal-uses`, SHA-256
+  `5faf2d959ccd2089dd13fda0f871ebbfb99cb2cb9e7f4975d5b920d4de36bc68`. Not installed on the phone.
+- Blit descriptor diagnostic plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed.
+  dSYM remains in `work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.dSYM`. Executable copied byte-for-byte to
+  `outputs/NativeAdrenoMetal-blitdesc`, SHA-256
+  `a46b676e9cd612f2b3da5bbb78b8b5f30aed64708231a027ff4017da36cf57fb`. Not installed on the phone.
 - Minecraft in landscape: black screen. backboardd's QuartzCore logs "Failed to allocate [1792 x 828] BGRA framebuffer
   MTLPixelFormatBGRA8Unorm" every frame (outputs/land1-oslog.txt, 105 times in 8 s); the kernel sees layer 0 surface 3
   828x1792 all black (SWEET FB black at display). CA asks for its portrait framebuffer surface as a landscape texture

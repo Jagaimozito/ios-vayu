@@ -122,6 +122,13 @@ GPU / Metal driver (`adrenometal-*.diff` are against `UniXNU/drivers/AdrenoMetal
   (QuartzCore's copy_iosurface in landscape; rectangles are the full sizes), and logs refused requests. New
   bsd/dev/sweet_scaler.c: `kern.sweet_scaler_rot` (0 refuse, 1 clockwise, 2 counter-clockwise), `kern.sweet_scaler_last`
   (latest refused/rotated request in hex), `kern.sweet_scaler_stats`. About 5-19 ms per turn on the CPU.
+- `adrenometal-blitdesc.diff` (on top of `adrenometal-landscape.diff`) - command buffers answer
+  `blitCommandEncoderWithDescriptor:` and `computeCommandEncoderWithDescriptor:`. Minecraft makes its upload encoders with
+  the first; unanswered it got nil, every copyFromBuffer:toBuffer: into its vertex and index buffers was lost, and every
+  frame was black. Confirmed: Minecraft renders (slowly). Also dump-cb-only diagnostics: each bound buffer's maker,
+  contents/gpuAddress/didModifyRange counts and nonzero data at encode, commit and completion; a watch of large mapped
+  buffers every 50 commits; the first callers that use each large buffer (image offsets); the first 24
+  copyFromBuffer:toBuffer: calls; missing selectors to stderr.
 
 Boot-args: `thid_should_crash=0` (an existing xnu tunable) lets apps set non-identity-protected exception ports.
 Apps run as platform binaries on this port, so the iOS 18+ rule for platform tasks killed any app whose crash
