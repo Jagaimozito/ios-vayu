@@ -1,0 +1,16 @@
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -427,6 +427,13 @@
+                 }
+             if (flow[0]) setenv("NATIVE_METAL_FLOW", flow, 1);
+             else unsetenv("NATIVE_METAL_FLOW");
++            // 2026-11-20: /var/local/sweet-rs-atcall (read as each process starts): the render server (backboardd) lowers its render
++            // calls on its own encode thread (the frontend's, gEncodeThread) instead of handing them on to the runtime's lowering
++            // thread: metal-flow bit 1 off there, bits 2 and 4 kept. A scroll profile (outputs/ui-bb-busiest.txt) had the encode
++            // thread ~20% blocked waiting for the lowering thread (end_encoding's room for ends in flight, encoder discard, ends
++            // settled), while CoreAnimation waits for both at every commit (commitAndWaitUntilSubmitted). Other processes unchanged.
++            if (!flow[0] && strcmp(getprogname(), "backboardd") == 0 && access("/var/local/sweet-rs-atcall", F_OK) == 0)
++                setenv("NATIVE_METAL_FLOW", "6", 1);
+         }
+         if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
+         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.

@@ -1,0 +1,1010 @@
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -93,7 +93,7 @@
+ use super::program_objects;
+ use super::queue::{QueueGen, Slot};
+ use super::rebind::{Holds, SubmittedHolds, Taken};
+-use super::render::{Carried, EndInFlight};
++use super::render::{Carried, EndInFlight, LoweringSlot};
+ use super::replay::Replay;
+ use super::residency::Residency;
+ use super::resource::{ObjectId, ResourceKey};
+@@ -678,8 +678,24 @@
+     /// (`render/deferral.rs`): the encoder stays open until it is lowered, and what follows the
+     /// end in the command buffer lowers it first ([`CommandBuffer::settle_end`]).
+     ending: Option<EndInFlight>,
+-    /// The device's lowering thread lowered the end it holds (`ending`).
+-    end_lowered: bool,
++    /// The render encoders' ends handed to the device's lowering thread and not lowered yet
++    /// (ios-sweet 0044): the one `ending` holds and those before it that later render encoders'
++    /// openings, left to the lowering thread too, hold (`render/deferral.rs`, `PendingOpen`). A
++    /// commit waits while any is (`queue_commit`), and runs once the last is lowered
++    /// (`end_lowered`). Was one flag of `ending`'s end, when only one end could be in flight.
++    ends_unlowered: u32,
++    /// The render encoder whose opening its call left to the device's lowering thread
++    /// (ios-sweet 0044, `render/deferral.rs`), by its ticket (`render_tickets`), and its slot,
++    /// until the opening runs: to the program that encoder is open, so another encoder's opening
++    /// or a commit meanwhile is refused as Metal refuses it, after the opening is run here
++    /// ([`CommandBuffer::settle_ended`]).
++    deferred_open: Option<(u64, Arc<LoweringSlot>)>,
++    /// Render encoders asked of the command buffer (ios-sweet 0044): each takes the next at its
++    /// call, its ticket. `render_opened` is the ticket of the next to open: an opening left to
++    /// the lowering thread that runs out of the order the program asked is counted
++    /// (`render::deferred_open_counts`), the ordering check of the deferred openings.
++    render_tickets: u64,
++    render_opened: u64,
+     /// The kept draw its last render encoder carried for its next render encoder, with that
+     /// encoder's bind state (`render/carried.rs`): let go by every call that settles the end
+     /// ([`CommandBuffer::settle_end`]) but a render encoder's opening, which takes it.
+@@ -1427,10 +1443,26 @@
+     pub(super) fn refusal(&self) -> Option<Problem> {
+         match self.queued_commit {
+             Some(_) => Some(Problem::AlreadyCommitted),
++            // A render encoder whose opening its call left to the lowering thread is open to the
++            // program until the opening ran (ios-sweet 0044), a deferred opening's own checks
++            // excepted (`open_refusal`).
++            None if self.deferred_open.is_some() => Some(Problem::EncoderOpen),
+             None => self.commit_refusal(),
+         }
+     }
+ 
++    /// [`refusal`](Self::refusal) of an encoder's opening: of a commit's own work as it runs
++    /// ([`commit_refusal`](Self::commit_refusal)) where a render encoder's opening its call left
++    /// to the device's lowering thread runs now (ios-sweet 0044): its checks at the call were
++    /// made of the command buffer as the program left it then, and a commit since, whose own work
++    /// waits for this encoder's end, does not refuse it.
++    pub(super) fn open_refusal(&self) -> Option<Problem> {
++        match super::render::opening_deferred_now() {
++            true => self.commit_refusal(),
++            false => self.refusal(),
++        }
++    }
++
+     /// [`refusal`](Self::refusal), but of a commit whose own work waited
+     /// (`render/queued_commits.rs`), as it runs.
+     fn commit_refusal(&self) -> Option<Problem> {
+@@ -2129,7 +2161,10 @@
+                 encoder_open: false,
+                 abandoned: false,
+                 ending: None,
+-                end_lowered: false,
++                ends_unlowered: 0,
++                deferred_open: None,
++                render_tickets: 0,
++                render_opened: 0,
+                 carried: None,
+                 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+                 failures_injected: 0,
+@@ -2442,8 +2477,12 @@
+     pub(crate) fn hold_end(&self, ending: EndInFlight) {
+         let mut state = self.state();
+         let held = state.ending.replace(ending);
+-        debug_assert!(held.is_none(), "two render encoders' ends in flight");
+-        state.end_lowered = false;
++        debug_assert!(held.is_none(), "two render encoders' ends held");
++        state.ends_unlowered += 1;
++        // The encoder ending is the one open: where its opening was left to the lowering thread
++        // and has not run, it is no longer open to the program (ios-sweet 0044), and the next
++        // render encoder's opening may be left there too, after this end, which runs it first.
++        state.deferred_open = None;
+     }
+ 
+     /// The render encoder's end the command buffer holds was lowered (`render/deferral.rs`), on
+@@ -2454,8 +2493,11 @@
+     pub(crate) fn end_lowered(self, by_thread: bool) {
+         let queued = {
+             let mut state = self.state();
+-            state.end_lowered = true;
+-            state.queued_commit.is_some()
++            debug_assert!(state.ends_unlowered > 0, "an end lowered that was not held");
++            state.ends_unlowered = state.ends_unlowered.saturating_sub(1);
++            // A commit waits for the last end in flight (ios-sweet 0044): an earlier one lowered
++            // leaves it waiting.
++            state.ends_unlowered == 0 && state.queued_commit.is_some()
+         };
+         let commits = self.0.device.shared().deferred.commits();
+         if let Some(commits) = commits.filter(|commits| queued && commits.ready(&self)) {
+@@ -2502,10 +2544,98 @@
+     /// (`render/carried.rs`): for a render encoder's opening, which takes it, and a read of what
+     /// the encoders left, which records nothing between them.
+     pub(crate) fn settle_ended(&self) {
++        // The opening of a render encoder left to the lowering thread, running now: what it
++        // settles is its own (`render/deferral.rs`, `PendingOpen`), and the end held now may be
++        // that encoder's own, which this would wait for.
++        if super::render::opening_deferred_now() {
++            return;
++        }
+         let ending = self.state().ending.take();
+         if let Some(ending) = ending {
+             ending.finish();
+         }
++        // A render encoder whose opening its call left to the lowering thread, which has not run
++        // it: run here, after every end before it (ios-sweet 0044).
++        let pending =
++            (self.state().deferred_open.as_ref()).map(|(at, slot)| (*at, Arc::clone(slot)));
++        if let Some((at, slot)) = pending {
++            slot.open_pending(self, at);
++        }
++    }
++
++    /// For a render encoder's opening its call leaves to the device's lowering thread (ios-sweet
++    /// 0044, `render/deferral.rs`): the end in flight it is to follow, taken, where the command
++    /// buffer's last encoder was a render encoder whose end its call left to that thread and no
++    /// other call came between; its ticket. `None` where the opening is to run at the call. A
++    /// refusal of Metal's at the call is returned: the command buffer committed or an encoder
++    /// abandoned (an encoder open is the ended one whose end is in flight).
++    pub(crate) fn take_end_for_deferred_open(
++        &self,
++        call: &'static str,
++    ) -> Result<Option<(EndInFlight, u64)>, Error> {
++        let mut state = self.state();
++        if state.ending.is_none() || state.deferred_open.is_some() {
++            return Ok(None);
++        }
++        match state.refusal() {
++            Some(Problem::EncoderOpen) | None => {}
++            Some(problem) => return Err(invalid(call, problem)),
++        }
++        let ending = state.ending.take();
++        let ticket = state.render_tickets;
++        state.render_tickets += 1;
++        Ok(ending.map(|ending| (ending, ticket)))
++    }
++
++    /// The render encoder of ticket `at` opens its pass later, on the device's lowering thread
++    /// (`render/deferral.rs`): open to the program until then.
++    pub(crate) fn defer_open(&self, at: u64, slot: &Arc<LoweringSlot>) {
++        self.state().deferred_open = Some((at, Arc::clone(slot)));
++    }
++
++    /// The opening of ticket `at` runs now: no longer pending.
++    pub(crate) fn deferred_open_runs(&self, at: u64) {
++        let mut state = self.state();
++        if state
++            .deferred_open
++            .as_ref()
++            .is_some_and(|(held, _)| *held == at)
++        {
++            state.deferred_open = None;
++        }
++    }
++
++    /// A render encoder's ticket, taken at its call where its opening runs at the call.
++    pub(crate) fn render_ticket(&self) -> u64 {
++        let mut state = self.state();
++        let ticket = state.render_tickets;
++        state.render_tickets += 1;
++        ticket
++    }
++
++    /// The render encoder of ticket `at` opens its pass now: whether it opens in the order the
++    /// program asked (the ordering check of ios-sweet 0044).
++    pub(crate) fn render_opens(&self, at: u64) -> bool {
++        let mut state = self.state();
++        let in_order = at == state.render_opened;
++        state.render_opened = state.render_opened.max(at + 1);
++        in_order
++    }
++
++    /// A render encoder's opening that its call left to the lowering thread was refused as it
++    /// ran: the command buffer fails, naming the opening, its error kept, as a refusal of a call
++    /// lowered after it returned does (`State::refuse_end`).
++    pub(crate) fn refuse_deferred_open(&self, error: Error) {
++        let mut state = self.state();
++        let place = state.open_encoder_place();
++        let call = EncoderCall::new("renderCommandEncoderWithDescriptor:", 0);
++        state.fail_from(place, CommandBufferError::CallRefused(call));
++        state.refuse_call(error);
++    }
++
++    /// Whether this handle and `other` are the same command buffer.
++    pub(crate) fn same(&self, other: &CommandBuffer) -> bool {
++        Arc::ptr_eq(&self.0, &other.0)
+     }
+ 
+     /// The kept draw the last render encoder carried for the next, taken (`render/carried.rs`).
+@@ -3100,7 +3230,11 @@
+             return Ok(false);
+         };
+         let mut state = self.state();
+-        let end_in_flight = state.ending.is_some() && !state.end_lowered;
++        let end_in_flight = state.ends_unlowered > 0;
++        // A render encoder whose opening waits for the lowering thread is open (ios-sweet 0044).
++        if state.deferred_open.is_some() {
++            return Err(invalid(call, Problem::EncoderOpen));
++        }
+         let queued = commits.lock();
+         if !end_in_flight && queued.idle() {
+             return Ok(false);
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -615,7 +615,7 @@
+         // The last render encoder's end, where its call left it to the device's lowering thread.
+         command_buffer.settle_end();
+         let mut state = command_buffer.state();
+-        if let Some(problem) = state.refusal() {
++        if let Some(problem) = state.open_refusal() {
+             return Err(invalid(call, problem));
+         }
+         // The pool's primary begun ahead where it holds one (`spares.rs`).
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -356,7 +356,7 @@
+ pub use rebind::RebindProblem;
+ #[doc(hidden)]
+ pub use recorder::CommandsRecorded;
+-pub use render::{DrawProblem, RenderCommandEncoder, ResolveTarget};
++pub use render::{deferred_open_counts, DrawProblem, RenderCommandEncoder, ResolveTarget};
+ pub use render_pass::{
+     Attachment, RenderPassColorAttachmentDescriptor, RenderPassDepthAttachmentDescriptor,
+     RenderPassDescriptor, RenderPassProblem, RenderPassStencilAttachmentDescriptor,
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -442,7 +442,9 @@
+ pub(crate) use bound::dynamic_compares;
+ use bound::{Bound, EqualShapes, Now, Recorded};
+ pub(crate) use carried::Carried;
+-pub(crate) use deferral::{lowering, DeferredEncoders, EndInFlight};
++pub use deferral::deferred_open_counts;
++pub(crate) use deferral::opening_deferred_now;
++pub(crate) use deferral::{lowering, DeferredEncoders, EndInFlight, LoweringSlot};
+ use deferral::{Logged, OwnLowering};
+ #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+ pub(crate) use deferral::{BATCH_CALLS, HANDED_BATCHES};
+@@ -1982,16 +1984,87 @@
+         descriptor: &RenderPassDescriptor,
+     ) -> Result<RenderCommandEncoder, Error> {
+         let _for = self.notices_for();
++        // ios-sweet 0044: after a render encoder whose end is in flight, the pass opens on the
++        // device's lowering thread, after that end (`render/deferral.rs`).
++        if let Some(encoder) = self.render_command_encoder_deferred(descriptor)? {
++            return Ok(encoder);
++        }
+         // The last render encoder's end, where its call left it to the device's lowering thread,
+         // and the kept draw it carried (`render/carried.rs`), which nothing came between.
+         self.settle_ended();
+         let carried = self.take_carried();
+         // Metal's process ends here under some protection options (`command_buffer/protection.rs`).
+         self.refuse_protected_encoder("render_command_encoder")?;
++        let ticket = self.render_ticket();
++        let in_order = self.render_opens(ticket);
++        debug_assert!(
++            in_order,
++            "render encoder {ticket} opened at its call out of order"
++        );
+         self.open_render(descriptor, None, None, carried)
+             .map(RenderCommandEncoder::new)
+     }
+ 
++    /// [`render_command_encoder`](Self::render_command_encoder)'s encoder whose pass opens on the
++    /// device's lowering thread (ios-sweet 0044, `render/deferral.rs`): where the command buffer's
++    /// last encoder is a render encoder whose end its call left to that thread, and the pass is
++    /// one the thread may open (no color groups, no rasterization-rate map, no call log for a
++    /// rebind). Metal's checks of the descriptor are made here, as `open_render` makes them, and
++    /// the encoder's calls are checked against the layout they give. `None` where the pass opens
++    /// at the call.
++    fn render_command_encoder_deferred(
++        &self,
++        given: &RenderPassDescriptor,
++    ) -> Result<Option<RenderCommandEncoder>, Error> {
++        const CALL: &str = "render_command_encoder";
++        let device = self.device();
++        let shared = device.shared();
++        let worker = device.compile_device().policy().render_lowering
++            == metal2vulkan::device::RenderLoweringPolicy::Worker;
++        if !worker
++            || !deferral::deferred_opens_on()
++            || lowering_worker::on_the_thread()
++            || crate::exit_guard::closed()
++            || !shared.deferred.worker_runs()
++            || shared.rebinds.any()
++            || shared.rebinds.any_detached_now()
++            || given.rasterization_rate_map.is_some()
++        {
++            return Ok(None);
++        }
++        // Metal's process ends here under some protection options (`command_buffer/protection.rs`).
++        self.refuse_protected_encoder(CALL)?;
++        rate_mapped_pass::check_descriptor(CALL, device, given)?;
++        let taken = render_pass::surface_stencil_loads(given);
++        let layout = render_pass::layout(CALL, self, &*taken)?;
++        if color_groups::grouping(device, &layout).is_some() {
++            return Ok(None);
++        }
++        let shape = PassShape::of(&layout)?;
++        render_target::shared_compatible_pass(device, &shape)?;
++        let Some((before, ticket)) = self.take_end_for_deferred_open(CALL)? else {
++            return Ok(None);
++        };
++        let pending = deferral::PendingOpen::new(before, self.clone(), given.clone(), ticket);
++        let slot = shared.deferred.take_deferred(&layout, pending);
++        self.defer_open(ticket, &slot);
++        deferral::count_deferred_open();
++        Ok(Some(RenderCommandEncoder::deferred(self, slot)))
++    }
++
++    /// The pass of `descriptor` opened now, on whichever thread runs a deferred opening
++    /// (ios-sweet 0044, `render/deferral.rs`): from the kept draw the end before it carried, its
++    /// checks of the command buffer those of a commit's own work as it runs
++    /// (`State::open_refusal`).
++    pub(crate) fn open_deferred_render(
++        &self,
++        descriptor: &RenderPassDescriptor,
++    ) -> Result<Lowering, Error> {
++        let _for = self.notices_for();
++        let carried = self.take_carried();
++        self.open_render(descriptor, None, None, carried)
++    }
++
+     /// [`render_command_encoder`](Self::render_command_encoder)'s encoder, or with `again` the
+     /// residency an ended encoder of the committed command buffer started with, that encoder
+     /// opened again (`render/replay.rs`): over a new `VkCommandBuffer` with no refusal of a
+@@ -2045,7 +2118,7 @@
+         let shape = PassShape::of(&layout)?;
+         let compatible = render_target::shared_compatible_pass(device, &shape)?;
+         if again.is_none() {
+-            if let Some(problem) = self.state().refusal() {
++            if let Some(problem) = self.state().open_refusal() {
+                 return Err(invalid(CALL, problem));
+             }
+         }
+--- a/crates/metal2vulkan-runtime/src/render/call_checks.rs
++++ b/crates/metal2vulkan-runtime/src/render/call_checks.rs
+@@ -94,6 +94,37 @@
+         }
+     }
+ 
++    /// The checks of an encoder whose opening its call left to the lowering thread (ios-sweet
++    /// 0044, `render/deferral.rs`): its state Metal's defaults over `layout`, its pass's layout as
++    /// the descriptor gives it (no rasterization-rate map: such a pass opens at its call), as the
++    /// opening will make them.
++    pub(super) fn preview(layout: &PassLayout) -> CallChecks {
++        CallChecks {
++            tables: Default::default(),
++            pipeline: None,
++            state: Versioned::new(EncoderState::metal_defaults(layout.extent)),
++            amplification: Versioned::new(Amplification::default()),
++            layout: layout.clone(),
++            rate_map: None,
++            settled: None,
++            stores_set: false,
++        }
++    }
++
++    /// These checks made [`preview`](Self::preview)'s, their lists' room kept.
++    pub(super) fn reset_preview(&mut self, layout: &PassLayout) {
++        for table in &mut self.tables {
++            table.clear();
++        }
++        self.pipeline = None;
++        self.state = Versioned::new(EncoderState::metal_defaults(layout.extent));
++        self.amplification = Versioned::new(Amplification::default());
++        self.layout.clone_from(layout);
++        self.rate_map = None;
++        self.settled = None;
++        self.stores_set = false;
++    }
++
+     /// These checks made the checks of `lowering`'s encoder, as [`new`](Self::new) makes them, in
+     /// their own lists: with no allocation where an earlier encoder's left room enough.
+     pub(super) fn reset(&mut self, lowering: &RenderLowering) {
+--- a/crates/metal2vulkan-runtime/src/render/deferral.rs
++++ b/crates/metal2vulkan-runtime/src/render/deferral.rs
+@@ -66,6 +66,21 @@
+ //! - **Slots.** Each encoder's lowering, checks and batches lie in a slot the device keeps
+ //!   ([`DeferredEncoders`]), which the encoder's end (or the command buffer's settling of it) or
+ //!   drop gives back for the device's next encoder, its batches' room kept.
++//! - **Openings left to the thread** (ios-sweet 0044). A render encoder asked of a command buffer
++//!   whose last encoder was a render encoder with its end in flight opens its pass on the
++//!   lowering thread too ([`PendingOpen`]): its call makes Metal's checks of the descriptor and
++//!   returns an encoder that logs its calls, checked against the pass's layout as the descriptor
++//!   gives it, and its slot holds the opening with the end before it. Whoever first lowers
++//!   anything of the slot (the lowering thread at its first turn there, or a drain on the
++//!   program's thread) runs the opening first ([`Lowerer::ready`]): the end before it settled
++//!   (already lowered, on the thread, which takes slots in the order they were handed), then the
++//!   pass opened as at the call, from the kept draw that end carried. So the program's thread no
++//!   longer waits at a pass boundary for the thread to lower the last pass. A call that needs
++//!   the command buffer as its encoders leave it runs a pending opening first
++//!   (`CommandBuffer::settle_ended`). A refusal the opening finds fails the command buffer,
++//!   naming the opening (`CommandBuffer::refuse_deferred_open`). Each render encoder takes a
++//!   ticket at its call; one that opens out of the order the program asked is counted
++//!   ([`deferred_open_counts`]). `M2V_DEFERRED_OPEN=0` opens every pass at its call, as before.
+ 
+ use super::call_checks::{CallChecks, Checked};
+ use super::lowering_worker::{self, LoweringWorker};
+@@ -77,10 +92,13 @@
+ use crate::error::{internal, EncoderCall, Error};
+ use crate::exit_guard;
+ use crate::live_bind::LiveBind;
++use crate::render_pass::{PassLayout, RenderPassDescriptor};
+ use crate::replay::CallLog;
+ use metal2vulkan::device::RenderLoweringPolicy;
++use std::cell::Cell;
+ use std::collections::VecDeque;
+ use std::marker::PhantomData;
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+ 
+ /// The calls of a batch (the module docs): few enough that the lowering thread starts on a pass's
+@@ -135,7 +153,10 @@
+     /// one refused failing the command buffer, and none after it lowered; counted as lowered on
+     /// the lowering thread (`by_thread`) or the program's.
+     fn lower(&self, lowerer: &mut Lowerer, by_thread: bool) {
+-        let Lowerer { lowering, refused } = lowerer;
++        lowerer.ready(by_thread);
++        let Lowerer {
++            lowering, refused, ..
++        } = lowerer;
+         let Some(lowering) = lowering else {
+             return;
+         };
+@@ -239,6 +260,125 @@
+     lowering: Option<Lowering>,
+     /// A call was refused as it was lowered: no later call is lowered.
+     refused: bool,
++    /// The encoder's opening, which its call left to the lowering thread (ios-sweet 0044, the
++    /// module docs): run before anything of the slot is lowered ([`Lowerer::ready`]).
++    opening: Option<PendingOpen>,
++    /// The command buffer of an opening refused as it ran: its end is still counted lowered and
++    /// handed back ([`end_lowering`]), with no lowering to end.
++    failed_open: Option<CommandBuffer>,
++}
++
++/// A render encoder's opening its call left to the device's lowering thread (ios-sweet 0044, the
++/// module docs): the end in flight it follows, its command buffer, the descriptor as the program
++/// gave it, and its ticket among the command buffer's render encoders.
++pub(crate) struct PendingOpen {
++    before: Option<EndInFlight>,
++    command_buffer: CommandBuffer,
++    descriptor: Box<RenderPassDescriptor>,
++    ticket: u64,
++}
++
++impl PendingOpen {
++    pub(crate) fn new(
++        before: EndInFlight,
++        command_buffer: CommandBuffer,
++        descriptor: RenderPassDescriptor,
++        ticket: u64,
++    ) -> PendingOpen {
++        PendingOpen {
++            before: Some(before),
++            command_buffer,
++            descriptor: Box::new(descriptor),
++            ticket,
++        }
++    }
++}
++
++impl Lowerer {
++    /// Run the encoder's opening where its call left it here (the module docs), on the lowering
++    /// thread (`by_thread`) or the program's: the end before it settled, then the pass opened,
++    /// or the command buffer failed with the opening's refusal.
++    fn ready(&mut self, by_thread: bool) {
++        let Some(pending) = self.opening.take() else {
++            return;
++        };
++        let PendingOpen {
++            before,
++            command_buffer,
++            descriptor,
++            ticket,
++        } = pending;
++        // Lowered already where this is the lowering thread, which took the slot before this one.
++        if let Some(before) = before {
++            before.finish();
++        }
++        let counts = &DEFERRED_OPEN_COUNTS;
++        counts[if by_thread { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
++        if !command_buffer.render_opens(ticket) {
++            counts[3].fetch_add(1, Ordering::Relaxed);
++            debug_assert!(false, "render encoder {ticket} opened out of order");
++        }
++        let opened = opening::during(|| command_buffer.open_deferred_render(&descriptor));
++        // Pending to the program until here: a call of the program's that needs it opened, made
++        // meanwhile, waits for this slot's lowering instead of passing it (`settle_ended`).
++        command_buffer.deferred_open_runs(ticket);
++        match opened {
++            Ok(lowering) => self.lowering = Some(lowering),
++            Err(error) => {
++                counts[4].fetch_add(1, Ordering::Relaxed);
++                command_buffer.refuse_deferred_open(error);
++                self.refused = true;
++                self.failed_open = Some(command_buffer);
++            }
++        }
++    }
++}
++
++/// The deferred openings (ios-sweet 0044, the module docs): `[0]` left to the lowering thread at
++/// their calls, `[1]` run by that thread, `[2]` run on the program's thread (a drain, or a call
++/// that needs the encoders' work), `[3]` run out of the order the program asked, `[4]` refused as
++/// they ran.
++static DEFERRED_OPEN_COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
++
++/// A render encoder's opening left to the lowering thread at its call.
++pub(crate) fn count_deferred_open() {
++    DEFERRED_OPEN_COUNTS[0].fetch_add(1, Ordering::Relaxed);
++}
++
++/// The deferred openings' counts ([`DEFERRED_OPEN_COUNTS`]).
++pub fn deferred_open_counts() -> [u64; 5] {
++    DEFERRED_OPEN_COUNTS
++        .each_ref()
++        .map(|count| count.load(Ordering::Relaxed))
++}
++
++/// Whether a render encoder's opening may be left to the lowering thread: unless
++/// `M2V_DEFERRED_OPEN=0` (ios-sweet 0044), read once.
++pub(crate) fn deferred_opens_on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("M2V_DEFERRED_OPEN").is_none_or(|value| value != "0"))
++}
++
++/// A deferred opening runs on this thread now ([`Lowerer::ready`]): the command buffer's settling
++/// is its own, and its checks are of the command buffer as the program left it at the call.
++pub(crate) fn opening_deferred_now() -> bool {
++    opening::OPENING.with(Cell::get)
++}
++
++mod opening {
++    use std::cell::Cell;
++
++    thread_local! {
++        pub(super) static OPENING: Cell<bool> = const { Cell::new(false) };
++    }
++
++    /// Run `f` as a deferred opening.
++    pub(super) fn during<T>(f: impl FnOnce() -> T) -> T {
++        let outer = OPENING.with(|opening| opening.replace(true));
++        let ran = f();
++        OPENING.with(|opening| opening.set(outer));
++        ran
++    }
+ }
+ 
+ struct SlotState {
+@@ -336,7 +476,18 @@
+ /// slot's locks, since its drop may give the slot back (an end in flight the command buffer
+ /// held, `CommandBuffer::hold_end`).
+ fn end_lowering(lowerer: &mut Lowerer, at: u32, by_thread: bool) -> Option<CommandBuffer> {
+-    let mut lowering = lowerer.lowering.take()?;
++    lowerer.ready(by_thread);
++    let Some(mut lowering) = lowerer.lowering.take() else {
++        // An opening refused as it ran (ios-sweet 0044): the command buffer failed then; its end
++        // is counted lowered, and a commit that waits for it runs.
++        let command_buffer = lowerer.failed_open.take()?;
++        let shared = command_buffer.device().shared();
++        shared.counts.render_log_end_lowered(by_thread);
++        if let Some(worker) = shared.deferred.started() {
++            worker.end_done();
++        }
++        return Some(command_buffer);
++    };
+     let command_buffer = lowering.core.command_buffer().clone();
+     let shared = lowering.core.device().shared();
+     shared.counts.render_log_end_lowered(by_thread);
+@@ -411,6 +562,19 @@
+         }
+     }
+ 
++    /// Run the opening of `command_buffer`'s render encoder of ticket `at` where its call left
++    /// it here and nothing has run it (ios-sweet 0044, `CommandBuffer::settle_ended`): nothing
++    /// where the slot holds another opening, or none.
++    pub(crate) fn open_pending(&self, command_buffer: &CommandBuffer, at: u64) {
++        let mut lowerer = lock(&self.lowerer);
++        let ours = (lowerer.opening.as_ref()).is_some_and(|pending| {
++            pending.ticket == at && pending.command_buffer.same(command_buffer)
++        });
++        if ours {
++            lowerer.ready(false);
++        }
++    }
++
+     /// The lowering thread leaves the slot with what is handed, unlowered: the process exits, or
+     /// the thread ended.
+     pub(super) fn left_by_thread(&self) {
+@@ -456,6 +620,7 @@
+         );
+         let state = &mut *guard;
+         let mut lowerer = lock(&self.lowerer);
++        lowerer.ready(false);
+         for batch in state.handed.iter().chain([&state.filling]) {
+             batch.lower(&mut lowerer, false);
+         }
+@@ -494,7 +659,11 @@
+         // Before the slot is free, so no later encoder's lowering goes here.
+         let gone = {
+             let mut lowerer = lock(&self.lowerer);
++            // An encoder dropped before its opening ran (ios-sweet 0044): opened now, after the
++            // end before it, and abandoned as one opened at its call would be.
++            lowerer.ready(false);
+             lowerer.refused = false;
++            lowerer.failed_open = None;
+             lowerer.lowering.take()
+         };
+         // An end handed and never lowered (its command buffer goes): room for the next.
+@@ -544,28 +713,7 @@
+         let slot = match kept {
+             Some(slot) => slot,
+             None => {
+-                let slot = Arc::new(LoweringSlot {
+-                    state: Mutex::new(SlotState {
+-                        taken: false,
+-                        checks: None,
+-                        checking: false,
+-                        filling: Batch::new(0),
+-                        handed: VecDeque::new(),
+-                        busy: false,
+-                        draining: false,
+-                        queued: false,
+-                        panicked: false,
+-                        ending: None,
+-                        lowered: Vec::new(),
+-                        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+-                        late: None,
+-                    }),
+-                    lowerer: Mutex::new(Lowerer {
+-                        lowering: None,
+-                        refused: false,
+-                    }),
+-                    handed_back: Condvar::new(),
+-                });
++                let slot = Self::new_slot();
+                 slots.push(Arc::clone(&slot));
+                 slot
+             }
+@@ -583,6 +731,77 @@
+         slot
+     }
+ 
++    /// A new slot, taken by none.
++    fn new_slot() -> Arc<LoweringSlot> {
++        Arc::new(LoweringSlot {
++            state: Mutex::new(SlotState {
++                taken: false,
++                checks: None,
++                checking: false,
++                filling: Batch::new(0),
++                handed: VecDeque::new(),
++                busy: false,
++                draining: false,
++                queued: false,
++                panicked: false,
++                ending: None,
++                lowered: Vec::new(),
++                #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
++                late: None,
++            }),
++            lowerer: Mutex::new(Lowerer {
++                lowering: None,
++                refused: false,
++                opening: None,
++                failed_open: None,
++            }),
++            handed_back: Condvar::new(),
++        })
++    }
++
++    /// A slot for an encoder whose opening its call left to the lowering thread, which logs its
++    /// calls, checked against `layout`, its pass's layout as the descriptor gives it, holding
++    /// `pending`, its opening (ios-sweet 0044, the module docs).
++    pub(crate) fn take_deferred(
++        &self,
++        layout: &PassLayout,
++        pending: PendingOpen,
++    ) -> Arc<LoweringSlot> {
++        let mut slots = lock(&self.slots);
++        let kept = slots.iter().find(|slot| !lock(&slot.state).taken).cloned();
++        let slot = match kept {
++            Some(slot) => slot,
++            None => {
++                let slot = Self::new_slot();
++                slots.push(Arc::clone(&slot));
++                slot
++            }
++        };
++        let mut state = lock(&slot.state);
++        state.taken = true;
++        drop(slots);
++        state.checking = true;
++        match &mut state.checks {
++            Some(checks) => checks.reset_preview(layout),
++            None => state.checks = Some(CallChecks::preview(layout)),
++        }
++        {
++            let mut lowerer = lock(&slot.lowerer);
++            lowerer.lowering = None;
++            lowerer.refused = false;
++            lowerer.failed_open = None;
++            lowerer.opening = Some(pending);
++        }
++        drop(state);
++        slot
++    }
++
++    /// Whether the device's lowering thread started and lowers what it is handed: a render
++    /// encoder's opening may be left to it (ios-sweet 0044).
++    pub(crate) fn worker_runs(&self) -> bool {
++        self.started().is_some_and(LoweringWorker::runs)
++    }
++
+     /// The device's commits that wait for a render encoder's end (`render/queued_commits.rs`):
+     /// none where its lowering thread never started, since no end waits for it then.
+     pub(crate) fn commits(&self) -> Option<&QueuedCommits> {
+@@ -742,6 +961,26 @@
+         }
+     }
+ 
++    /// The program's encoder of `command_buffer` over `slot`, which holds its opening, left to
++    /// the lowering thread (ios-sweet 0044, the module docs): it logs its calls.
++    pub(super) fn deferred(
++        command_buffer: &CommandBuffer,
++        slot: Arc<LoweringSlot>,
++    ) -> RenderCommandEncoder {
++        let logged = Logged {
++            slot,
++            device: command_buffer.device().clone(),
++            command_buffer: command_buffer.downgrade(),
++            at_call: false,
++        };
++        RenderCommandEncoder {
++            own: None,
++            logged: Some(logged),
++            next: 0,
++            unshared: PhantomData,
++        }
++    }
++
+     /// Whether the encoder lowers each call inside it (the module docs).
+     pub(crate) fn lowers_at_call(&self) -> bool {
+         self.logged.as_ref().is_none_or(|logged| logged.at_call)
+@@ -758,6 +997,7 @@
+             (Some(lowering), _) => lowering.logged(f),
+             (None, Some(logged)) => {
+                 let mut lowerer = lock(&logged.slot.lowerer);
++                lowerer.ready(false);
+                 let lowering = (lowerer.lowering.as_mut())
+                     .ok_or_else(|| internal("an ended encoder's call"))?;
+                 lowering.logged(f)
+@@ -789,7 +1029,9 @@
+         match (&mut self.own, &self.logged) {
+             (Some(lowering), _) => lowered(lowering),
+             (None, Some(logged)) => {
+-                if let Some(lowering) = lock(&logged.slot.lowerer).lowering.as_mut() {
++                let mut lowerer = lock(&logged.slot.lowerer);
++                lowerer.ready(false);
++                if let Some(lowering) = lowerer.lowering.as_mut() {
+                     lowered(lowering);
+                 }
+             }
+--- a/crates/metal2vulkan-runtime/src/tests/deferred_calls.rs
++++ b/crates/metal2vulkan-runtime/src/tests/deferred_calls.rs
+@@ -1816,3 +1816,227 @@
+     assert!(!(heard.lock().unwrap().iter())
+         .any(|notice| notice.degradation == Degradation::DrawDroppedStillMaking));
+ }
++
++/// The colors of [`deferred_passes`]' passes, in order, each of fifths, whose `RGBA8Unorm` bytes
++/// are exact, and those bytes packed (ios-sweet 0044).
++const PASS_COLORS: [[f32; 4]; 6] = [
++    [0.2, 0.4, 0.6, 1.0],
++    [0.4, 0.6, 0.8, 1.0],
++    [0.6, 0.8, 1.0, 1.0],
++    [0.8, 1.0, 0.2, 1.0],
++    [1.0, 0.2, 0.4, 1.0],
++    [0.0, 0.2, 0.4, 1.0],
++];
++
++/// `color`'s `RGBA8Unorm` bytes, packed.
++fn packed(color: [f32; 4]) -> u32 {
++    u32::from_le_bytes(color.map(|c| (c * 255.0).round() as u8))
++}
++
++/// A pass over `target` that draws the rectangle in `color`: the first clears the target, the
++/// others load what the passes before left.
++fn color_pass(
++    command_buffer: &CommandBuffer,
++    state: &RenderPipelineState,
++    target: &Texture,
++    color: [f32; 4],
++    first: bool,
++) -> RenderCommandEncoder {
++    let mut descriptor = pass(target);
++    if !first {
++        descriptor.color_attachments[0].load_action = crate::LoadAction::Load;
++    }
++    let mut encoder = command_buffer.render_command_encoder(&descriptor).unwrap();
++    rectangle(state, &mut encoder);
++    encoder
++        .set_fragment_bytes(&bytes_of(&color, f32::to_le_bytes), 0)
++        .unwrap();
++    encoder
++        .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
++        .unwrap();
++    encoder
++}
++
++/// How far [`passes_after_an_end_in_flight_open_without_waiting_and_keep_their_order`]'s
++/// encoding thread got: a pass drawn (opened, its calls made), a pass ended, or all of them.
++#[derive(Debug)]
++#[allow(dead_code)] // the passes' numbers are read through `Debug`, in the failure message
++enum Stage {
++    Drawn(usize),
++    Ended(usize),
++    Done,
++}
++
++/// Wait for [`Stage::Done`], each stage within [`WAIT`]: `Err` with the last stage reached (or
++/// `None`) where one did not come.
++fn until_done(passes: &mpsc::Receiver<Stage>) -> Result<(), Option<Stage>> {
++    let mut last = None;
++    loop {
++        match passes.recv_timeout(WAIT) {
++            Ok(Stage::Done) => return Ok(()),
++            Ok(stage) => last = Some(stage),
++            Err(_) => return Err(last),
++        }
++    }
++}
++
++/// ios-sweet 0044: render encoders asked after a render encoder whose end is in flight open their
++/// passes on the lowering thread, after that end. With the first pass's lowering held (Worker),
++/// three more passes open, draw and end without waiting for it (four ends in flight, the
++/// lowering thread's cap); then two more, a copy back and the commit; every pass ran, in order:
++/// the target holds the last pass's color, under both policies. None of the openings ran out of
++/// the order asked, and under Worker the openings after an end in flight were left to the thread.
++#[test]
++fn passes_after_an_end_in_flight_open_without_waiting_and_keep_their_order() {
++    let scratch = Scratch::new("deferred-open-order");
++    for policy in POLICIES {
++        let device = device(&scratch.0, policy, &[], &Heard::default());
++        let before = crate::deferred_open_counts();
++        let (opened, open) = mpsc::channel();
++        let (go, going) = mpsc::channel::<()>();
++        let (passed, passes) = mpsc::channel();
++        let encoding = std::thread::spawn({
++            let device = device.clone();
++            move || {
++                let state = rectangle_state(&device);
++                let queue = device.new_command_queue().unwrap();
++                let command_buffer = queue.command_buffer().unwrap();
++                let target = target(&device);
++                let first = color_pass(&command_buffer, &state, &target, PASS_COLORS[0], true);
++                opened.send(()).unwrap();
++                going.recv().unwrap();
++                first.end_encoding().unwrap();
++                passed.send(Stage::Ended(0)).unwrap();
++                for (at, &color) in PASS_COLORS[1..4].iter().enumerate() {
++                    let encoder = color_pass(&command_buffer, &state, &target, color, false);
++                    passed.send(Stage::Drawn(at + 1)).unwrap();
++                    encoder.end_encoding().unwrap();
++                    passed.send(Stage::Ended(at + 1)).unwrap();
++                }
++                passed.send(Stage::Done).unwrap();
++                for &color in &PASS_COLORS[4..] {
++                    color_pass(&command_buffer, &state, &target, color, false)
++                        .end_encoding()
++                        .unwrap();
++                }
++                let back = copy_back(&device, &command_buffer, &target);
++                committed(&command_buffer, &back)
++            }
++        });
++        open.recv().unwrap();
++        let returned = match policy {
++            RenderLoweringPolicy::Worker => {
++                let slots = device.shared().deferred.taken();
++                let [slot] = &slots[..] else {
++                    panic!("{} encoders' slots taken, not one", slots.len());
++                };
++                slot.while_held(|| {
++                    go.send(()).unwrap();
++                    until_done(&passes)
++                })
++            }
++            _ => {
++                go.send(()).unwrap();
++                until_done(&passes)
++            }
++        };
++        assert!(
++            returned.is_ok(),
++            "{policy:?}: the encoding thread stopped after {:?} while the first pass's lowering was \
++             held; deferred-open counts {:?} (at the test's start {before:?})",
++            returned.err(),
++            crate::deferred_open_counts()
++        );
++        let words = encoding.join().unwrap();
++        let last = packed(PASS_COLORS[PASS_COLORS.len() - 1]);
++        assert!(
++            words.iter().all(|&word| word == last),
++            "{policy:?}: {:x?}, not {last:x}",
++            &words[..4]
++        );
++        let after = crate::deferred_open_counts();
++        assert_eq!(
++            after[3], 0,
++            "{policy:?}: an opening ran out of order: {after:?}"
++        );
++        assert_eq!(
++            after[4], before[4],
++            "{policy:?}: an opening was refused: {after:?}"
++        );
++        if policy == RenderLoweringPolicy::Worker {
++            assert!(
++                after[0] > before[0],
++                "{policy:?}: no opening was deferred: {after:?}"
++            );
++        }
++    }
++}
++
++/// ios-sweet 0044: while a render encoder whose opening was left to the lowering thread is open,
++/// a commit and another encoder's opening are refused as Metal refuses them with an encoder open,
++/// under both policies with the same answers; once it ends, the command buffer runs both passes
++/// in order.
++#[test]
++fn an_encoder_whose_opening_waits_is_open_to_the_program() {
++    let scratch = Scratch::new("deferred-open-open");
++    for policy in POLICIES {
++        let device = device(&scratch.0, policy, &[], &Heard::default());
++        let state = rectangle_state(&device);
++        let queue = device.new_command_queue().unwrap();
++        let command_buffer = queue.command_buffer().unwrap();
++        let target = target(&device);
++        color_pass(&command_buffer, &state, &target, PASS_COLORS[0], true)
++            .end_encoding()
++            .unwrap();
++        let second = color_pass(&command_buffer, &state, &target, PASS_COLORS[1], false);
++        assert_eq!(
++            command_buffer.commit(),
++            Err(invalid("commit", Problem::EncoderOpen)),
++            "{policy:?}"
++        );
++        assert_eq!(
++            command_buffer.blit_command_encoder().err(),
++            Some(invalid("blit_command_encoder", Problem::EncoderOpen)),
++            "{policy:?}"
++        );
++        second.end_encoding().unwrap();
++        let back = copy_back(&device, &command_buffer, &target);
++        let words = committed(&command_buffer, &back);
++        let expected = packed(PASS_COLORS[1]);
++        assert!(
++            words.iter().all(|&word| word == expected),
++            "{policy:?}: {:x?}",
++            &words[..4]
++        );
++    }
++}
++
++/// ios-sweet 0044: a render encoder dropped unended before its opening, left to the lowering
++/// thread, ran abandons its command buffer as one opened at its call does: its commit is refused
++/// with the encoder abandoned, under both policies.
++#[test]
++fn an_encoder_dropped_before_its_deferred_opening_abandons_its_command_buffer() {
++    let scratch = Scratch::new("deferred-open-dropped");
++    for policy in POLICIES {
++        let device = device(&scratch.0, policy, &[], &Heard::default());
++        let state = rectangle_state(&device);
++        let queue = device.new_command_queue().unwrap();
++        let command_buffer = queue.command_buffer().unwrap();
++        let target = target(&device);
++        color_pass(&command_buffer, &state, &target, PASS_COLORS[0], true)
++            .end_encoding()
++            .unwrap();
++        drop(color_pass(
++            &command_buffer,
++            &state,
++            &target,
++            PASS_COLORS[1],
++            false,
++        ));
++        assert_eq!(
++            command_buffer.commit(),
++            Err(invalid("commit", Problem::EncoderAbandoned)),
++            "{policy:?}"
++        );
++    }
++}
