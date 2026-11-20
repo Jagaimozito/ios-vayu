@@ -70,6 +70,9 @@
   bridge archive (no bridge rebuild); signature verification passed. Executable copied byte-for-byte to
   `outputs/NativeAdrenoMetal-bindcache`, SHA-256 `2068c804e060a1ca355466196ec1dd9a1467e838ac1ccc6d1f48ad45063bb326`.
   Not installed on the phone.
+- Results: bindcache on the xfrot image (diag=1): 21.7 fps steady (outputs/mc-fps6.txt), rendering looks right (user).
+  xfrot-nodiag image + bindcache at ~7 min uptime (mc-fps8.txt, backboardd back to 10%): 17-21 fps, minecraftpe 268%:
+  no measurable gain from dropping diag=1 (scene-to-scene variation is larger). The phone runs the nodiag image now.
 - Built `outputs/guacamole-ios27a-xfrot-nodiag-triple.img` with the xfrot kernel and ADT; preserved the iOS 16
   payload and selector shim. Removed only `diag=1`, refreshed `sweettime` to `1795138076` (589-character boot args).
   Sidecar: `outputs/guacamole-ios27a-xfrot-nodiag-triple-boot-args.txt`. SHA-256

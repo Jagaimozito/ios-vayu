@@ -131,6 +131,10 @@ GPU / Metal driver (`adrenometal-*.diff` are against `UniXNU/drivers/AdrenoMetal
   copyFromBuffer:toBuffer: calls; missing selectors to stderr.
   Also: -[NBBuffer contents] answers from a cached pointer after its first non-null answer (the bridge pins the buffer
   then); each bridge call had been about a quarter of Minecraft's render thread. Minecraft 10.5 -> 12.3 fps.
+- `adrenometal-bindcache.diff` (on top of `adrenometal-blitdesc.diff`) - encoders skip a bind that changes nothing:
+  the same buffer and offset, texture or sampler already in that slot (first 32 slots of compute, vertex, fragment
+  and tile stages; setBytes forgets the slot's buffer; an unchanged setBufferOffset is skipped too). Minecraft 12.3 ->
+  about 21 fps, rendering unchanged. Made/skipped counts go to the dump file every 500 commits with dump-cb on.
 
 Boot-args: `thid_should_crash=0` (an existing xnu tunable) lets apps set non-identity-protected exception ports.
 Apps run as platform binaries on this port, so the iOS 18+ rule for platform tasks killed any app whose crash
