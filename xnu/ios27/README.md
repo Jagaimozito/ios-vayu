@@ -99,6 +99,29 @@ GPU / Metal driver (`adrenometal-*.diff` are against `UniXNU/drivers/AdrenoMetal
   it hands its slot to the lowering thread again, and after 3 such waits lowers on its own thread
   (`ROOM_STALLS` counts them). Candy Crush froze 5-10 s with its main thread in `wait_for_room` and the lowering
   thread parked: a lost hand-off. Built in source only; not yet confirmed on the phone.
+- `adrenometal-landscape.diff` - landscape apps (2026-11-19). backboardd asks for its portrait framebuffer surface
+  (828x1792) as a 1792x828 texture with a private rotation (QuartzCore: setRotation:3, then
+  newTextureWithDescriptor:iosurface:plane:); the runtime cannot make it (rows too short) and the screen went black
+  ("Failed to allocate [1792 x 828] BGRA framebuffer"). Such a view that is drawn into (RenderTarget usage) now gets a
+  private landscape texture of ours, turned into the surface at the end of every command buffer that draws into it,
+  blits into it, writes it from a shader or presents it (port of the iOS 16 frontend's 0196). Sampled-only views are
+  still refused, so CA goes through the scaler (`xnu12377-scaler-rotate.diff`). Apps' own rotated CAMetalLayer drawables
+  (rotation 1) take the same path. Direction from the descriptor's rotation; `/var/local/sweet-rotate-flip` inverts it,
+  `/var/local/sweet-norotate` turns it off, `/var/local/sweet-rotate-tint` tints the turn red (test). Always-on log lines
+  "native-metal: rotated framebuffer: ..." (first 40 per process). Also: refused render pipelines log their vertex layout;
+  error lines to stderr keep 600 characters. Confirmed: the landscape lock screen/launch screen and the turned frames
+  reach the display.
+- `adrenometal-vertex-absent.diff` - bridge patch 0043: a vertex attribute the function reads and the descriptor lacks is
+  left unfetched instead of refusing the pipeline, as Apple's driver does. Confirmed: Minecraft's pipelines are no
+  longer refused.
+- `adrenometal-vattr-dumpfile.diff` - NBFunction answers vertexAttributes / stageInputAttributes (new bridge calls
+  nmb_function_attribute_count/_at); bgfx (Minecraft) builds its vertex descriptors from them. Confirmed: Minecraft's
+  descriptors are now filled. And dump-cb can come from the file /var/local/dump-cb (NAME:FIRST[:COUNT]) instead of the
+  boot-arg; it also sets NMB_LOG_STDERR and SHENG_LOG_GPU for that process.
+- `xnu12377-scaler-rotate.diff` - the CPU AppleM2ScalerCSCDriver stand-in turns W x H -> H x W BGRA/RGBA requests
+  (QuartzCore's copy_iosurface in landscape; rectangles are the full sizes), and logs refused requests. New
+  bsd/dev/sweet_scaler.c: `kern.sweet_scaler_rot` (0 refuse, 1 clockwise, 2 counter-clockwise), `kern.sweet_scaler_last`
+  (latest refused/rotated request in hex), `kern.sweet_scaler_stats`. About 5-19 ms per turn on the CPU.
 
 Boot-args: `thid_should_crash=0` (an existing xnu tunable) lets apps set non-identity-protected exception ports.
 Apps run as platform binaries on this port, so the iOS 18+ rule for platform tasks killed any app whose crash

@@ -1,3 +1,145 @@
+# Landscape games black: CA's rotated framebuffer (2026-11-19, Claude) -- system landscape fixed, Minecraft open
+- Summary: landscape now works through the system (backboardd's rotated framebuffer, apps' rotated drawables, the
+  kernel scaler's rotation); diffs in xnu/ios27/ (adrenometal-landscape, adrenometal-vertex-absent = bridge 0043,
+  adrenometal-vattr-dumpfile, xnu12377-scaler-rotate). Minecraft still black (test 14, outputs/land17/): its descriptors
+  are filled and it draws, but every vertex buffer it binds reads all zero at the bound offset on the CPU (title cube
+  at offset 0 of a 4 MB buffer included), and its frame reads back black. Next: how Minecraft fills its vertex buffers
+  (private storage + blit? a buffer we answer contents for wrongly?).
+- Minecraft in landscape: black screen. backboardd's QuartzCore logs "Failed to allocate [1792 x 828] BGRA framebuffer
+  MTLPixelFormatBGRA8Unorm" every frame (outputs/land1-oslog.txt, 105 times in 8 s); the kernel sees layer 0 surface 3
+  828x1792 all black (SWEET FB black at display). CA asks for its portrait framebuffer surface as a landscape texture
+  (descriptor rotation SPI); the iOS 27 frontend refused it (textureOnBuffer: rows too short). iOS 16's frontend had the
+  fix (0196, userland/metal2): ported to work/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+  (rotatedSurfaceTexture, rotationPipeline, NBCommandBuffer.rotatedShadows, a turning pass at -commit).
+  Backup: research/ios27.2/metal/NativeBridgeMetalFrontend.mm.before-rotate.
+- Direction: descriptor rotation 3 -> clockwise, else counter-clockwise; /var/local/sweet-rotate-flip inverts both,
+  /var/local/sweet-norotate turns it off. Read when a shadow is made (respring). Logs: "native-metal: rotated
+  framebuffer: surface ... (descriptor rotation N)" and "rotated framebuffer: turn N into surface".
+- Codex: rebuild the ios27 plugin (scripts/build-adreno-metal-plugin.py --target ios27, same as the roomstall build;
+  the source also still has bridge patch 0042) and copy the executable to outputs/NativeAdrenoMetal-rotate.
+- Built with `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`; optional host replay generation was skipped after its shim failed to link. Fixed four Objective-C++ protocol-pointer type errors with explicit `id<MTLTexture>` casts only. Bundle codesign verification passed; executable copied byte-for-byte to `outputs/NativeAdrenoMetal-rotate`, SHA-256 `7a1e7c4a89e3896ad6897cbc0c31e895fae4a01a900a6c3f5cbf9e1ca0a4de3d`.
+- Test 1 (land2-oslog.txt, NativeAdrenoMetal-rotate installed): still black, "Failed to allocate [1792 x 828]" 156
+  times, and no rotation lines: NBLOG only reaches the log with SHENG_LOG_GPU set. QuartzCore (dsc 0x18434f3d8..):
+  texture2DDescriptorWithPixelFormat:width:height:mipmapped: landscape size, setFramebufferOnly:YES, setRotation:3,
+  setUsage:5 (or 0x11), then newTextureWithDescriptor:iosurface:plane:0; a nil texture logs "Failed to allocate".
+  So our path is the one called. Added always-on logs (RLOG, first 40 lines; refuseSurface logs landscape-shaped
+  refusals with their step). Codex: rebuild as before, executable to outputs/NativeAdrenoMetal-rotate2.
+- Test 2 (land3-oslog.txt): turning pipeline compiled, portrait texture over the surface made; the shadow failed: "no
+  1792x828 texture of our own". It was a copy of CA's descriptor (framebufferOnly YES, rotation 3). Now a plain
+  texture2DDescriptor (private, RenderTarget|ShaderRead); the failure line carries lastError(). Codex: rebuild,
+  executable to outputs/NativeAdrenoMetal-rotate3.
+- Test 3 (rotate3, land4-oslog.txt): framebuffer fixed: "a landscape texture of ours, turned counter-clockwise",
+  1200 turns in 35 s, no "Failed to allocate" left. Mojang logo shows for a second, then black: backboardd logs
+  "IOSurfaceAcceleratorTransformSurface returned: 0xe00002c7" every frame (1456x). QuartzCore 0x1844b7460 is
+  copy_iosurface ("msr-src"/"msr-dst", Left/Right/Top/Bottom clear): a scaler copy with letterbox clears, which our
+  CPU AppleM2ScalerCSCDriver stand-in refuses (nonzero rectangles). Its 32-line log was spent/rolled (dmesg empty).
+  SweetM2Scaler.cpp now logs refused requests (first 6 with the 0x170-byte request in hex, then every 1000th) and
+  bad-argument calls. Backup: research/ios27.2/kernel-backup/SweetM2Scaler.cpp.before-xflog.
+  Built `work/xnu-12377` as `DEVELOPMENT_ARM64_SWEET`; only `iokit/Kernel/arm/SweetM2Scaler.cpp` changed since
+  the cell5 kernel. Build succeeded without source fixes; log: `xnu12377-xflog-build.log`. Kernel SHA-256:
+  `bd2c99cb73d6210f7b8c1dc86415fdd112e7746b3d215c979ab0535004a7370d`.
+- The phone was confirmed to run cell5-diag, so this image uses those boot arguments with fresh
+  `sweettime=1795123307`; `diag=1` remains, `ufslogsecs=1` is absent. Arguments are 596 characters. ADT is unchanged:
+  `work/guacamole-ios27a-yuv.adt`.
+- Built `outputs/guacamole-ios27a-xflog-triple.img`. Its iOS 16 payload, selector shim and ADT are preserved from
+  cell5-diag-triple; only the iOS 27 payload at `0x103a000` was replaced. Boot arguments are recorded in
+  `outputs/guacamole-ios27a-xflog-triple-boot-args.txt`. SHA-256:
+  `9fcbdb2b663c44011b8068580c6ee6a6623a0a8a32e262edddd090f427bd7503`.
+- Not flashed. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-xflog-triple.img`.
+- Test 4 (xflog kernel flashed, land7-scaler.txt, dmesg polled every second): backboardd's refused requests are
+  src 828x1792 BGRA rows 3328 -> dst 1792x828 BGRA rows 7168 (dst cycles over 3 surfaces), about 65 a second from
+  Minecraft's landscape start; the 6 full dumps had rolled out of dmesg already (Minecraft's necp lines fill the
+  128 KB ring in ~30 s). Next kernel ("xfrot"): SweetM2Scaler turns such requests (W x H -> H x W, 32-bit) in 32x32
+  tiles, rectangles still ignored; new bsd/dev/sweet_scaler.c (in bsd/conf/files): kern.sweet_scaler_rot (rw, 0 refuse,
+  1 clockwise = default, 2 counter-clockwise), kern.sweet_scaler_last (the latest refused/rotated request in hex),
+  kern.sweet_scaler_stats (counts, average time per request).
+  Built `work/xnu-12377` as `DEVELOPMENT_ARM64_SWEET` with `SweetM2Scaler.cpp`, new `bsd/dev/sweet_scaler.c`, and
+  `bsd/conf/files` changes. Build succeeded without source fixes; compiler log: `xnu12377-xfrot-build.log.gz`.
+  Kernel SHA-256: `5a40536b913b83150b92a17baab7e219e6d05e2a95974e9c5170df2d810e0495`.
+- Reused `work/guacamole-ios27a-yuv.adt`; refreshed the xflog boot arguments' `sweettime` to `1795124499` and
+  kept all other arguments, including `diag=1`. Command line length: 596 characters. Arguments:
+  `outputs/guacamole-ios27a-xfrot-triple-boot-args.txt`.
+- Built `outputs/guacamole-ios27a-xfrot-triple.img`; iOS 16 payload, selector shim and ADT preserved from
+  `guacamole-ios27a-xflog-triple`; replaced iOS 27 payload at `0x103a000`. SHA-256: `784a1f3944ca578a60e350a095735c1779c4cae3c7b63a7fbdf80f64db8dc8af`.
+- Not flashed. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-xfrot-triple.img`.
+- Test 5 (xfrot kernel + rotate3 plugin, land8-*.txt): still black. Scaler: rotated 4 (4.6 ms each), refused 142,
+  then no requests at all (stats unchanged over 5 s, no TransformSurface errors). The rotated-framebuffer path now
+  also runs in minecraftpe (its CAMetalLayer drawables: "turn 2400 into surface 0x170"). Likely cause: backboardd
+  samples the app's rotated drawable through a rotated *read* view; rotatedSurfaceTexture gave it an empty private
+  shadow (nothing turns the surface into it), so CA stopped using the scaler and drew an empty layer. Fix: only views
+  with RenderTarget usage get a shadow; sampled-only views are refused again, so CA goes back to copy_iosurface through
+  the kernel scaler, which now turns them (kern.sweet_scaler_rot). Rebuilt the iOS 27 plugin with
+  `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 work/UniXNU/scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`
+  and copied the executable byte-for-byte to `outputs/NativeAdrenoMetal-rotate4`; SHA-256
+  `74fe5ef1d9c56f05e741e90a0ad926664281995ea3cdd7b72a6ad128f48d7b67`. Kernel/image unchanged (xfrot).
+- Test 6 (rotate4, land10-*.txt): still black. backboardd no longer reads Minecraft's frames on the GPU (ROT imports
+  only its 2 framebuffers); the display gets Minecraft's drawable directly: SWEET FB layer 0 surface 678 (= 0x2a6,
+  minecraftpe's drawable, which its own rotated-framebuffer path turns into: rotation 1, usage 4) 828x1792 xform 0,
+  64/64 samples black. Scaler idle (6 rotations in all, 9-19 ms each: too slow anyway). Either the turn's output is
+  lost or Minecraft draws black. Test switch: /var/local/sweet-rotate-tint makes the turn add a red tint (read when a
+  shadow is made). /var/local/sweet-rotate-flip appears to be present on the phone (backboardd's rotation 3 logs
+  counter-clockwise). Rebuilt the iOS 27 plugin using the same `--target ios27 --no-replay` build, and copied the
+  executable byte-for-byte to `outputs/NativeAdrenoMetal-rotate5`; SHA-256
+  `e3a3848424474014454c4592df086109886e974c3f98ee863f03d8e8c4b5eb33`. Kernel/image unchanged (xfrot).
+- Test 7 (rotate5 + /var/local/sweet-rotate-tint): Minecraft's screen turns red, so the turn reaches the display and
+  the stand-in it reads is black: Minecraft's frame reaches the drawable another way than as a render target (a blit
+  or a shader write), so the turn ran without it. Now a stand-in is also turned when it is a blit's texture, a texture
+  bound with ShaderWrite usage, or the texture of a drawable the command buffer presents (turnPresented, in
+  presentDrawable:). Rebuilt the iOS 27 plugin with `--target ios27 --no-replay`; copied the executable byte-for-byte
+  to `outputs/NativeAdrenoMetal-rotate6`. SHA-256: `e40e0585fe8412f6e911e9b2ee33e69f481c97db0803bbdddcd0f55e1f60a2ca`.
+  Kernel/image unchanged (xfrot).
+- Test 8 (rotate6, land11-oslog.txt): still black (tint off, flip on). Turns as before (~43/s): turning at present
+  time changed nothing, so the stand-in really holds black when it is turned. Next: dump Minecraft's command buffers.
+  NativeAdrenoMetalPlugin.mm now also takes dump-cb from the file /var/local/dump-cb (NAME:FIRST[:COUNT]) besides the
+  boot-arg (the boot-arg line is at its limit). Backup: research/ios27.2/metal/NativeAdrenoMetalPlugin.mm.before-dumpfile.
+  Rebuilt the iOS 27 plugin with `--target ios27 --no-replay` and copied the executable byte-for-byte to
+  `outputs/NativeAdrenoMetal-rotate7`; SHA-256: `94f4a908dfe60632486782ec0b920e680a05d3832ee555c45487aa07a241bf51`.
+  Kernel/image unchanged (xfrot).
+  Codex: rebuild the plugin, executable to outputs/NativeAdrenoMetal-rotate7.
+- Test 9 (rotate7, dump-cb from /var/local/dump-cb = minecraftpe:600:3, outputs/land12/): Minecraft's command
+  buffers 600-602 each have 5 passes into its drawable (1792x828, our stand-in) with ZERO draws (clears, viewports,
+  scissors only), then our turn pass. Readback: the stand-in is all 0 (black, alpha 1). So the landscape path is fine
+  and Minecraft itself draws nothing; Minecraft logs "[Graphics] The graphics context was lost" at launch ("gained"
+  only after a background/foreground). Separate problem from landscape (likely async pipeline/library creation
+  never completing, or a capability check failing). dump-cb now also sets NMB_LOG_STDERR so the driver's refusals land
+  in the same file. Rebuilt the iOS 27 plugin with `--target ios27 --no-replay`; copied the executable byte-for-byte
+  to `outputs/NativeAdrenoMetal-rotate8`. SHA-256: `30b2a670347115bd5097ae5c07a7a01ee66c6b3755fc371f7e7d5b3f93de8e7a`.
+  Kernel/image unchanged (xfrot).
+- Test 10 (rotate8, dump-cb minecraftpe:2000:2, outputs/land13/): the driver refuses 64 of Minecraft's render pipelines:
+  "render pipeline refused: Compile(InvalidDescriptor(VertexAttribute { attribute: 0 }))" (metal2vulkan
+  pipeline/link/vertex.rs: an attribute the vertex stage reads missing from the descriptor, or a stage compiled under
+  another vertex-input projection, or an instanced attribute stepped per vertex). Their draws are skipped: black.
+  Reopening the app shows a frame for a split second. Also 7 "texture over buffer refused" (new_texture_with_iosurface_
+  plane, RowPitch). dump-cb now also sets SHENG_LOG_GPU (pipeline journal pipelines-PID.log with each refused pipeline's
+  vertex layout) and NBLOG's stderr lines keep 600 characters (were 140). Rebuilt the iOS 27 plugin with
+  `--target ios27 --no-replay`; copied the executable byte-for-byte to `outputs/NativeAdrenoMetal-rotate9`.
+  SHA-256: `c155b2f8eb942ecae5646eee2c17637023e1c62bcc6aa31b26c1d13ad2e5e202`. Kernel/image unchanged (xfrot).
+- Test 11 (rotate9, outputs/land14/): same 64 refusals; no pipeline journal found on the phone. The refusal line itself
+  now carries the descriptor (renderDumpInfo: functions, colour formats, a<N>=format@offset/b<buffer>=stride/step/rate,
+  or "(no vertex descriptor)"). The 5 "texture over buffer refused" in minecraftpe are sampled-only rotated views
+  (RowPitch 3328 < 7168), refused on purpose. Rebuilt the iOS 27 plugin with `--target ios27 --no-replay`; copied
+  the executable byte-for-byte to `outputs/NativeAdrenoMetal-rotate10`. SHA-256:
+  `a76aea2c8e15b076057656903e54fb2adafa5619da1a3b14aa053a8a4b755e7a`. Kernel/image unchanged (xfrot).
+- Test 12 (rotate10, outputs/land15/): every refused pipeline is Minecraft's own (v=xlatMtlMain f=xlatMtlMain, colour
+  f80 blended, depth/stencil f260) with NO vertex attributes in its descriptor, while metal2vulkan finds attribute 0
+  read (declared_attributes keeps only used inputs). Apple's driver makes such a pipeline (undefined values without
+  validation). Bridge patch 0043 (work/UniXNU/drivers/AdrenoMetal/bridge/patches/0043-vertex-attributes-absent-from-
+  the-descriptor.patch, copy in research/ios27.2/metal/, listed in scripts/build-adreno-metal-bridge.py): resolve()
+  leaves an attribute the descriptor lacks out of the projection, fixed_function_notes skips it, vertex_input_state
+  accepts it as an unfetched fixed-function input. Backup: research/ios27.2/metal/vertex.rs.before-absent.
+  The runtime id changes, so shader priming runs again once. Rebuilt bridge and plugin for ios27; the bridge archive
+  is 253341336 bytes, and the plugin was 4K-signed. Copied its executable byte-for-byte to
+  `outputs/NativeAdrenoMetal-absent`; SHA-256: `55b83a100875e12b8af0d3a4764ebb38eb7eedff40990cd14e9228c6e744f31f`.
+- Test 13 (absent = 0043, outputs/land16/): no pipeline refused now, and Minecraft draws (a 36-index cube, 11 UI
+  draws), but its frame is still all black: the descriptors are still empty, so the vertex stage reads nothing.
+  Cause: bgfx (Renderdragon) builds each vertex descriptor from -[MTLFunction vertexAttributes], which NBFunction did
+  not answer (nil). Added nmb_function_attribute_count/_at (bridge/NativeMetalObjects.rs/.h, from metal2vulkan's
+  Function::vertex_attributes / stage_input_attributes) and NBFunction -vertexAttributes / -stageInputAttributes
+  (NBAttribute: name, attributeIndex, attributeType, isActive, isPatchData, isPatchControlPointData). 0043 stays (Apple
+  accepts such pipelines too). Backups: research/ios27.2/metal/*.before-vattr. Rebuilt the iOS 27 bridge and plugin;
+  the bridge archive is 253388344 bytes and the plugin was 4K-signed. Copied the executable byte-for-byte to
+  `outputs/NativeAdrenoMetal-vattr`; SHA-256: `0a8e9003ccbcd60eca84e9a7970777b1c33bcfb825f722926138ed5f722a8548`.
+
 # Metal / UI performance work (2026-11-19, Claude)
 - UI scrolling runs at 37-39 fps on the 88 Hz panel (SWEET FB 5 s lines, measured after 8+ min uptime; earlier is
   shader priming). GPU time is about 16-17 ms a frame, so the CPU side is not the limit; games feel fine.
