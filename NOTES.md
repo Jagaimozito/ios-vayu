@@ -61,8 +61,20 @@
   ~40% (buffer:offset:index:stage: 20%, texture 17%, sampler 7%: TracedEncodeCall, own:/purgeHold, bridge),
   renderCommandEncoderWithDescriptor: 12% (CommandBuffer::settle_ended, waiting for the lowering thread #39 at 43%),
   Minecraft's own uniform loop (minecraftpe+0x19e04c4) 13%, objc_msgSend ~13%. Next: a slimmer bind path and no
-  blocking hand-off between passes; also try a boot image without diag=1.
-  `2f068683b39b2587f83616945f118bbd2d041bbd78bc91e4e573295ae18ad3d8`. Not installed on the phone.
+  blocking hand-off between passes. The diagnostic-free triple image is built below.
+- Bind path: NBEncoder skips a bind that changes nothing (same buffer and offset, texture or sampler already in that
+  slot, first 32 slots of stages 0-3; setBytes forgets the slot's buffer; setBufferOffset skips an unchanged offset).
+  Counters gBindsMade/gBindsSkipped go to the dump file every 500 commits while dump-cb is on. The ENCODE closures'
+  TracedEncodeCall wrapper (four clock reads per call) only exists with diag=1: the nodiag image removes it.
+  Backup: research/ios27.2/metal/NativeBridgeMetalFrontend.mm.before-bindcache. Built for iOS 27 against the existing
+  bridge archive (no bridge rebuild); signature verification passed. Executable copied byte-for-byte to
+  `outputs/NativeAdrenoMetal-bindcache`, SHA-256 `2068c804e060a1ca355466196ec1dd9a1467e838ac1ccc6d1f48ad45063bb326`.
+  Not installed on the phone.
+- Built `outputs/guacamole-ios27a-xfrot-nodiag-triple.img` with the xfrot kernel and ADT; preserved the iOS 16
+  payload and selector shim. Removed only `diag=1`, refreshed `sweettime` to `1795138076` (589-character boot args).
+  Sidecar: `outputs/guacamole-ios27a-xfrot-nodiag-triple-boot-args.txt`. SHA-256
+  `eba2b0252ee6e4bb4ea51bf3e817e244cd9b832740dae2536e4d5e42d1bc7697`. Not flashed.
+  Flash command if requested: `fastboot flash boot_b outputs/guacamole-ios27a-xfrot-nodiag-triple.img`.
 - Minecraft in landscape: black screen. backboardd's QuartzCore logs "Failed to allocate [1792 x 828] BGRA framebuffer
   MTLPixelFormatBGRA8Unorm" every frame (outputs/land1-oslog.txt, 105 times in 8 s); the kernel sees layer 0 surface 3
   828x1792 all black (SWEET FB black at display). CA asks for its portrait framebuffer surface as a landscape texture
