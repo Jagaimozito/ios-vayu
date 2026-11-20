@@ -172,8 +172,71 @@ static void text_c(int y, int scale, const char *s, uint32_t fg)
 #define CARD_GAP	70
 #define BAR_Y		2650
 
-static void draw_entry(int i, const struct menu_entry *e, int selected)
+/* Pictures (2026-11-20): one column of MENU_ICON squares, a blue ring around the selected one. */
+#define ICON_X		((FB_W - MENU_ICON) / 2)
+#define ICON_Y0		470
+#define ICON_GAP	110
+#define ICON_R		(MENU_ICON * 22 / 100)	/* corner radius, as tools/mkmenuart.py masks them */
+
+static uint32_t dim(uint32_t c, int on)
 {
+	if (on)
+		return c;
+	/* 35 % picture, 65 % background */
+	uint32_t r = (((c >> 16) & 0xff) * 35 + 0x0e * 65) / 100, g = (((c >> 8) & 0xff) * 35 + 0x0e * 65) / 100;
+	uint32_t b = ((c & 0xff) * 35 + 0x12 * 65) / 100;
+	return 0xff000000u | r << 16 | g << 8 | b;
+}
+
+static void draw_icon(int i, const struct menu_entry *e, int selected)
+{
+	int y = ICON_Y0 + i * (MENU_ICON + ICON_GAP);
+	fill(ICON_X - 24, y - 24, MENU_ICON + 48, MENU_ICON + 48, BG);	/* clears the old ring */
+	if (selected) {
+		round_rect(ICON_X - 22, y - 22, MENU_ICON + 44, MENU_ICON + 44, ICON_R + 22, CARD_SEL);
+		round_rect(ICON_X - 10, y - 10, MENU_ICON + 20, MENU_ICON + 20, ICON_R + 10, BG);
+	}
+	const uint8_t *px = e->icon;
+	for (int j = 0; j < MENU_ICON && y + j < FB_H; j++) {
+		volatile uint32_t *p = con_fb + (y + j) * (FB_STRIDE / 4) + ICON_X;
+		for (int k = 0; k < MENU_ICON; k++, px += 3)
+			p[k] = dim(0xff000000u | (uint32_t)px[0] << 16 | (uint32_t)px[1] << 8 | px[2], e->enabled);
+	}
+}
+
+/* Small buttons (Restart, Power off): one row in the bottom right corner, in entry order. */
+#define BTN_Y		2860
+#define BTN_H		110
+#define BTN_SCALE	3
+#define BTN_PAD		44
+#define BTN_GAP		30
+#define BTN_RIGHT	(FB_W - 70)
+
+static int btn_w(const struct menu_entry *e) { return text_w(e->title, BTN_SCALE) + 2 * BTN_PAD; }
+
+static void draw_button(const struct menu_entry *all, int n, int i, int selected)
+{
+	int x = BTN_RIGHT;
+	for (int k = n - 1; k >= i; k--)
+		if (all[k].small)
+			x -= btn_w(&all[k]) + (k > i ? BTN_GAP : 0);
+	int w = btn_w(&all[i]);
+	fill(x - 8, BTN_Y - 8, w + 16, BTN_H + 16, BG);
+	round_rect(x, BTN_Y, w, BTN_H, BTN_H / 2, selected ? CARD_SEL : CARD);
+	text(x + BTN_PAD, BTN_Y + (BTN_H - 16 * BTN_SCALE) / 2, BTN_SCALE, all[i].title, TEXT);
+}
+
+static void draw_entry(const struct menu_entry *all, int n, int i, int selected)
+{
+	const struct menu_entry *e = &all[i];
+	if (e->small) {
+		draw_button(all, n, i, selected);
+		return;
+	}
+	if (e->icon) {
+		draw_icon(i, e, selected);
+		return;
+	}
 	int y = CARD_Y0 + i * (CARD_H + CARD_GAP);
 	fill(CARD_X - 12, y - 12, CARD_W + 24, CARD_H + 24, BG);	/* clears the old highlight ring */
 	if (selected)
@@ -194,10 +257,15 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 {
 	keys_init();
 	fill(0, 0, FB_W, FB_H, BG);
-	text_c(300, 7, "Boot", TEXT);
-	text_c(300 + 16 * 7 + 40, 3, "Volume up / down to choose, power to start", TEXT_DIM);
+	int pictures = 1;
 	for (int i = 0; i < n; i++)
-		draw_entry(i, &e[i], i == sel);
+		pictures &= e[i].icon != 0 || e[i].small;
+	if (!pictures) {
+		text_c(300, 7, "Boot", TEXT);
+		text_c(300 + 16 * 7 + 40, 3, "Volume up / down to choose, power to start", TEXT_DIM);
+	}
+	for (int i = 0; i < n; i++)
+		draw_entry(e, n, i, i == sel);
 	if (apid_pon < 0 || (apid_vup < 0 && apid_vdn < 0))
 		text_c(BAR_Y + 80, 3, "keys not found: starting the default", TEXT_DIM);
 
@@ -231,8 +299,8 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 				s = (s + move + n) % n;
 			while (!e[s].enabled && s != sel);
 			if (s != sel) {
-				draw_entry(sel, &e[sel], 0);
-				draw_entry(s, &e[s], 1);
+				draw_entry(e, n, sel, 0);
+				draw_entry(e, n, s, 1);
 				sel = s;
 			}
 		}

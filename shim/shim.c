@@ -43,6 +43,7 @@
 #define PSCI_CPU_OFF		0x84000002UL
 #define PSCI_CPU_ON		0xc4000003UL
 #define PSCI_MIGRATE_INFO_TYPE	0x84000006UL
+#define PSCI_SYSTEM_OFF		0x84000008UL
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define PSCI_FEATURES		0x8400000aUL
 #define PSCI_SYSTEM_SUSPEND	0xc400000eUL
@@ -393,7 +394,8 @@ void shim_main(uint64_t dtb)
 	con_skip();
 #if defined(BOARD_GUACAMOLE)
 	/*
-	 * Boot menu (menu.c), 2026-11-20: iOS 27 / macOS 27 / Android, volume keys to move, power to start.
+	 * Boot menu (menu.c), 2026-11-20: pictures of iOS 27 / macOS 27 / Android, then small Restart and
+	 * Power off buttons in the bottom right corner; volume keys to move, power to start.
 	 * No Alert Slider: the default is the last choice, kept in the boot menu memory block (ufs.c
 	 * ufs_bootmem_*: unallocated space at the end of LUN 0); none kept, iOS 27. It starts after 5 s
 	 * unless a key is pressed. If Android cannot be started the reason stays on screen for 15 s,
@@ -408,21 +410,41 @@ void shim_main(uint64_t dtb)
 		kept = mem[5];
 	/* Filled in code, not with an initializer: a table of string pointers in data would need
 	 * relocation, and the shim runs unrelocated. */
-	struct menu_entry entries[3];
+	struct menu_entry entries[5];
 	int npay = loader_count(dtb);
 	entries[0].title = "iOS 27";
 	entries[0].detail = npay >= 1 ? "iPhone 14 Pro, partition ios27" : "not in this boot image";
 	entries[0].enabled = npay >= 1;
+	entries[0].icon = menu_icon_ios27;
 	entries[1].title = "macOS 27";
 	entries[1].detail = npay >= 2 ? "partition macos" : "not installed yet";
 	entries[1].enabled = npay >= 2;
+	entries[1].icon = menu_icon_macos27;
 	entries[2].title = "Android";
 	entries[2].detail = "boot_a";
 	entries[2].enabled = 1;
+	entries[2].icon = menu_icon_android;
+	for (int i = 0; i < 3; i++)
+		entries[i].small = 0;
+	entries[3].title = "Restart";
+	entries[4].title = "Power off";
+	for (int i = 3; i < 5; i++) {
+		entries[i].detail = "";
+		entries[i].enabled = 1;
+		entries[i].icon = 0;
+		entries[i].small = 1;
+	}
 	__asm__ volatile("" ::: "memory");
 	int def = (kept >= 0 && entries[kept].enabled) ? kept : entries[0].enabled ? 0 : 2;
 	stage = "menu";
-	int choice = menu_choose(entries, 3, def, 5000);
+	/* Restart / Power off (PSCI) never return when they work; if one does, the menu comes back
+	 * with no countdown. Neither is remembered as the default. */
+	int choice = menu_choose(entries, 5, def, 5000);
+	while (choice >= 3) {
+		smc(choice == 3 ? PSCI_SYSTEM_RESET : PSCI_SYSTEM_OFF, 0, 0, 0);
+		entries[choice].title = "Failed";
+		choice = menu_choose(entries, 5, choice, 0);
+	}
 	if (memok && choice != kept) {	/* written only when the choice changed */
 		for (unsigned i = 0; i < sizeof(mem); i++)
 			mem[i] = 0;

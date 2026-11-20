@@ -8,13 +8,14 @@ MACOS27_boot.img are ordinary boot images as tools/guac-mkboot.sh makes them (iO
 macOS 27: ufsroot=macos). Their ramdisks are the SWEETXNU payloads (kernel + ADT + boot-args); they go
 into one ramdisk, iOS 27 first, each starting on a 4 KiB boundary (shim/loader.c payload_at). The menu
 (shim/shim.c) shows iOS 27 / macOS 27 / Android; macOS 27 is dimmed when its payload is absent. ABL
-leaves about 50 MiB for the ramdisk above the DTB: the image is refused past that. Writes nothing to
+leaves about 50 MiB for the ramdisk above the DTB, less the shim's own size (3.5 MB with the menu
+pictures): the image is refused past 46 MiB. Writes nothing to
 the phone.
 """
 import os, struct, subprocess, sys, tempfile
 
 HDR = "<8s10I16s512s32s1024sIQIIQ"
-RAMDISK_ROOM = 50 * 1024 * 1024
+RAMDISK_ROOM = 46 * 1024 * 1024  # ~50 MiB, less the menu pictures in the shim (3.3 MB, shim/art.S)
 
 
 def ramdisk_of(path):

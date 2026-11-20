@@ -7,6 +7,10 @@
 - Boot menu (shim, 2026-11-20): iOS 27 / macOS 27 / Android, no slider, default = last choice kept in the
   first block of that free 4 MiB (shim/ufs.c ufs_bootmem_*, a fenced SCSI WRITE(10) that checks the GPT
   first); tools/mkmenuboot.py replaces mktripleboot.py (iOS 27 payload first, macOS optional).
+- Menu pictures + Restart / Power off (2026-11-20): user's PNGs shim/art/src -> tools/mkmenuart.py -> 600x600
+  RGB shim/art/*.bin, linked last (.menuart after the stacks; inside .rodata the adr in start.S to _sec_stacks
+  overflowed). Shim Image 3.48 MB (was 0.23); mkmenuboot limit 46 MiB. Built clean on the device VM (gcc
+  aarch64, no ABS64 in C objects, icon bytes verified in the Image); not run on the phone yet.
 - The current boot image's iOS 27 entry looks for ufsroot=ios26 and no longer boots; Android is unaffected.
 - Codex: (1) tools/mkios27root-mac.sh 80g with the current NativeAdrenoMetal (outputs/NativeAdrenoMetal-bindcache),
   sparse -> research/ios27.2/ios27-root-80g.simg; (2) boot image = xfrot-nodiag kernel/args with ufsroot=ios27,

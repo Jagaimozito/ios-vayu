@@ -16,6 +16,10 @@ SECTIONS
 	. = ALIGN(4096);
 	_sec_stacks = .;
 	. += 8 * 0x1000;
+	/* Menu pictures (art.S, 3.2 MB) last: start.S reaches .bss and the stacks with adr (+-1 MiB). */
+	. = ALIGN(16);
+	.menuart : { *(.menuart) }
+	. = ALIGN(16);
 	_end = .;
 	/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

@@ -1,7 +1,12 @@
 # Dual boot: Android and iOS on one OnePlus 7 Pro (guacamole)
 
-A boot menu picks the operating system at power-on (`shim/menu.c`): iOS 27, macOS 27, Android, top to
-bottom. Volume up and down move the selection, power starts it. The default is the last choice made,
+A boot menu picks the operating system at power-on (`shim/menu.c`): one picture each for iOS 27,
+macOS 27 and Android, top to bottom, and two small buttons in the bottom right corner, Restart and
+Power off (PSCI SYSTEM_RESET / SYSTEM_OFF; if one returns, its button says "Failed"). Volume up and
+down move the selection (a blue ring), power starts it. The pictures are the user's own PNGs in
+`shim/art/src/`, turned into 600x600 RGB by `tools/mkmenuart.py` (`shim/art/*.bin`, committed, so a
+shim build needs no Pillow) and linked at the end of the shim image (`shim/art.S`, `shim/shim.ld`
+section `.menuart`: `start.S` reaches `.bss` with `adr`, +-1 MiB, so they cannot sit before it). The default is the last choice made,
 which starts after 5 s unless a key is pressed (none kept yet: iOS 27; macOS 27 is dimmed while the
 boot image carries no macOS payload). The Alert Slider is no longer read (2026-11-20).
 
@@ -106,7 +111,7 @@ shim/build.sh`), then:
 python3 tools/mkmenuboot.py dtb/android-boot_b.img shim/out/Image IOS27.img [MACOS27.img] OUT.img
 ```
 
-It refuses more than 50 MiB of payloads (ABL's ramdisk room above the DTB, below 0x85700000). Test with
+It refuses more than 46 MiB of payloads (the shim with its pictures is 3.5 MB) (ABL's ramdisk room above the DTB, below 0x85700000). Test with
 `fastboot boot OUT.img`, then flash it to `boot_b` as below. An iOS restart (PSCI SYSTEM_RESET) comes
 back to this menu. (`tools/mktripleboot.py` built the older iOS 16 + iOS 27 image.)
 
