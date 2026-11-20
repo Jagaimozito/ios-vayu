@@ -235,6 +235,44 @@ if [ -f "$U/adspd" ] && [ -f "$U/tfa" ] && [ -f "$X/fw/modem-all/adsp.mdt" ]; th
 		echo "ADSP speaker stack: binaries/firmware staged; no boot job (extras/fw/tfa98xx.cnt missing)"
 	fi
 fi
+# 2026-11-20: everything the old phone root had by hand goes into the image (a fresh 80g root came up without the
+# GPU driver, Bluetooth, the switch files and the debugging tools).
+# GPU: the NativeAdrenoMetal bundle (newest build: METAL_BUNDLE, default the iOS 27 plugin build folder) + .publish.
+MB=${METAL_BUNDLE:-$TOOLS/../work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.bundle}
+if [ -f "$MB/NativeAdrenoMetal" ] && [ -f "$MB/libvulkan_freedreno.dylib" ]; then
+	ext="$R/System/Library/Extensions"
+	sudo rm -rf "$ext/NativeAdrenoMetal.bundle"
+	sudo cp -R "$MB" "$ext/NativeAdrenoMetal.bundle"
+	sudo chown -R 0:0 "$ext/NativeAdrenoMetal.bundle"
+	sudo find "$ext/NativeAdrenoMetal.bundle" -type d -exec chmod 0755 {} \;
+	sudo find "$ext/NativeAdrenoMetal.bundle" -type f -exec chmod 0644 {} \;
+	sudo chmod 0755 "$ext/NativeAdrenoMetal.bundle/NativeAdrenoMetal" "$ext/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib"
+	sudo install -o 0 -g 0 -m 0644 /dev/null "$ext/NativeAdrenoMetal.publish"
+	echo "GPU: NativeAdrenoMetal.bundle from $MB ($(shasum -a 256 "$MB/NativeAdrenoMetal" | cut -c1-16))"
+else
+	echo "ERROR: no NativeAdrenoMetal bundle at $MB (set METAL_BUNDLE): the root would have no GPU" >&2; exit 1
+fi
+# Switch files the phone had (read at process start): rs-atcall = backboardd encodes at the call (kept 2026-11-20),
+# rotate-flip = landscape framebuffer orientation (2026-11-19).
+sudo install -d -m 0755 "$R/private/var/local"
+for f in sweet-rs-atcall sweet-rotate-flip; do sudo install -o 0 -g 0 -m 0644 /dev/null "$R/private/var/local/$f"; done
+# Bluetooth: btbridge (UART <-> bluetoothd), started at boot, retried until wland has the rails up.
+if [ -f "$U/btbridge" ]; then
+	sudo install -d -m 0755 "$R/private/var/local/bin"
+	sudo install -m 0755 "$U/btbridge" "$R/private/var/local/bin/btbridge"
+	jobs+=(btbridge)
+	echo "btbridge: installed; boot job enabled"
+else
+	echo "ERROR: no userland/out/btbridge (sh userland/build.sh): the root would have no Bluetooth" >&2; exit 1
+fi
+# Tools and helper jobs: spinwatch (restarts locationd when it spins a core), bootlog (first 4 min of oslog per boot),
+# tsample / ptop / oslog for debugging.
+sudo install -d -m 0755 "$R/private/var/local/bin"
+for t in spinwatch tsample ptop oslog; do
+	[ -f "$U/$t" ] && sudo install -m 0755 "$U/$t" "$R/private/var/local/bin/$t" && echo "tool: $t"
+done
+[ -f "$U/spinwatch" ] && jobs+=(spinwatch)
+[ -f "$U/oslog" ] && jobs+=(bootlog)
 if [ ${#jobs[@]} -gt 0 ]; then
 sudo python3 - "$R/System/Library/xpc/launchd.plist" "${jobs[@]}" <<'PYEOF'
 import plistlib, sys
@@ -272,6 +310,19 @@ J['adspd'] = ('/System/Library/LaunchDaemons/com.sweet.adspd.plist', {
     'Label': 'com.sweet.adspd', 'ProgramArguments': ['/var/local/bin/adspd', 'serve'], 'RunAtLoad': True,
     'KeepAlive': True, 'EnvironmentVariables': {'ADSPD_BOOT': '30'}, 'POSIXSpawnType': 'Interactive',
     'StandardOutPath': '/var/local/adspd.out', 'StandardErrorPath': '/var/local/adspd.out'})
+J['btbridge'] = ('/System/Library/LaunchDaemons/com.sweet.btbridge.plist', {
+    'Label': 'com.sweet.btbridge', 'ProgramArguments': ['/var/local/bin/btbridge', '-q'], 'RunAtLoad': True,
+    'KeepAlive': True, 'ThrottleInterval': 10, 'POSIXSpawnType': 'Interactive',
+    'StandardOutPath': '/var/local/btbridge.out', 'StandardErrorPath': '/var/local/btbridge.out'})
+J['spinwatch'] = ('/System/Library/LaunchDaemons/com.sweet.spinwatch.plist', {
+    'Label': 'com.sweet.spinwatch', 'ProgramArguments': ['/var/local/bin/spinwatch', 'locationd'], 'RunAtLoad': True,
+    'KeepAlive': True, 'ProcessType': 'Background',
+    'StandardOutPath': '/var/local/spinwatch.log', 'StandardErrorPath': '/var/local/spinwatch.log'})
+J['bootlog'] = ('/System/Library/LaunchDaemons/com.sweet.bootlog.plist', {
+    'Label': 'com.sweet.bootlog', 'RunAtLoad': True, 'KeepAlive': False, 'POSIXSpawnType': 'Interactive',
+    'ProgramArguments': ['/bin/zsh', '-c', 'exec > /var/local/boot-oslog.txt 2>&1; '
+                         'for p in /usr/local/bin/oslog /var/local/bin/oslog; do '
+                         '[ -x $p ] && exec $p -t 240; done; echo no oslog']})
 d = plistlib.load(open(p, 'rb'))
 for w in want:
     k, j = J[w]
@@ -306,3 +357,6 @@ trap - EXIT
 hdiutil convert ios27-root.sparseimage -format UDTO -o ios27-root
 ls -l ios27-root.cdr
 shasum -a 256 ios27-root.cdr
+# Sparse image for fastboot: ONLY with tools/hfs2simg.py. A generic converter drops all-zero blocks that HFS uses
+# (2026-11-20: corrupted dyld and the cache on the phone, launchd crashed).
+python3 "$TOOLS/hfs2simg.py" ios27-root.cdr ios27-root.simg
