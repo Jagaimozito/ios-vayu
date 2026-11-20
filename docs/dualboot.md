@@ -4,7 +4,9 @@ A boot menu picks the operating system at power-on (`shim/menu.c`): one picture 
 macOS 27 and Android, top to bottom, and two small buttons in the bottom right corner, Restart and
 Power off (PSCI SYSTEM_RESET / SYSTEM_OFF; if one returns, its button says "Failed"). The background is black, and so is everything
 the shim shows before the menu; after a choice the chosen OS's picture stays alone in the centre until
-that OS draws its own screen (no "Booting ..." line). Text appears only on an error. Volume up and
+that OS draws its own screen (no "Booting ..." line). Text appears only on an error. The menu runs with
+the MMU on (`shim/mmu.c`: our image cacheable, the framebuffer write-combining) so the pictures draw
+quickly; `mmu_disable` turns it off again before the UFS write and before Android or iOS starts. Volume up and
 down move the selection (a blue ring), power starts it. The pictures are the user's own PNGs in
 `shim/art/src/`, turned into 600x600 RGB by `tools/mkmenuart.py` (`shim/art/*.bin`, committed, so a
 shim build needs no Pillow) and linked at the end of the shim image (`shim/art.S`, `shim/shim.ld`

@@ -388,9 +388,11 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
-	con_clear(MENU_BG);	/* black (2026-11-20); 2026-11-17: was red, a red flash before the menu */
 #if defined(BOARD_GUACAMOLE)
 	con_quiet = 1;	/* black until the menu; an error turns the text back on */
+	/* No clear here: the menu clears the screen with the MMU on (3 ms instead of ~190 ms). */
+#else
+	con_clear(MENU_BG);	/* 2026-11-17: was red, a red flash before the menu */
 #endif
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_str("BOARD", BOARD_NAME);
@@ -439,6 +441,12 @@ void shim_main(uint64_t dtb)
 	}
 	__asm__ volatile("" ::: "memory");
 	int def = (kept >= 0 && entries[kept].enabled) ? kept : entries[0].enabled ? 0 : 2;
+	/* MMU on for drawing (mmu.c: image Normal WB, framebuffer Normal-NC, everything else Device as
+	 * with the MMU off); off again before the UFS write below. Without it the menu still works, slowly. */
+	stage = "menu mmu";
+	int menu_mmu = mmu_enable(&mi) == 0;
+	if (!menu_mmu)
+		con_clear(MENU_BG);
 	stage = "menu";
 	/* Restart / Power off (PSCI) never return when they work; if one does, the menu comes back
 	 * with no countdown. Neither is remembered as the default. */
@@ -448,6 +456,12 @@ void shim_main(uint64_t dtb)
 		entries[choice].title = "Failed";
 		choice = menu_choose(entries, 5, choice, 0);
 	}
+	/* The chosen OS's picture while the MMU is still on, then MMU off for everything that follows. */
+	menu_booting(choice == 2 ? menu_icon_android : choice == 1 && entries[1].enabled ? menu_icon_macos27 :
+		     menu_icon_ios27);
+	if (menu_mmu)
+		mmu_disable();
+	stage = "bootsel";
 	if (memok && choice != kept) {	/* written only when the choice changed */
 		for (unsigned i = 0; i < sizeof(mem); i++)
 			mem[i] = 0;
@@ -455,10 +469,9 @@ void shim_main(uint64_t dtb)
 		mem[5] = (uint8_t)choice; mem[6] = (uint8_t)~choice;
 		(void)ufs_bootmem_write(mem);
 	}
-	con_quiet = 1;	/* only "Booting ..." until the kernel takes the screen; errors turn it back on */
+	con_quiet = 1;	/* only the chosen picture until the kernel takes the screen; errors turn text back on */
 	if (choice == 2) {
 		stage = "android";
-		menu_booting(menu_icon_android);
 		const char *afail = android_boot(dtb);
 		con_quiet = 0;
 		con_clear(BLACK);
@@ -475,9 +488,6 @@ void shim_main(uint64_t dtb)
 	int pay_index = 0;
 	if (choice == 1 && entries[1].enabled) {
 		pay_index = 1;
-		menu_booting(menu_icon_macos27);
-	} else {
-		menu_booting(menu_icon_ios27);
 	}
 #else
 	int pay_index = 0;
