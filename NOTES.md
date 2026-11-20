@@ -73,6 +73,15 @@
 - Results: bindcache on the xfrot image (diag=1): 21.7 fps steady (outputs/mc-fps6.txt), rendering looks right (user).
   xfrot-nodiag image + bindcache at ~7 min uptime (mc-fps8.txt, backboardd back to 10%): 17-21 fps, minecraftpe 268%:
   no measurable gain from dropping diag=1 (scene-to-scene variation is larger). The phone runs the nodiag image now.
+- Profile after bindcache (outputs/mc-fps9.txt; render thread #14 80%, lowering thread #36 ~48%): opening a render
+  encoder settles the previous end on the program's thread (CommandBuffer::settle_ended -> EndInFlight::finish): 22% of
+  the render thread (Batch::lower on the program's thread 8%, the rest waiting for the batch the lowering thread is on).
+  Binds and draws ~12%, Minecraft's own code 13%, newBufferWithBytes 5% (allocation; zeroing only for pooled memory).
+  Structural: a pass is recorded after the previous one, and the opening runs at its call, so with Minecraft's
+  back-to-back passes (5-6 a frame) the lowering thread never gets ahead at a boundary. Fix = defer the opening too:
+  log "open with this descriptor" and let the lowering thread open passes in order (render/deferral.rs,
+  command_buffer settle_*, residency inheritance, carried draws, shadows, queued commits). Needs the runtime's own test
+  suite (cargo test -p metal2vulkan-runtime on the Mac) before a phone test. Not started.
 - Built `outputs/guacamole-ios27a-xfrot-nodiag-triple.img` with the xfrot kernel and ADT; preserved the iOS 16
   payload and selector shim. Removed only `diag=1`, refreshed `sweettime` to `1795138076` (589-character boot args).
   Sidecar: `outputs/guacamole-ios27a-xfrot-nodiag-triple-boot-args.txt`. SHA-256
