@@ -57,13 +57,19 @@ boot iOS; after it the iOS payload in memory is gone and the shim resets.
 | Partition | Sectors | Size | Contents |
 | --- | --- | --- | --- |
 | `userdata` (sda19) | 1945992-18723207 | 64 GiB | Android data |
-| `ios26` (sda21) | 18723208-30781831 | 46 GiB | blank, for iOS 26 tests |
-| `ios` (sda20) | 30781832-61409274 | 116.83 GiB | iOS 16 HFS+ root (`ufsroot=ios`); kernel log ring in its last 4 MiB + 4 KiB |
+| `ios27` (entry 21) | 18723208-40065671 | 81.42 GiB | iOS 27 root (`ufsroot=ios27`); kernel log ring in its last 4 MiB + 4 KiB |
+| `macos` (entry 20) | 40065672-61408250 | 81.42 GiB | empty, for the macOS 27 port |
+| `bootmem` (entry 22) | 61408251-61409274 | 4 MiB | the boot menu's memory of the last choice |
 
-The table was rewritten from TWRP with `dd` (TWRP 3.7.1 has no sgdisk): `userdata` kept its start,
-type and unique GUIDs, `ios26` was added in the freed space, `ios` was not touched. Both GPT copies
-(LBA 0-5 and LBA 61409275-61409279) were written and read back by sha256. Android's data partition was
-formatted afterwards (TWRP Format Data).
+2026-11-20: iOS 16 was retired and the iOS space split in two. `ios26` (which held iOS 27) became `ios27`
+with the same start and unique GUID, grown to the middle; the old iOS 16 partition `ios` became `macos`
+(new unique GUID); `bootmem` was added in a free entry. Written from recovery with `dd` (both GPT copies,
+LBA 0-5 and LBA 61409275-61409279, read back by sha256: head 8b229704..., tail 90825ad5...). The tables
+before and after are kept locally in `dtb/sda-gpt-{head,tail}.{before-split,split}.bin` (not in git).
+
+Earlier (2026-11-12) the table was rewritten from TWRP with `dd` (TWRP 3.7.1 has no sgdisk): `userdata`
+kept its start, type and unique GUIDs, `ios26` was added in the freed space; Android's data partition
+was formatted afterwards (TWRP Format Data).
 
 ## Setting it up
 

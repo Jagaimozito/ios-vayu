@@ -1,3 +1,289 @@
+# Partition split: iOS 16 removed, ios27 + macos (2026-11-20, Claude) -- table written, images pending
+- New GPT written from recovery and read back (sha256 head 8b2297045a27..., tail 90825ad53b40...): entry 20 `ios26`
+  -> `ios27` 18723208-40065671 (81.42 GiB, same start and unique GUID); entry 19 `ios` (iOS 16) -> `macos`
+  40065672-61408250 (81.42 GiB, new unique GUID); new entry 21 `bootmem` 61408251-61409274 (4 MiB, Linux type).
+  Everything else unchanged. Before/after tables: dtb/sda-gpt-{head,tail}.{before-split,split}.bin and
+  outputs/gpt-{now,new}-*.bin (local only). Rollback: dd the before-split copies to LBA 0 and 61409275.
+- The current boot image's iOS 27 entry looks for ufsroot=ios26 and no longer boots; Android is unaffected.
+- Codex: (1) tools/mkios27root-mac.sh 80g with the current NativeAdrenoMetal (outputs/NativeAdrenoMetal-bindcache),
+  sparse -> research/ios27.2/ios27-root-80g.simg; (2) boot image = xfrot-nodiag kernel/args with ufsroot=ios27,
+  menu iOS 27 + Android only (no iOS 16 payload) -> outputs/guacamole-ios27a-xfrot-ios27part.img.
+  tools/ios27-klog-pull.sh now defaults to ios27 (done).
+
+# UI ~29 fps: SwapWait experiment (2026-11-19 23:50, Claude) -- TESTED: SwapWait is NOT the bottleneck
+- Result (2026-11-20, outputs/ui-sw{1,2,0}.txt, swapwait-nodiag kernel at ~9 min uptime): SwapWait blocks almost nothing. Best
+  scrolling window (mode 2): 140 swaps (27.9/s); SwapWait 286 calls, 249 of them already shown, 27 on the newest swap, 10 on
+  the previous; blocked 13 ms in all (45 us a call). GPU busy at only 24 % of vsyncs. Swap gaps: <17 ms 42, <34 50, <50 25,
+  >50 ms 23 (longest 232 ms): frames come in fast runs broken by stalls, not at a steady 3 slots -> the stalls set the fps.
+  Mode 0 windows (11/s, every gap >50 ms, GPU 1 %) and mode 1 windows (6/s) look like little or no scrolling: not comparable.
+  Keep mode 1 (the default at every boot); the new 5 s SwapWait line stays as a measurement.
+- Next: find what the 50-230 ms stalls wait on: all-thread tsample of backboardd (and SpringBoard) while scrolling.
+- All-thread capture (2026-11-20, outputs/ui-bb-all1.txt, ui-sb-all1.txt): tsample's all-thread mode samples threads ONE AFTER
+  ANOTHER (600 samples each), so only threads #0-#3 were sampled while scrolling; target busy threads by index instead.
+  At the start: backboardd #13 78.5 %, #3 48.8 %, #14 16.5 %; SpringBoard main thread 5.9 % (not the limit).
+  backboardd #3 (CoreAnimation's render thread; NativeAdrenoMetal frames symbolicated with tools/machosym.py, which reads the
+  dSYM symbol table on Linux: `python3 tools/machosym.py DWARF_FILE < "0xOFFSET COUNT" lines`): 45 % of samples under
+  -[NBCommandBuffer commitAndWaitUntilSubmitted], 42 % in -[NBCommandBuffer waitUntilScheduled] <- encodeDrain(): CA commits each
+  frame with commitAndWaitUntilSubmitted, which (frontend line ~3584) = commit + waitUntilScheduled = encodeDrain (wait for the
+  frontend's encode thread, render server only, gEncodeThread) + nmb_command_buffer_wait_scheduled (wait for the runtime's
+  lowering + submission). So the render thread waits for the encode thread (likely #13, 78 %) every frame: the encode thread's
+  work is the critical path. Also seen on #3: texture/heap/no-copy-buffer creation (import_pointer, allocate_memory) ~5-10 %.
+- Next: profile backboardd #13 and #14 by index while scrolling (outputs/ui-bb-t13.txt).
+- Thread numbers shift between captures (ui-bb-t13.txt sampled the wrong ones; #13 there = the runtime lowering thread, ~20 %
+  busy, mostly idle). Let tsample pick the busiest thread (no 4th argument): outputs/ui-bb-busiest.txt, 1000 x 3 ms.
+- Busiest backboardd thread while scrolling = the frontend's encode thread (~78 % busy; 22 % idle). Of its samples:
+  draws ~25 % (draw_at_call -> RenderLowering::draw), setRenderPipelineState 12 %, ends ~23 %; WAITING on the lowering thread
+  ~21 %: RenderCommandEncoder::end -> reserve_end condvar 9 %, -[NBEncoder dealloc] -> nmb_encoder_discard -> slot give_back
+  10 %, Lowerer::ready -> previous end's drain 2.5 %; Vec growth from empty every frame (EncoderRecord in end_with_replay,
+  OwnedRecording in inline_splits Kept::draw, ...) ~7 % (realloc into the kernel).
+- So backboardd hands each frame twice (CA render thread -> frontend encode thread -> runtime lowering thread) and CA waits for
+  both at every commit: the second hand-off only adds waits there.
+- CHANGE (BUILT 2026-11-20): NativeAdrenoMetalPlugin.mm: with /var/local/sweet-rs-atcall present when backboardd starts (and no
+  metal-flow= boot arg), backboardd gets NATIVE_METAL_FLOW=6 (lowering thread off, commit submission and warm pass kept); other
+  processes unchanged. Diff xnu/ios27/adrenometal-rsatcall.diff; backup research/ios27.2/metal/NativeAdrenoMetalPlugin.mm.before-rsatcall.
+  Rebuilt bridge and iOS 27 plugin from current source (`PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-bridge.py --target ios27`,
+  then `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`). Bundle signature
+  verified. Executable copied byte-for-byte to outputs/NativeAdrenoMetal-rsatcall; SHA-256
+  `7d725dee61726c0433ef00beb87956227526b692d0f4d2246bf04933b5d64dbc`. No source compile fixes were needed. Not installed.
+  Test when ready: install, touch the file, reboot, scroll, compare swaps/s with 27-28 (ui-sw2 / ui-bb-t13 windows).
+- Later candidate (runtime): keep those Vec capacities across encoders (spares) instead of growing from empty each frame.
+- RESULT sweet-rs-atcall (2026-11-20, installed NativeAdrenoMetal-rsatcall, file present): outputs/ui-rsatcall1.txt at ~3.7 min
+  uptime 21.5-25.3/s (too early: priming); ui-rsatcall2.txt at ~6 min (load average still 9) 26.9/28.9/26.9 swaps/s while
+  scrolling, longest gaps 165-282 ms -> no measurable change from the 27-28 baseline. The waits on the lowering thread were not
+  what sets the frame rate; the encode thread's own work (draws, pipeline sets, pass ends, list growth) and CA's wait for it at
+  every commit remain. Previous plugin kept on the phone at /var/local/NativeAdrenoMetal.deferopen2.
+- User: scrolling feels less jittery with it -> KEPT ON (/var/local/sweet-rs-atcall stays). The fps numbers do not show it;
+  frame-time evenness is not in the 5 s lines beyond the gap buckets and the longest gap.
+- PAUSED here (2026-11-20 01:25, user: switching to the root filesystem expansion). Two options left, user to pick:
+  1. Cheaper encode-thread work (runtime): first keep the per-pass Vec capacities (EncoderRecord in end_with_replay,
+     OwnedRecording in inline_splits Kept::draw, ...) instead of growing from empty each frame (~7 % of the encode thread), then
+     re-profile (tsample backboardd 1000 3000, busiest thread) and take the next item. Low risk, a few % each; testable with the
+     GPU tests on the Mac before a Codex build. Claude's recommendation: do this first.
+  2. Overlap frames: commitAndWaitUntilSubmitted returns after commit; the kernel holds a swap until that frame's GPU work is
+     submitted. Needs frontend -> kernel "frame N committed/submitted" signals (no channel today; via a new call in Turnip's darwin
+     backend -> new SweetAccelerator selector -> SweetFramebuffer holds the swap). Per-process submit counts are not enough (a
+     late submit of frame N-1 would release swap N: an older surface shown). Several days, 2 Codex builds, glitch risk;
+     possible 30-40 % (estimate). Write the design first.
+- Observation (user): UI scrolling 25-30 fps, unchanged by the 0044 hand-off (now in backboardd too, draws fine).
+- Reading of the earlier data: no stage is saturated (backboardd's busiest thread ~40 %, outputs/tsample-bbd-scroll.txt; GPU busy
+  47-72 %; Reduce Transparency gave fewer GPU cycles but no more frames, dmesg-fps-reducetrans), yet frames land every 3rd panel
+  slot (88 Hz: 3 slots = 29 fps). Suspect: stages run one after another instead of overlapping. CoreAnimation calls SwapWait
+  (selector 6) ~2x a frame; ours blocks backboardd's render thread until the named swap is shown (up to 50 ms), and since
+  asyncflip a swap counts as shown only once the previous flip settled at the panel's next frame start. If CA names the swap it
+  just made, CPU drawing of frame N+1 cannot start before frame N is on the panel.
+- Change (iokit/Kernel/arm/SweetFramebuffer.cpp; diff research/ios27.2/kernel/xnu12377-fb-swapwait.diff, copy in xnu/ios27/;
+  backup kernel-backup/SweetFramebuffer.cpp.before-swapwait):
+  * New 5 s line: `SWEET FB: 5s: SwapWait mode M: on the newest swap N, the previous N, older N, not waited N; blocked X ms in
+    all (Y us a call)` -> which swap CA waits on, and how much of each 5 s the render thread spent blocked there.
+  * Runtime switch, no boot arg: `sysctl kern.sweet_fb_swapwait=1` (default, unchanged behaviour), `=2` (a wait on the newest
+    swap returns at once; earlier swaps still waited for), `=0` (never waits). Resets to 1 at boot.
+  * Risk in 2/0: CA may draw into a surface whose GPU blit to the flip buffer is still queued (the GPU runs submissions in order,
+    so expected safe) or that a CPU-composed frame still reads (possible tearing on such frames). Watch for glitches.
+- Status: the requested kernel and images are built; artifact hashes and sidecars are recorded below. The only boot-arg
+  change from xfrot-nodiag is a refreshed `sweettime`.
+- Build complete: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256
+  `85093444842f631e824b73e9773258c449aadf10fedb4811f151231404127a6c`; build log `xnu12377-swapwait-build.log`.
+  Build exited 0; no compile fixes were needed. ADT reused unchanged: `work/guacamole-ios27a-yuv.adt`.
+- Boot images: `outputs/guacamole-ios27a-swapwait-nodiag.img`, SHA-256
+  `994447459897c7bddf4bb3b1c2c8283f3f6e50c55697316c151919bf9e1ce3e3`; triple image
+  `outputs/guacamole-ios27a-swapwait-nodiag-triple.img`, SHA-256
+  `aeb97cc0190935aca71750872ad0bc8ecb4516debcdfd3338d7ffa4265758539`.
+  Boot-args sidecars: `outputs/guacamole-ios27a-swapwait-nodiag-boot-args.txt` and
+  `outputs/guacamole-ios27a-swapwait-nodiag-triple-boot-args.txt` (identical, 589 characters; only `sweettime`
+  differs from xfrot-nodiag). The triple preserves the iOS 16 payload and selector shim; iOS 27 starts at `0x103a000`.
+  Not installed or flashed. Flash command (not run):
+  `fastboot flash boot_b outputs/guacamole-ios27a-swapwait-nodiag-triple.img`.
+- Phone test (user): boot it, wait ~8 min, then for each mode scroll the home screen ~15 s and capture:
+  `ssh root@PHONE 'dmesg | grep "SWEET FB: 5s" | tail -12' > outputs/ui-swN.txt` after `ssh root@PHONE 'sysctl kern.sweet_fb_swapwait=N'`.
+  Read: swaps/s per mode; "on the newest swap" high + large "blocked" in mode 1 confirms the serialisation.
+
+# ON HOLD (2026-11-19, Claude + user): 90 fps UI -- linear surface textures -> UBWC. Waiting on the 0044/upload-reuse build first.
+Nothing below is implemented.
+- Goal: UI at the panel's ~88-90 Hz (0199): ~11.3 ms a frame. Now 37-39 fps scrolling, GPU ~16-17 ms a frame (GPU-bound). CA
+  shows a frame only at a refresh: one missed slot = 44 fps, two = 29 fps (37-39 is a mix). Target GPU <= ~9-10 ms a frame.
+  Render size 828x1792 (sweetfb_scale=2, QSEED3 scales to the panel); Android runs this GPU at 1440p 90 Hz, so 16 ms is inefficiency.
+- Already known: UI renders in GMEM (gpu-diagB: 21,895 passes GMEM, 1 sysmem; ~10 passes, 72 draws, 5.4 Mpx GMEM work a frame).
+- What is linear (checked in the runtime source, .cache/gpu-reference/metal2vulkan/crates/metal2vulkan-runtime):
+  * Private Metal textures (newTextureWithDescriptor: -> image_plan.rs create_info): VK_IMAGE_TILING_OPTIMAL with a format list,
+    so Turnip should give them tiling + UBWC. Not verified.
+  * Every texture over an IOSurface: imported as DRM_FORMAT_MOD_LINEAR images rendered in place (dma_buf.rs,
+    HostPageTexturePolicy::InPlaceWrites): backboardd's framebuffer surface and every app layer backing store it samples. Cost is
+    at each pass's GMEM load/store and at sampling (no compression, poor texture-cache locality), not during drawing.
+- Plan, in order:
+  1. Inventory (1-2 days): for one scrolling frame, every texture rendered/sampled, size, and layout (linear surface / tiled /
+     tiled+UBWC); a Turnip log line in its image setup when and why UBWC is turned off. Decides whether this lever is worth 2 ms or 6.
+  2. Framebuffer path (days to 2 weeks): backboardd's framebuffer surface and the page-flip buffers in UBWC, scanned out as UBWC
+     by the DPU (VIG pipes support it on SM8150, as Android does). Runtime: import with DRM_FORMAT_MOD_QCOM_COMPRESSED (Turnip
+     supports it) instead of LINEAR. Kernel (SweetFramebuffer/SweetSurface): buffers in Turnip's UBWC layout (data + metadata),
+     VIG pipe UBWC format and UBWC static config matching the GPU's. Catch: CPU readers of the framebuffer (screenshots, the
+     kernel's CPU compose fallback) need a GPU decompress-to-linear first.
+  3. App layer backing stores (weeks, uncertain; the bigger share): cross-process (app renders, backboardd samples), so the
+     compressed form must live in the surface itself, not a per-process shadow. Idea: iOS's lossless-compressed IOSurface pixel
+     formats ('&' four-char codes) that QuartzCore uses on real iPhones for GPU-only surfaces; report support, map them to UBWC in
+     SweetSurface, import compressed. First find what iOS 27 QuartzCore checks before using those formats.
+  4. Private textures: confirm nothing turns their UBWC off (view formats without a list, unrequested storage usage).
+- Free diagnostic any time: Settings > Accessibility > Display & Text Size > Reduce Transparency on vs off, scroll the home screen
+  10 s each, then `ssh root@192.168.0.69 'dmesg | grep "SWEET FB: 5s" | tail -5'` -> how much of the 16 ms the glass/blur passes are.
+- Other GPU-time levers to weigh after the inventory: shader quality after Metal -> SPIR-V -> ir3, number of passes/offscreen copies.
+
+# PLANNED, NOT STARTED (2026-11-19, Claude + user): power management, boot-arg room, native GPU driver question
+Nothing below is implemented. Decisions and plans from a discussion, for a later session.
+
+## Boot arguments: the 607-character total is the limit (iOS 27 args at 589)
+- No new boot args for new features. New features default ON; the only boot-arg control is a DISABLE value, preferably on an
+  argument that already exists. Runtime on/off goes through sysctls (no boot-arg cost), like kern.sweet_passcode_reset.
+- Free room by making today's always-on values the iOS 27 kernel's defaults (each driver's PE_parse_boot_argn default), so the
+  args can be dropped and still work as overrides (e.g. sweetcamhw=0). Candidates (~270 chars):
+  sweettouch=1 sweetkeys=1 sweetusb=1 sweetpmem=1 sweetwifid=1 sweetmailbox=1 sweetboxroot=1 sweetfbgpu=1 sweetfbatswap=1
+  sweetfb_hwvsync=1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_scale=2 sweetcamhw=1 sweetpasscode=1 sweetabp=3 sweetgpu=11
+  sweetmtl=3 sb=2 sc=1. Keep as args: sweettime, ufsroot/rd, wdt, debug, diag and Apple's own. Do it together with the governor
+  kernel build, and write a new boot-args sidecar without the dropped entries. Expected: 589 -> ~320 chars.
+
+## Power management (state today: no saving at all)
+- CPU: sweetcpufreq=3 pins all three OSM domains at their top row (bsd/dev/sweet_cpufreq.c). GPU: fixed at level 5, 585 MHz
+  (sweetgpufreq default, bsd/dev/sweet_gpu.c, HFI perf vote). Idle cores: WFI only. SweetCPU::haltCPU/quiesceCPU panic
+  (iokit/Kernel/arm/SweetCPU.cpp); tools/mkadt.py sets sleep-disabled so iOS never tries system sleep.
+- A governor saves battery/heat; it does not add speed (clocks are already max), but may avoid LMh thermal throttling in long games.
+
+### Plan, in order
+1. Measure battery current screen-on idle and screen-off (SweetBattery readings) as the baseline for every step.
+2. CPU governor (days, low risk): sample per-cluster busy time every ~10-20 ms, pick an OSM table row (schedutil-like); optional
+   CLPC-lite through XNU's sched_perfcontrol callbacks (boost for user-interactive threads). Touch boost from sweet_touch.c.
+   Controls: default ON when sweetcpufreq is absent; sweetcpufreq=3 = pinned at max (the disable; delete it from the args to get
+   the governor, saves 15 chars); sysctl kern.sweet_cpugov=0/1 at runtime.
+3. GPU governor (days to a week): GPU busy time (already measured for the SWEET FB 5 s lines) -> GMU level 1-5 via HFI; also
+   DDR/bus bandwidth votes (probably stuck high). Controls: default ON; sweetgpufreq=5 pins 585 MHz (the disable);
+   sysctl kern.sweet_gpugov=0/1.
+4. Userland that keeps cores awake: wland polls Wi-Fi every 1 ms (~12% of a core); locationd can spin a core after boot.
+5. Deeper CPU idle (weeks, medium risk): PSCI CPU_SUSPEND core/cluster power collapse instead of WFI. Needs the PSCI state ids
+   (Android DT idle states), a wake timer that runs while cores are off (Qualcomm memory-mapped timer, as Linux), resume through
+   the existing CPU start vector. Default ON, sysctl back to WFI, a disable value on an existing arg if needed from boot.
+6. Real system sleep (months, high risk): SM8150 firmware has no usable whole-SoC suspend; Linux "sleeps" with every CPU in its
+   deepest idle state and RPMh sleep votes released (step 5 is the base). Also needs: wake interrupts routed through the PDC
+   (power key via PMIC, RTC alarm, modem), every driver powering down/up through iOS power states (UFS, display, touch, Wi-Fi,
+   ADSP audio, GMU, camera, USB), haltCPU = PSCI CPU_OFF for secondaries, then sleep-disabled removed from the ADT.
+- Expectation: steps 1-4 likely give most of the screen-off battery gain even with sleep still disabled.
+
+## Native Metal GPU driver vs metal2vulkan (question asked; answer: not now)
+- A native driver (Metal -> Adreno command streams directly) = multi-person-years (12+ months even with agents) for parity:
+  shaders AIR -> NIR -> Mesa ir3 (reusable), command streams (Turnip/freedreno scale), and all of Metal's semantics (hazard
+  tracking, retained resources, argument buffers, heaps, purgeable, IOSurface, tile shaders), which is most of metal2vulkan anyway.
+- Possible gain: games are CPU-bound (Minecraft GPU busy 13%), so per-draw overhead matters; rough guess 1.5-3x in draw-heavy
+  games, but much of the cost is Metal semantics, not Vulkan. UI is GPU-bound (16-17 ms/frame): a new driver barely helps; UBWC
+  instead of linear textures, fewer render-pass splits and GMEM vs sysmem choices help the same on Turnip.
+- Middle path if ever: a Metal frontend on Mesa Gallium + freedreno (Metal's default model is closer to GL than Vulkan; Gallium
+  already does implicit hazard tracking). Still a large project (compare Mesa's D3D9 frontend).
+- Decision trigger: profile per draw (frontend / bridge / metal2vulkan lowering / Turnip recording). Only if the cost is inherent
+  to the Metal -> Vulkan translation does the Gallium route make sense. First finish 0044 + upload reuse, then UI GPU time (UBWC).
+
+# Metal performance: upload buffer reuse + render passes open on the lowering thread (2026-11-19, Claude) -- INSTALLED AND KEPT (deferopen2)
+Goal: Minecraft 17-21 fps -> ~26 (profile mc-fps9: 22% of the render thread waited at pass boundaries, CommandBuffer::settle_ended;
+newBufferWithBytes ~5%). At handoff, both changes were source only and uncompiled; the Codex build and test results are recorded below.
+
+## 1. Upload buffer reuse (frontend only)
+- `work/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm`: gUploadPool. A newBufferWithBytes: buffer of <= 64 KiB, Shared
+  storage, is kept at -dealloc and handed to the next newBufferWithBytes: of the same length and options (bytes memcpy'd in). Safe at
+  dealloc because every bind holds the buffer object in its command buffer's resourceOwners (-own:) until completion. Never kept: GPU
+  address handed out (argument buffers skip own:), setPurgeableState: other than KeepCurrent, makeAliasable, heap/no-copy/surface.
+  Caps: 64 per (length, options), 8 MiB total; drained in native_bridge_metal_relieve_memory (memory pressure).
+- Off switch: `/var/local/sweet-nobufpool` (read once per process). Counters: uploads reused/made/kept/dropped (log line below).
+- Diff: `xnu/ios27/adrenometal-uploadpool.diff`; backup `research/ios27.2/metal/NativeBridgeMetalFrontend.mm.before-uploadpool`.
+
+## 2. Bridge patch 0044: a render pass opens on the lowering thread
+- Patch: `work/UniXNU/drivers/AdrenoMetal/bridge/patches/0044-render-pass-opens-on-the-lowering-thread.patch` (added to
+  scripts/build-adreno-metal-bridge.py's list; copies `xnu/ios27/adrenometal-deferopen.diff`,
+  `research/ios27.2/metal/0044-...patch`). The .cache source already has it applied (= pin + 0002..0044). Backups of the touched
+  files before it: `research/ios27.2/metal/before-deferopen/`.
+- Design (render/deferral.rs module docs, "Openings left to the thread"): render_command_encoder after a render encoder whose end is
+  in flight (CommandBuffer.ending held, the pass has no color groups / rate map / rebind log) makes the descriptor checks at the call
+  (check_descriptor, layout, PassShape, compatible pass), takes the end in flight into a PendingOpen held by the new encoder's slot
+  (Lowerer.opening), and returns an encoder that logs its calls, checked against the descriptor's layout (CallChecks::preview).
+  Lowerer::ready runs the opening before anything of the slot is lowered (Batch::lower, end_lowering, drain_locked, at_call,
+  give_back): finish the end before it (already lowered on the thread: slots are taken in hand order), then open_render as at the
+  call, from the carried draw. Under the opening, settle_ended is a no-op and State::open_refusal uses commit_refusal (a commit
+  queued since does not refuse it).
+- Command buffer state: `end_lowered: bool` became `ends_unlowered: u32` (several ends can be in flight now; a queued commit runs
+  when the last is lowered). `deferred_open` marks the pending opening: refusal() answers EncoderOpen while it is set, queue_commit
+  refuses, settle_ended runs it (open_pending) so any call that needs the encoders' work still sees them in order.
+- Ordering check: every render encoder takes a ticket at its call; State.render_opened checks they open in that order. Counters
+  (runtime `deferred_open_counts()`, bridge `nmb_deferred_open_counts`): [0] deferred at call, [1] opened by thread, [2] opened by
+  program, [3] OUT OF ORDER (must stay 0), [4] refused as it ran. Frontend os_log every 1000 commits with diag=1, or whenever [3]/[4]
+  change: `NativeAdrenoMetal opens: commit N | deferred .. (thread .., program ..) out-of-order .. refused .. | uploads reused ..`.
+- Off switch: `/var/local/sweet-nodeferopen` -> plugin sets M2V_DEFERRED_OPEN=0 (NativeAdrenoMetalPlugin.mm), read once per process.
+- Frontend/plugin/bridge diff: `xnu/ios27/adrenometal-deferopen-frontend.diff`; upload-pool frontend diff:
+  `xnu/ios27/adrenometal-uploadpool.diff`.
+- New tests in src/tests/deferred_calls.rs: passes_after_an_end_in_flight_open_without_waiting_and_keep_their_order (first pass's
+  lowering held, 3 more passes open/end without waiting, 6 passes in all, last color wins, out-of-order 0),
+  an_encoder_whose_opening_waits_is_open_to_the_program (commit and blit refused EncoderOpen, both policies alike),
+  an_encoder_dropped_before_its_deferred_opening_abandons_its_command_buffer.
+- Known risks (observations, not results): the layout is computed twice (call and opening), so a degradation notice from
+  render_pass::layout may be announced twice; protection options changed between the call and the opening apply at the opening; a
+  read like commandBuffer.error while the next pass is open but before its opening ran now settles that opening first.
+
+## Build and test result (Codex, 2026-11-19)
+- Runtime unit suite passes when run serially: `cargo test -p metal2vulkan-runtime --lib -- --test-threads=1` -> 1394 passed,
+  0 failed, 4 ignored (113.99 s). The default parallel run had two flaky `churn_counts` failures; both passed serially.
+- Deferred-call GPU tests are not verified. With the requested `RUSTFLAGS="--cfg m2v_gpu"`, I fetched MoltenVK 1.4.2 into
+  `/private/tmp/ios27-moltenvk` and exposed it as a temporary `VULKAN_SDK`; the loader opens, but all 25 tests fail at device setup
+  with `NoDevice`. This Mac execution environment has no Vulkan physical device available to MoltenVK. Do not install or phone-test
+  this build until those 25 tests run on a host with a usable MoltenVK device.
+- Build fixes needed: added `<map>` for the upload pool's `std::map`, and added `-Wno-frame-address` to the plugin compile flags
+  for the intentional caller-frame diagnostic. Refreshed `xnu/ios27/adrenometal-uploadpool.diff` to include the `<map>` fix.
+- Bridge and iOS 27 plugin build succeeded; bundle code signature verification passed. Executable copied byte-for-byte to
+  `outputs/NativeAdrenoMetal-deferopen`; SHA-256:
+  `09c7c1a4ac8ac35d7e503336e935c22bb2dd5f86cb6914d51d0ffd18d69cf76b`.
+- Rebuilt the bridge and plugin again from current source (Codex, 2026-11-19). Signature verification passed; executable copied
+  byte-for-byte to `outputs/NativeAdrenoMetal-deferopen2`; SHA-256:
+  `887e13d60536b45fd37ac6d9c81efc79b58986fc4e7b24950d53ddb5317bc0de`.
+- Device install and phone test plan remain pending the deferred-call tests on a host that exposes a Vulkan device.
+
+## Device tests on the user's Mac + fix (2026-11-19 22:00, Claude + user)
+- The GPU tests run in the user's own Terminal (Codex's sandbox has no GPU). Setup that works:
+  `brew install vulkan-loader molten-vk`; in the metal2vulkan folder, with a PATH WITHOUT /private/tmp/adreno-cargo-bin (its
+  wrapper pins stable 1.98.0, but the repo's rust-toolchain.toml needs nightly-2026-11-03 for -Z flags):
+  `export RUSTC="$(/opt/homebrew/bin/rustup which --toolchain nightly-2026-11-03 rustc)"`
+  `export VK_DRIVER_FILES=/opt/homebrew/.../MoltenVK_icd.json` (the brew icd.d path; VK_ICD_FILENAMES the same)
+  `RUSTFLAGS="--cfg m2v_gpu" /opt/homebrew/bin/rustup run nightly-2026-11-03 cargo test -p metal2vulkan-runtime --lib tests::deferred_calls -- --test-threads=1`
+- First run: 24/25 passed; passes_after_an_end_in_flight_open_without_waiting_and_keep_their_order failed: pass 1's opening was
+  deferred, pass 2's was not (deferred_open still marked pass 1, whose opening had not run, and take_end_for_deferred_open refused
+  to chain). FIX: hold_end clears State.deferred_open (an encoder that ended is no longer open to the program; its opening runs
+  through its end). The test now reports how far the encoding thread got (Stage) and the counts on failure.
+- After the fix: deferred_calls 25/25 passed on the Mac's GPU (MoltenVK). Then only formatting of Claude's own lines changed.
+- Patch 0044 regenerated with the fix (applies to the 0043 source and reproduces the tree; SHA-256 prefix fe81d4b7f2b2bccc).
+- outputs/NativeAdrenoMetal-deferopen (09c7c1a4...) is STALE: built before the fix, it opens only every other pass on the
+  lowering thread at best. Do not install it. Codex: rebuild bridge + iOS 27 plugin from the current source, copy to
+  outputs/NativeAdrenoMetal-deferopen2, record its SHA-256 here. Then the phone test plan above.
+
+## Phone result (2026-11-19 22:27, user + Claude) -- KEPT
+- Installed outputs/NativeAdrenoMetal-deferopen2 (SHA-256 887e13d6...bc0de) over SSH; previous plugin backed up on the phone at
+  /var/local/NativeAdrenoMetal.bindcache. Booted with /var/local/sweet-nodeferopen present (UI without the hand-off), then removed
+  it and relaunched Minecraft. The switch file is now absent: after the next reboot every process uses the hand-off.
+- Minecraft (outputs/mc-fps10.txt, xfrot-nodiag image): 22.9 fps in the measured 5 s window (baseline 17-21 with bindcache);
+  swap gaps <34 ms 35, <50 ms 45, more 35; longest gap 57 ms; GPU busy at 20% of vsyncs; minecraftpe 254% CPU (was 268%).
+  outputs/mc-opens10.txt empty: no opening out of order or refused. Rendering correct. User: frame times a bit better -> keep.
+  No same-session A/B was taken, so the gain is not separated from scene variation (~+2-4 fps at most).
+- Seen: memory tight while playing (free 45 MB, 810 page-ins in 5 s, minecraftpe 931 MB RSS): a possible stutter source.
+- Phone address on this network was 172.28.200.71 (not 192.168.0.69).
+- Rollback: `ssh root@PHONE 'cp /var/local/NativeAdrenoMetal.bindcache /System/Library/Extensions/NativeAdrenoMetal.bundle/NativeAdrenoMetal && sync && reboot'`;
+  hand-off only: `touch /var/local/sweet-nodeferopen`; upload reuse only: `touch /var/local/sweet-nobufpool` (both read at process start).
+- Next for games (not started): profile minecraftpe's render thread to see whether settle_ended is gone and what leads now
+  (the lowering thread, per the earlier estimate).
+
+## Codex: build and test
+1. Unit tests: `cd work/UniXNU/.cache/gpu-reference/metal2vulkan && cargo test -p metal2vulkan-runtime --lib -- --test-threads=1`
+2. On a Mac with a working MoltenVK physical device, run device tests:
+   `VULKAN_SDK=/path/to/vulkan-sdk RUSTFLAGS="--cfg m2v_gpu" cargo test -p metal2vulkan-runtime --lib tests::deferred_calls`
+   All of deferred_calls must pass (old ones cover end/commit-in-flight ordering, which ends_unlowered changed).
+3. Bridge + plugin: `python3 scripts/build-adreno-metal-bridge.py --target ios27`, then
+   `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`;
+   copy the executable to `outputs/NativeAdrenoMetal-deferopen`, record its SHA-256 here.
+## Phone test plan (after 1-3 pass)
+- Install NativeAdrenoMetal-deferopen; boot the current xfrot-nodiag image (diag=1 image for the log line). Minecraft: fps as in
+  mc-fps8 (baseline 17-21), plus the "opens" line (out-of-order and refused must be 0). Watch for: wrong or flickering frames, a
+  black pass, GPU hang/reset, freeze. Any of those: `touch /var/local/sweet-nodeferopen`, relaunch the app, retest (isolates 0044);
+  then the same with `/var/local/sweet-nobufpool` for the upload reuse.
+- Also check the UI (SpringBoard scrolling 37-39 fps) and Subway Surfers for regressions.
+
 # Landscape games black: CA's rotated framebuffer (2026-11-19, Claude) -- fixed: Minecraft runs (low fps)
 - Summary: landscape now works through the system (backboardd's rotated framebuffer, apps' rotated drawables, the
   kernel scaler's rotation); diffs in xnu/ios27/ (adrenometal-landscape, adrenometal-vertex-absent = bridge 0043,

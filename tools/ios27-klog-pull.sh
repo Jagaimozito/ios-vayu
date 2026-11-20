@@ -1,11 +1,11 @@
 #!/bin/sh
-# Pull the iOS 27 kernel log (the SWEETLOG ring in the last 4 MiB + 4 KiB of the ios26 partition) from the phone
+# Pull the iOS 27 kernel log (the SWEETLOG ring in the last 4 MiB + 4 KiB of the ios27 partition) from the phone
 # booted into ANDROID (adb + root), and decode it. Run on the Mac in the repo folder:
 #   sh tools/ios27-klog-pull.sh            -> outputs/ios27-klog.bin (raw) and outputs/ios27-klog.txt (text)
-# Only reads. PART=name picks another partition (default ios26).
+# Only reads. PART=name picks another partition (default ios27; ios26 before the 2026-11-20 split).
 set -eu
 cd "$(dirname "$0")/.."
-part=${PART:-ios26}
+part=${PART:-ios27}
 adb get-state >/dev/null 2>&1 || { echo "no adb device: boot Android and connect USB" >&2; exit 1; }
 dev=$(adb shell "readlink -f /dev/block/by-name/$part" | tr -d '\r')
 [ -n "$dev" ] || { echo "no partition $part" >&2; exit 1; }
