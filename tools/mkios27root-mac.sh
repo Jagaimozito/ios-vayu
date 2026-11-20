@@ -101,6 +101,15 @@ with open(p, 'r+b') as f:	# rewrite in place: owner and mode stay
 print('launchd.plist: removed', gone)
 PYEOF
 
+# 2026-11-20: no Setup on a fresh root. On the old phone a box installed these by hand; the 80g root ran Setup again
+# (and resprang). purplebuddy + purplebuddy.notbackedup: SetupDone, SetupFinishedAllSteps, ForceNoBuddy,
+# UserChoseLanguage, SetupVersion/TVSetupVersion 99, and every "<Pane>Presented" key in 27.2's Setup binary.
+sudo install -d -o 501 -g 501 -m 0755 "$R/private/var/mobile/Library/Preferences"
+for f in com.apple.purplebuddy.plist com.apple.purplebuddy.notbackedup.plist; do
+	sudo install -o 501 -g 501 -m 0600 "$TOOLS/nobuddy27/$f" "$R/private/var/mobile/Library/Preferences/$f"
+done
+echo "Setup skipped: purplebuddy prefs installed"
+
 # Network extras (all optional; local files only, never in git: research/ is ignored).
 #   research/ios27.2/extras/bootstrap-ssh-iphoneos-arm64.tar.zst   Procursus rootless bootstrap with OpenSSH
 #       (https://apt.procurs.us/bootstraps/1900/) -> /var/jb; host keys made here; launchd job com.sweet.sshd
