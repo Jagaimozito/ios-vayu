@@ -1,3 +1,14 @@
+# macOS 27 kernel, first build (2026-11-20, Claude) -- scripts ready, Codex builds
+- Goal: see how far the macOS kernel gets on the phone, before any macOS userland. Same work/xnu-12377 tree as iOS 27,
+  built with the macosx SDK (PLATFORM=MacOSX -> XNU_TARGET_OS_OSX) and xnu/macos27/MASTER.arm64.sweet.MacOSX
+  (Apple's MacOSX config with the SWEET changes: nos_arm_asm/nos_arm_pmap, sweet_hfs, no CPU counters; doconf
+  prefers MASTER.arm64.sweet.MacOSX over MASTER.arm64.sweet). Objects: BUILD/obj-macos27-sweet (iOS build untouched).
+- tools/mkmacos27kernel.sh builds it (log work/xnu12377-macos27-build.log). Source fixes for macOS only go under
+  #if XNU_TARGET_OS_OSX so the iOS kernel still builds.
+- tools/mkmacos27boot.sh IOS27.img: ADT and boot-args from the iOS 27 image (ufsroot=macos, no rootrw, console on
+  screen, -v), then outputs/guacamole-menu-ios27-macos27.img. `macos` starts mid-way through the old iOS 16 image,
+  so no HFS volume header is expected there: the kernel should stop at the root mount. Log: PART=macos.
+
 # Partition split: iOS 16 removed, ios27 + macos (2026-11-20, Claude) -- table written, images pending
 - GPT gpt-new2 written from recovery and read back (sha256 head e55ee144..., tail 1c4032f7...): entry 20 `ios26`
   -> `ios27` 18723208-40065671 (81.42 GiB, same start and unique GUID); entry 19 `ios` (iOS 16) -> `macos`

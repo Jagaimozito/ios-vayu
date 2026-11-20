@@ -1,0 +1,27 @@
+#!/bin/bash
+# Build the SWEET macOS 27 kernel on this Mac: the same xnu-12377 tree as iOS 27 (work/xnu-12377), built for
+# PLATFORM=MacOSX (macosx SDK -> XNU_TARGET_OS_OSX) with xnu/macos27/MASTER.arm64.sweet.MacOSX. Its objects go
+# to BUILD/obj-macos27-sweet, so the iOS 27 build (BUILD/obj-ios26-sweet) is not touched.
+#
+#   tools/mkmacos27kernel.sh            -> work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet
+#                                          log: work/xnu12377-macos27-build.log
+#
+# The source tree is shared with iOS 27: a source fix needed only for macOS goes under #if XNU_TARGET_OS_OSX
+# (or CONFIG_EMBEDDED for iOS-only code), so the iOS kernel keeps building unchanged.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+REPO=$PWD
+X=$REPO/work/xnu-12377
+[ -d "$X/config" ] || { echo "no $X" >&2; exit 1; }
+cp xnu/macos27/MASTER.arm64.sweet.MacOSX "$X/config/MASTER.arm64.sweet.MacOSX"
+cd "$X"
+make -j4 MAKEJOBS=-j4 \
+	SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" KERNEL_SDKROOT="$X/BUILD/sdk-ios26" \
+	OBJROOT="$X/BUILD/obj-macos27-sweet" SYMROOT="$X/BUILD/obj-macos27-sweet" \
+	KERNEL_CONFIGS=DEVELOPMENT ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=SWEET \
+	BUILD_WERROR=0 BUILD_LTO=0 BUILD_DSYM=0 DO_CTFMERGE=0 MEMORY_SIZE=34359738368 \
+	SYSCTL_HW_PHYSICALCPU=8 SYSCTL_HW_LOGICALCPU=8 RC_DARWIN_KERNEL_VERSION=25.5.0 \
+	2>&1 | tee "$REPO/work/xnu12377-macos27-build.log"
+K=$X/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet
+[ -f "$K" ] || { echo "no kernel: see work/xnu12377-macos27-build.log" >&2; exit 1; }
+shasum -a 256 "$K"
