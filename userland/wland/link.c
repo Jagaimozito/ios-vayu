@@ -4,6 +4,7 @@
  * channel. The modem is QRTR node 0; we are node 1.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "glink.h"
@@ -31,6 +32,29 @@ static qrtr_cb_t qrtr_cb;
 int verbose_link = 1;
 unsigned link_stats[4];
 void (*link_idle)(void);
+unsigned link_activity;
+static uint64_t now_ms(void);
+
+/* how long the idle loop sleeps now: 1 ms while there is traffic, 2 ms after 20 ms without any, 4 ms after 100 ms
+ * (at most 4: each RX ring has 32 buffers, a burst after a long idle fills them in a few ms) */
+static unsigned link_nap(void)
+{
+	static int off = -1;
+	static unsigned seen;
+	static uint64_t last;
+	uint64_t now = now_ms();
+	if (off < 0) {
+		const char *e = getenv("WLAND_NAP");
+		off = e && e[0] == '0';
+		last = now;
+	}
+	if (off || link_activity != seen) {
+		seen = link_activity;
+		last = now;
+		return 1;
+	}
+	return now - last < 20 ? 1 : now - last < 100 ? 2 : 4;
+}
 #define LOG(...) do { if (verbose_link) { printf("[%6llu] ", (unsigned long long)link_ms()); printf(__VA_ARGS__); } } while (0)
 
 static uint64_t now_ms(void)
@@ -228,12 +252,14 @@ int link_poll(unsigned ms)
 	uint64_t end = now_ms() + ms;
 	int n = 0;
 	do {
-		while (rx_one())
+		while (rx_one()) {
 			n++;
+			link_activity++;
+		}
 		if (link_idle)
 			link_idle();
 		if (ms)
-			delay_ms(1);
+			delay_ms(ms >= 100 ? link_nap() : 1);	/* waits inside a send or a bring-up stay at 1 ms */
 	} while (now_ms() < end);
 	return n;
 }
