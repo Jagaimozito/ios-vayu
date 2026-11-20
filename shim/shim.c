@@ -393,33 +393,43 @@ void shim_main(uint64_t dtb)
 	con_skip();
 #if defined(BOARD_GUACAMOLE)
 	/*
-	 * Boot menu (menu.c): iOS 27 / iOS 16 / Android, volume keys to move, power to start.
-	 * The Alert Slider picks the default like the menu reads, top to bottom (2026-11-17): top iOS 27,
-	 * middle iOS 16, bottom Android (unknown: iOS 16), which
-	 * starts after 5 s unless a key is pressed. If Android cannot be started the reason
-	 * stays on screen for 15 s, then iOS 16 boots.
+	 * Boot menu (menu.c), 2026-11-20: iOS 27 / macOS 27 / Android, volume keys to move, power to start.
+	 * No Alert Slider: the default is the last choice, kept in the boot menu memory block (ufs.c
+	 * ufs_bootmem_*: unallocated space at the end of LUN 0); none kept, iOS 27. It starts after 5 s
+	 * unless a key is pressed. If Android cannot be started the reason stays on screen for 15 s,
+	 * then iOS 27 boots. Payload 0 = iOS 27 (partition ios27), payload 1 = macOS 27 (partition macos).
 	 */
 	stage = "bootsel";
-	uint32_t slider_raw = 0;
-	int slider = bootsel_slider(&slider_raw);
+	static uint8_t mem[4096] __attribute__((aligned(4096)));
+	int memok = !ufs_open() && !ufs_bootmem_read(mem);
+	int kept = -1;
+	if (memok && mem[0] == 'S' && mem[1] == 'W' && mem[2] == 'B' && mem[3] == 'M' && mem[4] == 1 &&
+	    mem[5] < 3 && mem[6] == (uint8_t)~mem[5])
+		kept = mem[5];
 	/* Filled in code, not with an initializer: a table of string pointers in data would need
 	 * relocation, and the shim runs unrelocated. */
 	struct menu_entry entries[3];
-	/* tools/mktripleboot.py: payload 0 = iOS 16 (partition ios), payload 1 = iOS 27 (partition ios26) */
 	int npay = loader_count(dtb);
 	entries[0].title = "iOS 27";
-	entries[0].detail = npay >= 2 ? "iPhone 14 Pro, partition ios26" : "not in this boot image";
-	entries[0].enabled = npay >= 2;
-	entries[1].title = "iOS 16";
-	entries[1].detail = "iPhone X, partition ios";
-	entries[1].enabled = 1;
+	entries[0].detail = npay >= 1 ? "iPhone 14 Pro, partition ios27" : "not in this boot image";
+	entries[0].enabled = npay >= 1;
+	entries[1].title = "macOS 27";
+	entries[1].detail = npay >= 2 ? "partition macos" : "not installed yet";
+	entries[1].enabled = npay >= 2;
 	entries[2].title = "Android";
 	entries[2].detail = "boot_a";
 	entries[2].enabled = 1;
 	__asm__ volatile("" ::: "memory");
-	int def = (slider == SLIDER_TOP && entries[0].enabled) ? 0 : slider == SLIDER_BOTTOM ? 2 : 1;
+	int def = (kept >= 0 && entries[kept].enabled) ? kept : entries[0].enabled ? 0 : 2;
 	stage = "menu";
 	int choice = menu_choose(entries, 3, def, 5000);
+	if (memok && choice != kept) {	/* written only when the choice changed */
+		for (unsigned i = 0; i < sizeof(mem); i++)
+			mem[i] = 0;
+		mem[0] = 'S'; mem[1] = 'W'; mem[2] = 'B'; mem[3] = 'M'; mem[4] = 1;
+		mem[5] = (uint8_t)choice; mem[6] = (uint8_t)~choice;
+		(void)ufs_bootmem_write(mem);
+	}
 	con_quiet = 1;	/* only "Booting ..." until the kernel takes the screen; errors turn it back on */
 	if (choice == 2) {
 		stage = "android";
@@ -428,17 +438,21 @@ void shim_main(uint64_t dtb)
 		con_quiet = 0;
 		con_clear(BLACK);
 		con_str("ANDROID", afail);
-		bootsel_report(dtb, slider, slider_raw);
+		bootsel_report(dtb, SLIDER_UNKNOWN, 0);
+		if (memok) {	/* next boot defaults to iOS 27, not to the Android that failed */
+			mem[5] = 0; mem[6] = 0xff;
+			(void)ufs_bootmem_write(mem);
+		}
 		delay_ms(15000);
 		con_quiet = 1;
 	}
 	stage = "loader";
 	int pay_index = 0;
-	if (choice == 0 && entries[0].enabled) {
+	if (choice == 1 && entries[1].enabled) {
 		pay_index = 1;
-		menu_booting("Booting iOS 27");
+		menu_booting("Booting macOS 27");
 	} else {
-		menu_booting("Booting iOS 16");
+		menu_booting("Booting iOS 27");
 	}
 #else
 	int pay_index = 0;

@@ -1,13 +1,16 @@
 # Partition split: iOS 16 removed, ios27 + macos (2026-11-20, Claude) -- table written, images pending
-- New GPT written from recovery and read back (sha256 head 8b2297045a27..., tail 90825ad53b40...): entry 20 `ios26`
+- GPT gpt-new2 written from recovery and read back (sha256 head e55ee144..., tail 1c4032f7...): entry 20 `ios26`
   -> `ios27` 18723208-40065671 (81.42 GiB, same start and unique GUID); entry 19 `ios` (iOS 16) -> `macos`
-  40065672-61408250 (81.42 GiB, new unique GUID); new entry 21 `bootmem` 61408251-61409274 (4 MiB, Linux type).
-  Everything else unchanged. Before/after tables: dtb/sda-gpt-{head,tail}.{before-split,split}.bin and
-  outputs/gpt-{now,new}-*.bin (local only). Rollback: dd the before-split copies to LBA 0 and 61409275.
+  40065672-61408250 (81.42 GiB, new unique GUID); 61408251-61409274 (4 MiB) left unallocated. A `bootmem`
+  entry there (gpt-new, -new3 32 MiB, -new4 in front of ios27) made ABL fastboot hang every time: fastboot
+  stops working at 119 partitions in total, 118 is fine. Tables local only in outputs/gpt-*.
+- Boot menu (shim, 2026-11-20): iOS 27 / macOS 27 / Android, no slider, default = last choice kept in the
+  first block of that free 4 MiB (shim/ufs.c ufs_bootmem_*, a fenced SCSI WRITE(10) that checks the GPT
+  first); tools/mkmenuboot.py replaces mktripleboot.py (iOS 27 payload first, macOS optional).
 - The current boot image's iOS 27 entry looks for ufsroot=ios26 and no longer boots; Android is unaffected.
 - Codex: (1) tools/mkios27root-mac.sh 80g with the current NativeAdrenoMetal (outputs/NativeAdrenoMetal-bindcache),
   sparse -> research/ios27.2/ios27-root-80g.simg; (2) boot image = xfrot-nodiag kernel/args with ufsroot=ios27,
-  menu iOS 27 + Android only (no iOS 16 payload) -> outputs/guacamole-ios27a-xfrot-ios27part.img.
+  tools/mkmenuboot.py, iOS 27 payload only (no iOS 16) -> outputs/guacamole-ios27a-xfrot-ios27part.img.
   tools/ios27-klog-pull.sh now defaults to ios27 (done).
 
 # UI ~29 fps: SwapWait experiment (2026-11-19 23:50, Claude) -- TESTED: SwapWait is NOT the bottleneck

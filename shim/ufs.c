@@ -4,8 +4,9 @@
  * Runs with the MMU off (all memory Device, so DMA is coherent with no cache
  * maintenance). Dumps the UFSHCI registers ABL left behind and, if the host
  * is enabled and the link is up, points the transfer request list at our own
- * buffers and issues READ-ONLY SCSI commands on LUN 0. Nothing is ever
- * written to the device: there is no SCSI WRITE in this file.
+ * buffers and issues SCSI commands. The only write is ufs_bootmem_write (2026-11-20): one 4 KiB
+ * block, the first of the unallocated 4 MiB at the end of LUN 0, after checking the GPT that no
+ * partition covers it (the boot menu's memory of the last choice). Nothing else is written.
  *
  * Register layout and descriptor formats: JEDEC UFSHCI (JESD223).
  */
@@ -80,19 +81,22 @@ static uint32_t be32(const uint8_t *p)
 }
 
 /*
- * Issue one SCSI command (read direction or no data) in slot 0.
- * Returns 0 on success, otherwise a code describing the failure stage.
+ * Issue one SCSI command in slot 0: data in (len, the default), data out (scsi_out, only
+ * ufs_bootmem_write) or no data. Returns 0 on success, otherwise a code describing the failure stage.
  */
+static int scsi_out;
 static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *buf, uint32_t len,
     uint32_t *ocs_out, uint32_t *status_out)
 {
+	const int out = scsi_out;
+	scsi_out = 0;
 	static uint8_t tag;
 	zero(&utrl[0], sizeof(utrl[0]));
 	zero(&ucd, sizeof(ucd));
 
 	/* Command UPIU: header (12 bytes), expected length, CDB. */
 	ucd.cmd[0] = 0x01;			/* transaction type: COMMAND */
-	ucd.cmd[1] = len ? 0x40 : 0x00;		/* flags: R (data in) */
+	ucd.cmd[1] = !len ? 0x00 : out ? 0x20 : 0x40;	/* flags: W (data out) or R (data in) */
 	ucd.cmd[2] = lun;
 	ucd.cmd[3] = ++tag;
 	ucd.cmd[12] = len >> 24;
@@ -103,7 +107,7 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 		ucd.cmd[16 + i] = cdb[i];
 
 	uintptr_t ucd_pa = (uintptr_t)&ucd;
-	utrl[0].dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);	/* UFS storage, dev->host */
+	utrl[0].dw0 = (1u << 28) | ((!len ? 0u : out ? 1u : 2u) << 25) | (1u << 24);	/* UFS storage; 1 host->dev, 2 dev->host */
 	utrl[0].dw2 = 0x0f;			/* OCS: invalid until the host updates it */
 	utrl[0].ucdba = (uint32_t)ucd_pa;
 	utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
@@ -367,4 +371,59 @@ int ufs_find_guid(const char *name, uint8_t *lun_out, uint32_t *first_out, uint3
 		}
 	}
 	return 1;
+}
+
+/*
+ * The boot menu's memory (2026-11-20): one 4 KiB block on LUN 0, the first of the last 1024 usable
+ * blocks (the 4 MiB the 2026-11-20 split left unallocated: the bootloader's fastboot hangs with a
+ * 119th partition, so it has no GPT entry). Found from the GPT header's last usable LBA, and used
+ * only while no partition entry overlaps those 1024 blocks. 0 = ok; *lba_out = the block.
+ */
+static int bootmem_lba(uint32_t *lba_out)
+{
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+	ufs_tur(0);
+	if (read_lun(0, 1, 1, data))
+		return 1;
+	const uint8_t *g = data;
+	if (g[0] != 'E' || g[1] != 'F' || g[2] != 'I' || g[3] != ' ')
+		return 2;
+	uint64_t last = le64(g + 48);
+	uint32_t nent = g[80] | g[81] << 8 | g[82] << 16, esz = g[84] | g[85] << 8;
+	uint32_t elba = g[72] | g[73] << 8 | g[74] << 16 | (uint32_t)g[75] << 24;
+	if (esz != 128 || nent > 128 || !nent || last < 2048 || last > 0xffffffffu)
+		return 3;
+	uint64_t first = last - 1023;
+	if (read_lun(0, elba, (nent * 128 + BLOCK - 1) / BLOCK, ents))
+		return 4;
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		uint64_t s = le64(e + 32), t = le64(e + 40);
+		if (s && !(t < first || s > last))
+			return 5;	/* a partition covers it: never write there */
+	}
+	*lba_out = (uint32_t)first;
+	return 0;
+}
+
+int ufs_bootmem_read(void *block)
+{
+	uint32_t lba;
+	if (bootmem_lba(&lba))
+		return 1;
+	return read_lun(0, lba, 1, block) ? 2 : 0;
+}
+
+int ufs_bootmem_write(const void *block)
+{
+	uint32_t lba;
+	if (bootmem_lba(&lba))
+		return 1;
+	const uint8_t *src = block;
+	for (unsigned i = 0; i < BLOCK; i++)
+		data[i] = src[i];
+	uint8_t cdb[10] = { 0x2a, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, 0, 1, 0 };	/* WRITE(10), 1 block */
+	uint32_t ocs, st;
+	scsi_out = 1;
+	return scsi(0, cdb, sizeof(cdb), data, BLOCK, &ocs, &st) ? 2 : 0;
 }

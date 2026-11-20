@@ -1,16 +1,15 @@
 # Dual boot: Android and iOS on one OnePlus 7 Pro (guacamole)
 
-A boot menu picks the operating system at power-on (`shim/menu.c`): iOS 27, iOS 16, Android. Volume up
-and down move the selection, power starts it. The Alert Slider picks the default, which starts after 5 s
-unless a key is pressed:
+A boot menu picks the operating system at power-on (`shim/menu.c`): iOS 27, macOS 27, Android, top to
+bottom. Volume up and down move the selection, power starts it. The default is the last choice made,
+which starts after 5 s unless a key is pressed (none kept yet: iOS 27; macOS 27 is dimmed while the
+boot image carries no macOS payload). The Alert Slider is no longer read (2026-11-20).
 
-| Alert Slider | Default |
-| --- | --- |
-| top | iOS 27 (partition `ios26`; when the boot image carries no iOS 27 payload: iOS 16) |
-| middle | iOS 16 |
-| bottom | Android (boot_a: the stock ROM boot image, Magisk included) |
-
-The slider positions follow the menu's order, top to bottom (changed 2026-11-17; before, top was Android).
+The last choice is kept in a 4 KiB record (`SWBM`, version 1, choice, ~choice) in the first block of the
+unallocated 4 MiB at the end of LUN0 (LBA 61408251; `shim/ufs.c` `ufs_bootmem_read` / `ufs_bootmem_write`).
+That block has no GPT entry: ABL's fastboot hangs with 119 entries (118 work), so the shim finds it as
+the last usable LBA minus 1023 and refuses it if any GPT entry overlaps. It is the shim's only UFS write,
+done only when the choice changed. If Android cannot be started, the record goes back to iOS 27.
 
 Keys come from the PM8150 over the SPMI arbiter, read only: power = PON INT_RT_STS (0x0810) bit 0,
 volume down = bit 1 (RESIN) or GPIO7 (0xc610), volume up = GPIO6 (0xc510), as the kernel's keys driver
@@ -22,12 +21,12 @@ boots with Magisk. Flashing it to `boot_b` with slot B active is the permanent s
 ## How it works
 
 The phone's stock bootloader (ABL) always starts slot B's boot image. Its "kernel" is our shim
-(`shim/`), which ABL treats as an arm64 Linux Image. The shim reads the slider before anything else:
+(`shim/`), which ABL treats as an arm64 Linux Image. The shim shows the menu before anything else:
 
 - **iOS**: unchanged. The boot image's ramdisk is the SWEETXNU payload (XNU + ADT); `loader.c` places
   it and jumps to XNU, whose root is the GPT partition `ios` (`ufsroot=ios`).
 - **Android** (`shim/android.c`):
-  1. reads `boot_a` straight from the UFS (`shim/ufs.c`, read-only: the shim has no SCSI WRITE) into
+  1. reads `boot_a` straight from the UFS (`shim/ufs.c`; its only write is the menu's 4 KiB record outside every partition) into
      RAM at 0x100000000;
   2. takes the kernel out of Qualcomm's `UNCOMPRESSED_IMG` wrapper and moves it to an 8-byte aligned
      address (the MMU is off, so all memory is Device memory and unaligned 8-byte loads fault);
@@ -59,13 +58,15 @@ boot iOS; after it the iOS payload in memory is gone and the shim resets.
 | `userdata` (sda19) | 1945992-18723207 | 64 GiB | Android data |
 | `ios27` (entry 21) | 18723208-40065671 | 81.42 GiB | iOS 27 root (`ufsroot=ios27`); kernel log ring in its last 4 MiB + 4 KiB |
 | `macos` (entry 20) | 40065672-61408250 | 81.42 GiB | empty, for the macOS 27 port |
-| `bootmem` (entry 22) | 61408251-61409274 | 4 MiB | the boot menu's memory of the last choice |
+| (no entry) | 61408251-61409274 | 4 MiB | unallocated; its first block is the boot menu's last choice |
 
 2026-11-20: iOS 16 was retired and the iOS space split in two. `ios26` (which held iOS 27) became `ios27`
 with the same start and unique GUID, grown to the middle; the old iOS 16 partition `ios` became `macos`
-(new unique GUID); `bootmem` was added in a free entry. Written from recovery with `dd` (both GPT copies,
-LBA 0-5 and LBA 61409275-61409279, read back by sha256: head 8b229704..., tail 90825ad5...). The tables
-before and after are kept locally in `dtb/sda-gpt-{head,tail}.{before-split,split}.bin` (not in git).
+(new unique GUID). Written from recovery with `dd` (both GPT copies, LBA 0-5 and LBA 61409275-61409279,
+read back by sha256: head e55ee144..., tail 1c4032f7...; `outputs/gpt-new2-*`, local only). A first
+version with a `bootmem` GPT entry (`dtb/sda-gpt-*.split.bin`) made ABL's fastboot hang, wherever the entry
+sat and whatever its size: the limit is 118 partitions in total, so the 4 MiB stays unallocated. The
+table before the split is kept locally in `dtb/sda-gpt-{head,tail}.before-split.bin` (not in git).
 
 Earlier (2026-11-12) the table was rewritten from TWRP with `dd` (TWRP 3.7.1 has no sgdisk): `userdata`
 kept its start, type and unique GUIDs, `ios26` was added in the freed space; Android's data partition
@@ -79,8 +80,7 @@ Requirements: unlocked bootloader, Android on slot A (`boot_a`), the iOS root on
 1. Build the shim and an iOS boot image as usual (`docs/guacamole.md`, Workflow): `BOARD=guacamole
    shim/build.sh` builds the selector into `shim/out/Image`; `tools/guac-mkboot.sh` /
    `tools/mkguacboot.py` wrap it with the payload.
-2. Test tethered, nothing flashed: `fastboot boot IMAGE` with the slider at the bottom (Android) and at
-   the top or middle (iOS).
+2. Test tethered, nothing flashed: `fastboot boot IMAGE`, then pick Android and iOS 27 from the menu.
 3. Make `dtbo_b` equal `dtbo_a` (ABL applies the active slot's dtbo; Android needs its own):
    ```
    adb shell su -c "dd if=/dev/block/by-name/dtbo_a of=/dev/block/by-name/dtbo_b bs=4096 conv=fsync"
@@ -95,20 +95,20 @@ Requirements: unlocked bootloader, Android on slot A (`boot_a`), the iOS root on
    ```
 5. Back to plain Android at any time: `fastboot set_active a`.
 
-## Triple boot image (iOS 27 + iOS 16 + Android)
+## Menu boot image (iOS 27 + macOS 27 + Android)
 
-One boot image carries both iOS payloads in its ramdisk, iOS 16 first, each on a 4 KiB boundary
-(`shim/loader.c` `payload_at`, `loader_count`, `loader_boot_n`); the menu enables "iOS 27" when a
-second payload is there. Build both iOS boot images as usual (their own kernel, ADT and boot-args,
-`ufsroot=ios` / `ufsroot=ios26`), rebuild the shim (`BOARD=guacamole shim/build.sh`), then:
+One boot image carries the payloads in its ramdisk, iOS 27 first, then macOS 27 when there is one, each
+on a 4 KiB boundary (`shim/loader.c` `payload_at`, `loader_count`, `loader_boot_n`). Build the iOS 27
+boot image as usual (`ufsroot=ios27`; macOS 27: `ufsroot=macos`), rebuild the shim (`BOARD=guacamole
+shim/build.sh`), then:
 
 ```
-python3 tools/mktripleboot.py dtb/android-boot_b.img shim/out/Image IOS16.img IOS27.img OUT.img
+python3 tools/mkmenuboot.py dtb/android-boot_b.img shim/out/Image IOS27.img [MACOS27.img] OUT.img
 ```
 
-It refuses more than ~50 MiB of payloads (ABL's ramdisk room above the DTB, below 0x85700000). Test with
+It refuses more than 50 MiB of payloads (ABL's ramdisk room above the DTB, below 0x85700000). Test with
 `fastboot boot OUT.img`, then flash it to `boot_b` as below. An iOS restart (PSCI SYSTEM_RESET) comes
-back to this menu.
+back to this menu. (`tools/mktripleboot.py` built the older iOS 16 + iOS 27 image.)
 
 ## Rebuilding the boot image (kernel or payload changes)
 
@@ -147,7 +147,7 @@ checks, keystore), the shim could pass ABL's verity line for slot A instead.
 ## Files
 
 - `shim/menu.c`, `shim/menu.h`: boot menu (keys over SPMI, drawing).
-- `shim/bootsel.c`, `shim/bootsel.h`: slider read, diagnostics screen.
+- `shim/bootsel.c`, `shim/bootsel.h`: slider read (unused since 2026-11-20), diagnostics screen.
 - `shim/android.c`, `shim/android.h`: boot_a loader.
 - `shim/ufs.c`: `ufs_open`, `ufs_find`, `ufs_find_guid`, `ufs_read` (read-only, any LUN).
 - `shim/fdt.c`: `fdt_chosen_prop`, `fdt_rebuild_chosen`.

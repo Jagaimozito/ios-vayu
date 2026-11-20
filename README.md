@@ -48,7 +48,7 @@ Status snapshot: **2026-11-18**. For detailed evidence, caveats, and engineering
 
 ## Booting
 
-Use the combined triple-boot image and select iOS 27 from the shim menu. The Alert Slider picks the default in the menu's order: top iOS 27, middle iOS 16, bottom Android. **Do not assume a standalone iOS wrapper image will boot**; this setup requires the selector/triple-boot path.
+Use the combined menu boot image and select iOS 27 from the shim menu (iOS 27 / macOS 27 / Android; the last choice is the default). **Do not assume a standalone iOS wrapper image will boot**; this setup requires the selector/triple-boot path.
 
 The existing data partition is named `ios26`, so iOS 27 boot arguments commonly contain `ufsroot=ios26`. That is the partition label, not the OS version. See [`docs/dualboot.md`](docs/dualboot.md) for the image layout and selector workflow. The phone's Android installation and partition backups should be preserved when building or booting test images.
 
@@ -58,7 +58,7 @@ The existing data partition is named `ios26`, so iOS 27 boot arguments commonly 
 - **Metal plugin:** source/build work is in the separate Git repository at `work/UniXNU`; it is not included in commits to this repository.
 - **Root filesystem:** `tools/mkios27root-mac.sh` builds the iOS 27.2 root image on macOS from the prepared IPSW contents.
 - **Device tree and payload:** `tools/mkadt.py`, `tools/mkpayload.py`, and the shim build create the ADT and kernel payload used by the boot image.
-- **Triple-boot image:** `tools/mktripleboot.py` combines the stock boot image, selector shim, iOS 16 payload, and iOS 27 payload. See `docs/dualboot.md` for required inputs.
+- **Menu boot image:** `tools/mkmenuboot.py` combines the stock boot image, selector shim, the iOS 27 payload and (later) a macOS 27 payload. See `docs/dualboot.md` for required inputs.
 - **Userland tools and drivers:** `userland/` contains Wi-Fi, Bluetooth, audio, display, haptics, GPU and diagnostic code, including the phone-side diagnostics `ptop` (CPU, memory and process churn), `tsample` (sampling profiler), `tprobe` (clocks, timed waits, thread policies) and `rebootbl` (reboot to fastboot) in `userland/jb/`.
 - **launchd jobs:** `tools/launchd-add-job.py` and `tools/launchd-drop-job.py` add and remove jobs in iOS's launchd plist (the `adspd` boot job, the removed `PerfPowerServices`).
 - **Detailed status:** [`docs/ios27.md`](docs/ios27.md) tracks the current feature state; [`NOTES.md`](NOTES.md) records experiments, build artifacts, crashes and decisions. A source change or successful build does not by itself establish that a feature works at runtime.
