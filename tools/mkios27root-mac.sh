@@ -80,6 +80,12 @@ fi
 sudo python3 "$TOOLS/launchd-fips-noverify.py" "$R/sbin/launchd" /tmp/ios27-launchd.new --no-reboot-task sysstatuscheck
 sudo sh -c 'cat /tmp/ios27-launchd.new > "$1"' _ "$R/sbin/launchd"	# keeps owner, mode, hard links
 sudo rm -f /tmp/ios27-launchd.new
+# BlueTool: alias the BCM4357B1/USI legacy row (whose HCD is built into BlueTool) to D73's ProductHash, so the
+# btbridge-emulated BCM4357B1 finds a row. Without it: "HCD file corrupt!", then "no firmware for this platform",
+# and Bluetooth restarts forever. Page hashes are refreshed by the script; the signature and entitlements stay.
+sudo python3 "$TOOLS/patch-bluetool27-profile.py" "$R/usr/sbin/BlueTool" /tmp/ios27-BlueTool.new
+sudo sh -c 'cat /tmp/ios27-BlueTool.new > "$1"' _ "$R/usr/sbin/BlueTool"	# keeps owner, mode, hard links
+sudo rm -f /tmp/ios27-BlueTool.new
 # launchd.plist: no FairPlay here; com.apple.fairplayd.H2 exits -42306 and KeepAlive restarts it forever.
 # 2026-11-19: com.apple.cameracaptured goes too: the synthetic camera kept restarting it (about 400 MB of GPU pool,
 # then a jetsam kill, every few seconds), which resprung SpringBoard when leaving a game. backboardd gets
@@ -128,6 +134,7 @@ echo "GPU: shader priming list installed"
 # Network extras (all optional; local files only, never in git: research/ is ignored).
 #   research/ios27.2/extras/bootstrap-ssh-iphoneos-arm64.tar.zst   Procursus rootless bootstrap with OpenSSH
 #       (https://apt.procurs.us/bootstraps/1900/) -> /var/jb; host keys made here; launchd job com.sweet.sshd
+#   research/ios27.2/extras/ssh_host_keys/                         sshd host keys, reused by every root (made on first build)
 #   research/ios27.2/extras/authorized_keys                         -> /var/root/.ssh and /var/mobile/.ssh
 #   research/ios27.2/extras/fw/{modem,rmtfs}/...                    -> /var/local/fw (userland/wland/README.md)
 #   research/ios27.2/extras/wlan.conf (ssid=, psk=)                 -> /var/local/wlan.conf (0600)
@@ -156,7 +163,23 @@ if [ -f "$bs" ]; then
 	sudo tar -xpf "$bs" -C "$R" -s '#^\./var/#./private/var/#' -s '#^var/#private/var/#' --exclude '._*'
 	sudo test -x "$R/private/var/jb/usr/sbin/sshd" || { echo "bootstrap: no /var/jb/usr/sbin/sshd" >&2; exit 1; }
 	sudo mkdir -p "$R/private/var/jb/etc/ssh"
-	sudo ssh-keygen -A -f "$R/private/var/jb"
+	# 2026-11-20: the same host keys in every root (kept in the git-ignored research/ios27.2/extras/ssh_host_keys/),
+	# so a reflash no longer trips "REMOTE HOST IDENTIFICATION HAS CHANGED" on the Mac. Made once, then reused.
+	hk="$X/ssh_host_keys"
+	if ls "$hk"/ssh_host_*_key >/dev/null 2>&1; then
+		sudo cp "$hk"/ssh_host_* "$R/private/var/jb/etc/ssh/"
+		echo "ssh host keys: reused from $hk"
+	else
+		sudo ssh-keygen -A -f "$R/private/var/jb"
+		mkdir -p "$hk"
+		sudo cp "$R/private/var/jb/etc/ssh/"ssh_host_* "$hk/"
+		sudo chown "$(id -u):$(id -g)" "$hk"/ssh_host_*
+		chmod 0600 "$hk"/ssh_host_*_key
+		echo "ssh host keys: made and saved to $hk"
+	fi
+	sudo chown 0:0 "$R/private/var/jb/etc/ssh/"ssh_host_*
+	sudo chmod 0600 "$R/private/var/jb/etc/ssh/"ssh_host_*_key
+	sudo chmod 0644 "$R/private/var/jb/etc/ssh/"ssh_host_*.pub
 	# Procursus ships root locked ("!"); give root the same password as mobile ("alpine") so ssh root@ works.
 	mp="$R/private/var/jb/etc/master.passwd"
 	mh=$(sudo awk -F: '$1=="mobile"{print $2}' "$mp")
@@ -305,7 +328,7 @@ J = {
         'POSIXSpawnType': 'Interactive', 'StandardOutPath': '/var/local/wland.out',
         'StandardErrorPath': '/var/local/wland.out'}),
     'sshd': ('/System/Library/LaunchDaemons/com.sweet.sshd.plist', {
-        'Label': 'com.sweet.sshd', 'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-e', '-o', 'LogLevel=DEBUG3'], 'RunAtLoad': True,
+        'Label': 'com.sweet.sshd', 'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-e'], 'RunAtLoad': True,
         'KeepAlive': True, 'POSIXSpawnType': 'Interactive', 'StandardErrorPath': '/var/local/sshd.out'}),
 }
 J['pwdmkdb'] = ('/System/Library/LaunchDaemons/com.sweet.pwdmkdb.plist', {
