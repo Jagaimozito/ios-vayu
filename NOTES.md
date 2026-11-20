@@ -1,4 +1,43 @@
+# iOS 27 root flash: the .simg was wrong (2026-11-20, Claude) -- fixed converter, re-flash pending
+- Symptom: after flashing research/ios27.2/ios27-root-80g.simg, iOS 27 panicked "initproc failed to start -- exit
+  reason namespace 2 subcode 0xb" (launchd SIGSEGV at pc 0x1000000000100, no shared region mapped).
+- Cause: the .simg (generic converter) marked all-zero 4 KiB blocks "don't care" even where HFS uses them (zero pages
+  inside dyld, the allocation bitmap, catalog/attribute nodes), and it does not match the final .cdr (catalog nodes
+  2005/2045 hold data in the .cdr but are "don't care" in the .simg). fastboot skips "don't care", so the old system's
+  blocks stayed: dyld blocks 190+ held old plist text, bitmap blocks 3-4 the old bitmap. The user was right that the
+  image was the problem; I first blamed the flash path (wasted runs: two fastboot flashes, the gzip pipe, a plain dd).
+- FIX: tools/hfs2simg.py builds the .simg from the .cdr using the HFS+ allocation bitmap: used blocks always written
+  (RAW, or FILL 0 when zero), free blocks "don't care". Test on the first 300,000 blocks: every used block correct,
+  none left as "don't care". Lesson: never ship a root .simg from a converter that drops zero blocks; and a verify
+  that hashes whole MiB windows cannot tell "not written" from "zero blocks skipped".
+- Side finding: fastboot "Writing ... OKAY [0.003s]" per piece is normal on this ABL (data is written as it arrives).
+
 # macOS 27 kernel, first build (2026-11-20, Claude) -- scripts ready, Codex builds
+- BUILD RESULT (2026-11-20): kernel build completed from branch `ios27` at `11bf5c2` (the requested `1aefafb`
+  is its ancestor). `bash tools/mkmacos27kernel.sh` produced
+  `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, 21,280,088 bytes,
+  SHA-256 `4d6058e92a19e7d6dee9ad5abe302c5f044b16e6604877ded54b92041d41b10c`; cputype `0x100000c`, subtype 0
+  (plain arm64). Xcode's macOS 27.2 SDK has no `availability.pl`; the build script now defaults to
+  `tools/macos27-availability-versions.py`, which reads version defines from the selected SDK header. The script
+  stages `BUILD/sdk-macos27` separately from the iOS SDK and supplies its macOS 27.2 `libfirehose_kernel.a` from
+  `work/xnu-local-latest/dxb/fakeroot`; this fixed the initial platform-mismatch link failure without changing
+  the iOS SDK.
+- macOS-only source fix: `bsd/kern/syscalls.master` now exposes `pid_hibernate` only for embedded targets or
+  SWEET non-macOS targets. macOS gets `nosys`, matching the existing `#if !XNU_TARGET_OS_OSX` implementation
+  guard; iOS's `CONFIG_EMBEDDED` path remains enabled. Saved as
+  `xnu/macos27/0001-disable-pid-hibernate-on-macos.patch`. This fixed the unresolved `_pid_hibernate` link.
+  The kernel make target actually emits `kernel.development.sweet` (not `mach.development.sweet`), so the
+  macOS build and boot scripts now use that output name.
+- Shim rebuilt with `PATH=/private/tmp/guac-llvm18-cross:$PATH BOARD=guacamole sh shim/build.sh` (the host lacks
+  `aarch64-linux-gnu-gcc`; the LLVM 18 wrapper also links the small freestanding `strcmp` helper). Current
+  `shim/out/Image`: 3,498,048 bytes, SHA-256 `ad12995d6a74f50002171480e00c57b87455a18e8ba79639a98c985be55a9d4f`.
+- `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img` succeeded. Boot args printed:
+  `keepsyms=1 -v debug=0xc serial=3 cpus=8 bingrade=0x100000c:2 sweettouch=1 sweetkeys=1 sweetusb=1 wdt=-1 sweettime=1795161842 rd=ufsroot0 ufsroot=macos unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 launchd_unsecure_cache=1 sweetgpu=11 sb=2 sweetpmem=1 sweetwifid=1 guacwifi=wlfw sweetfb_hz=60 sweetmtl=3 sweetcpufreq=3 sweetfbgpu=1 sweetfbatswap=1 sweetfb_hwvsync=1 sweetaudio=0 sweetmailbox=1 sweetboxroot=1 sweetboxpart=rawdump validation_disables=0x10 sc=1 sweetfb_scale=2 tu-cb=1 sweetcamhw=1 thid_should_crash=0 sweetpasscode=1 sweetabp=3`
+- `mkmenuboot.py` output: macOS kernel image 29,155,328 bytes, SHA-256
+  `571c0526b8060fc01d3e8c0487e2bd8f54845a9969808764c3aa7e9a42feb1bb`; menu image 49,377,280 bytes, SHA-256
+  `6f73c3a58588607b23729e98194d26edcc645aad8e60f6afdc53444443f6517b`. Payloads: iOS 27 20,221,248 bytes,
+  macOS 27 21,390,144 bytes; combined ramdisk 41,612,096 of 48,234,496 bytes (below the 46 MiB limit).
+  Images are built only; nothing was flashed.
 - Goal: see how far the macOS kernel gets on the phone, before any macOS userland. Same work/xnu-12377 tree as iOS 27,
   built with the macosx SDK (PLATFORM=MacOSX -> XNU_TARGET_OS_OSX) and xnu/macos27/MASTER.arm64.sweet.MacOSX
   (Apple's MacOSX config with the SWEET changes: nos_arm_asm/nos_arm_pmap, sweet_hfs, no CPU counters; doconf
