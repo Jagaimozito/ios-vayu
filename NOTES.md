@@ -13,6 +13,11 @@
   attachments ignored). Diagnostics kept (dump-cb only): per-buffer made-by/contents/gpuAddress counts, buffer watch,
   buffer uses by caller offset, copy log, missing selectors to stderr. Codex: rebuild, outputs/NativeAdrenoMetal-blitdesc.
 - Test 27 (blitdesc): Minecraft launches and renders, at a very low frame rate.
+- Frame rate (outputs/mc-fps1.txt, mc-fps2-samples.txt): 10.5 fps; GPU busy 13%; scaler idle; minecraftpe 193% CPU,
+  its render thread 91% of a core (the m2v lowering thread mostly waits). About a quarter of the render thread's samples
+  are -[NBBuffer contents] (Rust guard, purge-cell lock, pin) from minecraftpe+0x19e04c4, before every uniform update,
+  plus today's counters. Now -contents answers from a cached pointer after the first non-null answer (the bridge pins it
+  then, so it never moves), and the counters/watch run only with dump-cb on. Codex: rebuild, outputs/NativeAdrenoMetal-fastcontents.
 - Test 15 setup (outputs/NativeAdrenoMetal-bufdiag): the dump now prints, for each bound buffer, how it was made
   (options, heap offset, no-copy), its contents pointer and where in the whole buffer the CPU sees nonzero words; and
   with dump-cb on, the first 24 copyFromBuffer:toBuffer: calls go to the dump file (sizes, options, offsets).
@@ -49,6 +54,15 @@
   dSYM remains in `work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.dSYM`. Executable copied byte-for-byte to
   `outputs/NativeAdrenoMetal-blitdesc`, SHA-256
   `a46b676e9cd612f2b3da5bbb78b8b5f30aed64708231a027ff4017da36cf57fb`. Not installed on the phone.
+- Fast-contents diagnostic plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed.
+  dSYM remains in `work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.dSYM`. Executable copied byte-for-byte to
+  `outputs/NativeAdrenoMetal-fastcontents`, SHA-256
+- fastcontents: 12.3 fps (outputs/mc-fps3.txt). Render thread profile (mc-fps5.txt thread 18, 60 samples): binds
+  ~40% (buffer:offset:index:stage: 20%, texture 17%, sampler 7%: TracedEncodeCall, own:/purgeHold, bridge),
+  renderCommandEncoderWithDescriptor: 12% (CommandBuffer::settle_ended, waiting for the lowering thread #39 at 43%),
+  Minecraft's own uniform loop (minecraftpe+0x19e04c4) 13%, objc_msgSend ~13%. Next: a slimmer bind path and no
+  blocking hand-off between passes; also try a boot image without diag=1.
+  `2f068683b39b2587f83616945f118bbd2d041bbd78bc91e4e573295ae18ad3d8`. Not installed on the phone.
 - Minecraft in landscape: black screen. backboardd's QuartzCore logs "Failed to allocate [1792 x 828] BGRA framebuffer
   MTLPixelFormatBGRA8Unorm" every frame (outputs/land1-oslog.txt, 105 times in 8 s); the kernel sees layer 0 surface 3
   828x1792 all black (SWEET FB black at display). CA asks for its portrait framebuffer surface as a landscape texture

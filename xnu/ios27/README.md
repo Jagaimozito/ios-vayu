@@ -129,6 +129,8 @@ GPU / Metal driver (`adrenometal-*.diff` are against `UniXNU/drivers/AdrenoMetal
   contents/gpuAddress/didModifyRange counts and nonzero data at encode, commit and completion; a watch of large mapped
   buffers every 50 commits; the first callers that use each large buffer (image offsets); the first 24
   copyFromBuffer:toBuffer: calls; missing selectors to stderr.
+  Also: -[NBBuffer contents] answers from a cached pointer after its first non-null answer (the bridge pins the buffer
+  then); each bridge call had been about a quarter of Minecraft's render thread. Minecraft 10.5 -> 12.3 fps.
 
 Boot-args: `thid_should_crash=0` (an existing xnu tunable) lets apps set non-identity-protected exception ports.
 Apps run as platform binaries on this port, so the iOS 18+ rule for platform tasks killed any app whose crash
