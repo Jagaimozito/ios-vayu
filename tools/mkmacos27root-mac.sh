@@ -12,7 +12,8 @@
 #   - Preboot: the SystemOS and AppOS cryptexes at /System/Volumes/Preboot/Cryptexes/{OS,App}; the system volume's own
 #     /System/Cryptexes/{OS,App} symlinks already point there. Both dyld shared caches (system, DriverKit) are also
 #     hard-linked to their root paths, and cryptex-only files to theirs, as on iOS.
-# First goal: launchd starting and the verbose console, no WindowServer.
+# First goal: launchd starting and the verbose console, no WindowServer; Wi-Fi + SSH in (tools/macos27-extras.sh,
+# needs userland/build-macos.sh run first).
 #
 #   tools/mkmacos27root-mac.sh [SIZE]      (SIZE default 40g: about 31 GB of files; the raw .cdr is SIZE bytes)
 #       -> research/macos27/macos27-root.cdr (raw) and macos27-root.simg (fastboot: `fastboot flash macos ...`)
@@ -84,13 +85,19 @@ echo "cryptex-only files linked into /"
 
 # launchd: Boot.fips -N if macOS launchd has that task (lowered corecrypto fails cc_fips_test's integrity HMAC on iOS;
 # POST tests still run). Skipped, not fatal, if this launchd has no embedded Boot.fips.
-if sudo python3 "$TOOLS/launchd-fips-noverify.py" "$R/sbin/launchd" /tmp/macos27-launchd.new; then
+# macOS 27.2: launchd is fat (two arm64e slices); both get the change. Boot.sysstatuscheck loses RebootOnSuccess as on
+# iOS 27 (2026-11-20 first boot: cc_fips_test exited -2074 and launchd panicked the kernel). --tolerant: no Boot task
+# can panic the boot (init_featureflags aborted next); failures are left for a shell to look at.
+if sudo python3 "$TOOLS/launchd-fips-noverify.py" "$R/sbin/launchd" /tmp/macos27-launchd.new --no-reboot-task sysstatuscheck --tolerant; then
 	sudo sh -c 'cat /tmp/macos27-launchd.new > "$1"' _ "$R/sbin/launchd"	# keeps owner, mode, hard links
 	echo "launchd: Boot.fips -N"
 else
 	echo "launchd: no Boot.fips change (see the message above)"
 fi
 sudo rm -f /tmp/macos27-launchd.new
+
+# Wi-Fi (macOS wland build) and SSH (macOS's sshd, root by key, fixed host keys): tools/macos27-extras.sh.
+bash "$TOOLS/macos27-extras.sh" "$R"
 
 df -h "$R"
 hdiutil detach "$R"

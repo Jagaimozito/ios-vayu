@@ -1,3 +1,118 @@
+# macOS 27: cfprefsd fixed (0005); WindowServer needs IOHIDSystem (2026-11-20, Claude)
+- After 0005: cfprefsd runs, sw_vers / log show work. launchctl list non-zero: WindowServer 1, mobileactivationd -5,
+  iomfb_fdr_loader 1, iomfb_bics_daemon -11, digest-service 1, security.xprotectd 1, endpointsecurityd 35.
+- WindowServer (log show): "Server is starting up" -> "IOHIDSystem not found e00002be" -> "Cannot open the HID and
+  display/cursor system." -> exit 1, every 10 s. IOHIDSystem is a macOS-only IOHIDFamily class (kext on a Mac); our
+  kernel's HID (iokit/Kernel/arm/hid) is the iOS event-service path only. Next: a SWEET IOHIDSystem stand-in for
+  macOS (service + user clients + the shared event/cursor memory WindowServer maps), from Apple's open-source
+  IOHIDFamily (APSL) as reference. The GPU comes after that.
+- mobileactivationd: BootPolicy "SEP command 38 returned 2", "Failed to retrieve OIC" (no SEP), Activation State
+  Unactivated, then crashes (-5). Needed later for login/setup; not for WindowServer.
+
+# macOS 27: SSH in over Wi-Fi; cfprefsd = missing Quarantine policy (2026-11-20, Claude) -- fix in source
+- MILESTONE: `ssh guacmac` (root by key) works on macOS 27.2 26B123 (default route added by sweet-diag.sh v4).
+  Root /dev/ufsroot0 hfs rw, 16 GB free. launchctl list: only WindowServer 1, iomfb_bics_daemon -11,
+  digest-service 1, cfprefsd 254, endpointsecurityd 35 fail. Anything reading preferences (sw_vers, log show) hangs.
+- cfprefsd by hand: silent exit 254. Its strings: "Failure to configure quarantine: qtn_proc_apply_to_self() failed.
+  Exiting daemon." qtn_proc_apply_to_self is __mac_syscall("Quarantine", ...); no Quarantine policy without the kext.
+- Fix: xnu/macos27/0005-quarantine-policy-standin.patch (bsd/kern/sweet_amfi.c, XNU_TARGET_OS_OSX only): a
+  "Quarantine" MAC policy whose policy_syscall returns 0 for everything (first 32 calls logged "SWEET Quarantine").
+
+# macOS 27: Wi-Fi joins and gets its lease; no ping -> no route (2026-11-20, Claude)
+- With rootrw=1 the box installed the macOS wland: joined GuestConnect (WPA2), DHCP ACK 172.28.200.71/255.255.248.0,
+  router 172.28.207.252, utun0 configured; "netsvc -> No such file" (iOS-only). Packets reach the IP side (rx 26..68),
+  only 6 sent: replies have no route (no configd service on macOS, so no default route).
+- sweet-diag.sh v3: once a utun has an address and there is no default route, `route -n add default -interface utunN`
+  (console line "SWEET DIAG: default route -> ..."); also prints the routes each round; runs 40 rounds (20 min).
+  Lasting fix later: a macOS netsvc (SystemConfiguration) or the route from wland itself.
+
+# macOS 27: SWEETBOX root installs did nothing -> rootrw=1 for macOS (2026-11-20, Claude)
+- Boxes with ROOT/private/var/local/bin/{wland,sweet-diag.sh}: the late pass logged "1 file(s) to extract; done, 0/0
+  files, 0/1 root files" and the old files stayed. mkmacos27boot.sh dropped rootrw=1 (written before a macOS root
+  existed), so the root was read-only at bsd_init and the root pass could write nothing (vfs_subr.c: rootrw=1 is
+  what mounts the SWEET root read-write from the start). rootrw=1 is kept for macOS now (boot image only).
+- The wland box was never installed either: wland reached the radio ("radio: stats: state 0") and waited for wifid.
+
+# macOS 27: our jobs run; wland waits for an iOS wifid that macOS does not have (2026-11-20, Claude)
+- SWEET DIAG works: wland running (rmtfs writes), inet only 127.0.0.1; cfprefsd: runs 11, last exit code 254 (the
+  console's "status -2"). Kernel GPU now finds its firmware: "Adreno 640 backend published (RedwoodGPU)".
+- With boot-arg sweetwifid=1 wland opens /dev/wlan and leaves joining to wifid (bridge_joins) -> never joins on macOS.
+  wland.c: WLAND_NO_BRIDGE skips the bridge (wlan.conf join + DHCP on its utun); the macOS job sets it. iOS unchanged.
+- Tried sweetwifid=0 for macOS (boot image only): Qualcomm CrashDump right after wland's modem power votes (rpmh
+  mss.lvl, pmem alloc for pid 80); with sweetwifid=1 the modem had come up (rmtfs running). Reverted: macOS keeps
+  sweetwifid=1 and gets the WLAND_NO_BRIDGE wland through a box (ROOT/private/var/local/bin/wland, rawdump).
+
+# macOS 27: jobs in /Library/LaunchDaemons never run -> into launchd's job cache (2026-11-20, Claude)
+- Boot with the extras: files all present in the image (checked in macos27-root.cdr), but no "SWEET WLAND: starting"
+  and no "SWEET DIAG" on the console: launchd never started /Library/LaunchDaemons jobs (macOS 27 reads its daemons
+  from /System/Library/xpc/launchd.plist, 918 jobs + SystemLibraryTreeState; third-party ones come later, if at all,
+  probably through Background Task Management, which needs the cfprefsd that is looping). Also seen: init_featureflags
+  SIGABRT (tolerated now), IOMFB_bics_daemon SIGSEGV, WindowServer exit 1, cfprefsd -2 loop.
+- macos27-extras.sh now writes com.sweet.wland / com.sweet.diag to /System/Library/LaunchDaemons and adds them to
+  launchd.plist's LaunchDaemons (as mkios27root does on iOS); ssh.plist's Disabled is cleared there too.
+
+# macOS 27 with NVRAM: no panic; loop continues; GPU firmware missing; no sign of wland (2026-11-20, Claude)
+- 0004 (NVRAM) works: kernelmanagerd no longer dies. Still: cfprefsd exit -2 loop, WindowServer exit 1,
+  digest-service 1, endpointsecurityd 35, IOMFB_bics_daemon SIGSEGV. Kernel GPU stage 1: a640_gmu.bin, a630_sqe.fw,
+  a640_zap.* missing (the macOS root had no /usr/standalone/firmware/sweet). Touch, haptics, camera probe fine.
+  No "SWEET WLAND" line in the photos.
+- tools/macos27-extras.sh now: GPU firmware; the wland job runs through /bin/sh and prints "SWEET WLAND: starting";
+  com.sweet.diag prints every 30 s (from 45 s) the newest wland lines, the inet addresses and launchd's view of
+  cfprefsd ("SWEET DIAG n: ..."). Apply with tools/macos27-patch-cdr.sh.
+
+# macOS 27 boot video: NVRAM missing kills kernelmanagerd/kmutil (2026-11-20, Claude) -- fix in source
+- "kernelmanagerd/NVRAM.swift:123: Fatal error: NVRAM isn't supported on this system" -> kernelmanagerd and kmutil
+  crash (SIGTRAP). The SWEET platform expert never publishes /options (no NVRAM controller; ADT has no /options).
+- Fix: xnu/macos27/0004-nvram-options-node.patch (SweetPlatformExpert::processTopLevel, XNU_TARGET_OS_OSX only): an
+  empty /options DT node, then the stock publishNVRAM() -> IODTNVRAM. In-memory only, nothing persists.
+- First try panicked: "IONVRAMCHRPHandler creation failed" (IONVRAM.cpp:1602; getNVRAMProperties: no
+  nvram-bank-size in /chosen). 0004 now also puts iBoot's /chosen keys there when missing: nvram-bank-size 0x10000,
+  -bank-count 1, -current-bank 0 and nvram-proxy-data = an empty v1 CHRP image ("nvram" header, "common" 0x7fd0,
+  "system" 0x7ff0, adler32 from the generation field), checked against the handler's rules in a Python model.
+- Also seen, not acted on: "dyld_shared_cache_arm64e.NN: not in trust cache" for every subcache, then "dyld cache
+  mapped system-wide" (mapping works); WindowServer exit 1 (expected: no macOS Metal driver yet); cfprefsd exit -2
+  loop; prng_seedctl exit 13 (no saved seed); tzinit no data; sysstatuscheck 1; "Early boot complete. Continuing
+  system boot." reached.
+
+# macOS 27: daemons loop (cfprefsd -2, endpointsecurityd 35, digest-service 1); Wi-Fi + SSH added (2026-11-20, Claude)
+- Boot passes the Boot tasks; launchd starts daemons; cfprefsd exits status -2 and endpointsecurityd 35 again and again
+  (respawn loop), plus many harmless "triggered unnest of range ... DYLD shared region" warnings. No shell to see why.
+- Way in: userland/build-macos.sh builds wland for macOS (out/macos/wland; plain C, no frameworks). wland/ipnet.c now
+  also prints the DHCP lease to /dev/console ("SWEET WLAND: Wi-Fi up, utunN address A ... ssh root@A").
+  tools/macos27-extras.sh ROOT installs wland + modem/rmtfs firmware + wlan.conf + /Library/LaunchDaemons/
+  com.sweet.wland.plist, root's authorized_keys, fixed host keys (research/macos27/ssh_host_keys, made once) and
+  enables macOS's sshd (ssh.plist, com.openssh.sshd) in /var/db/com.apple.xpc.launchd/disabled.plist.
+  mkmacos27root-mac.sh calls it; tools/macos27-patch-cdr.sh applies it to the existing .cdr (hdiutil rw) + hfs2simg.
+- Same Wi-Fi MAC as iOS (from the radio), so DHCP likely gives the iOS address again. netsvc (configd/DNS) is iOS-only:
+  on macOS its spawn just fails and is logged.
+
+# macOS 27: past FIPS; init_featureflags aborts -> launchd panics; Boot tasks made tolerant (2026-11-20, Claude)
+- Next boot: "init_featureflags[17] exited -- exit reason namespace 2 subcode 0x6" (SIGABRT). Boot.init_featureflags
+  has no AllowCrash, so its crash panics. Without a shell the reason is unknown.
+- launchd-fips-noverify.py --tolerant: every Boot task gets AllowCrash and loses RequireSuccess (38 of 46 changed), so
+  failures are logged and the boot continues; mkmacos27root-mac.sh uses it. Revisit once there is SSH: each failing
+  task should be fixed and its RequireSuccess restored where it matters. Existing macos27-root.cdr patched in place again.
+
+# macOS 27: past fsck; cc_fips_test exits -2074 -> launchd panics (2026-11-20, Claude)
+- With the 0003 kernel: fsck passed, Boot tasks ran (MobileAssetEarlyBootTask log on screen), then "cc_fips_test[12]
+  exited -- (signal 0, exit status -2074)": Boot.fips is RequireSuccess, the same FIPS integrity failure as iOS (lowered
+  corecrypto). The root script's launchd step had skipped: macOS 27.2 /sbin/launchd is FAT (arm64e subtypes
+  0x80000002 and 0x8000000c, each with __config), launchd-fips-noverify.py only took thin files.
+- Fix: launchd-fips-noverify.py patches every arm64 slice of a fat file; mkmacos27root-mac.sh passes
+  --no-reboot-task sysstatuscheck too (it has RebootOnSuccess, as on iOS). Existing research/macos27/macos27-root.cdr
+  patched in place (/sbin/launchd: one extent, block 3124959, contents checked equal to the lowered overlay first);
+  the .simg must be regenerated with tools/hfs2simg.py.
+
+# macOS 27 root mounts, launchd runs; fsck_hfs panics in sweet_ufs_strategy (2026-11-20, Claude) -- fix in source
+- With research/macos27/macos27-root.simg on `macos`: root mounted, launchd started, pid 3 fsck_hfs (macOS checks a
+  non-APFS root at boot) read /dev/rdisk -> panic "Kernel data abort" (esr 0x9600004f: write, permission fault) in
+  memmove <- sweet_ufs_strategy+0x1ec <- physio <- spec_read <- read. Kernel slide 0 (symbols from
+  BUILD/obj-macos27-sweet/.../kernel.development.sweet.unstripped).
+- Cause: physio's B_PHYS buffer carries the caller's user address; buf_map returns it unchanged and the strategy
+  memcpy'd to it from the kernel (PAN). iOS never did raw disk reads.
+- Fix: bsd/dev/sweet_ufs.c uses copyout/copyin for B_PHYS buffers (physio calls the strategy in the caller's thread,
+  pages wired); xnu/macos27/0003-sweet-ufs-raw-io-copyout.patch. Same file is in the iOS kernel: harmless there.
+
 # macOS 27.2 arm64e userland lowering (UniversalMac_27.2_26B123_Restore, 2026-11-20)
 
 Unpacked and decrypted the OS, SystemOS and AppOS volumes from the Universal Mac restore IPSW for the

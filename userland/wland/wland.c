@@ -580,6 +580,7 @@ static void net_cb(const struct qrtr_hdr *h, const uint8_t *d, uint32_t n)
  * networks: one ssid= line each, its psk= after it (none = open); wland joins the strongest one it hears.
  */
 #define WLAN_CONF	"/var/local/wlan.conf"
+static int no_bridge(void);	/* macOS build: wland joins by itself (below up()) */
 #define CONF_MAX	16
 static struct { char ssid[33], psk[65]; unsigned fails; } conf[CONF_MAX];
 static unsigned nconf;
@@ -740,9 +741,11 @@ static int net(unsigned secs)
 			delay_ms(100);	/* topaz: only after mission mode; before it a CE access hangs the bus */
 			if (radio_start())
 				printf("net: radio start failed\n");
-			else if (bridge_open() == 0)
+			else if (!no_bridge() && bridge_open() == 0)
 				bridge_joins = 1;	/* guacamole: wifid joins (its saved networks); our own wlan.conf
-							 * join before it showed as an "insecure network" (wifi28) */
+							 * join before it showed as an "insecure network" (wifi28).
+							 * no_bridge(): macOS 27 has no wifid to ask, so wland joins from
+							 * wlan.conf and runs DHCP on its own utun. */
 			else if (conf_ssid[0] && ipnet_init())
 				printf("net: no utun: joining without IP\n");
 		}
@@ -750,6 +753,19 @@ static int net(unsigned secs)
 	radio_summary();
 	radio_stats();
 	return 0;
+}
+
+/*
+ * 2026-11-20: macOS has no iOS wifid behind /dev/wlan, so the macOS build (userland/build-macos.sh, -DWLAND_MACOS)
+ * never hands joining to the bridge; elsewhere WLAND_NO_BRIDGE in the environment does the same.
+ */
+static int no_bridge(void)
+{
+#ifdef WLAND_MACOS
+	return 1;
+#else
+	return getenv("WLAND_NO_BRIDGE") != NULL;
+#endif
 }
 
 /* everything `up` does, from a fresh boot */

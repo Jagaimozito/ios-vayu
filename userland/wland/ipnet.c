@@ -126,6 +126,15 @@ static void tun_configure(void)
 	int e = posix_spawn(&pid, NETSVC, NULL, NULL, argv, NULL);
 	LOG("%s: %s/%s router %s dns %s %s; netsvc -> %s", tun_name, ip, mask, gw, dns[0] ? d0 : gw, dns[1] ? d1 : "",
 	    e ? strerror(e) : "started");
+	/*
+	 * 2026-11-20: the address on the system console too, so it shows on the verbose boot screen where there is no
+	 * other way to learn it (macOS 27 bring-up: SSH is the first way in). One line per lease.
+	 */
+	int con = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK);
+	if (con >= 0) {
+		dprintf(con, "SWEET WLAND: Wi-Fi up, %s address %s (router %s): ssh root@%s\n", tun_name, ip, gw, ip);
+		close(con);
+	}
 }
 
 /* the link went down: the lease off the utun and out of configd (IPMonitor falls back to another service) */

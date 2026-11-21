@@ -30,9 +30,13 @@ assert rd[:8] == b'SWEETXNU', 'not a SWEETXNU payload'
 adt_off, adt_size = struct.unpack_from('<QQ', rd, 0x20)
 open('work/macos27-from-ios27.adt', 'wb').write(rd[adt_off:adt_off + adt_size])
 a = rd[0x48:0x48 + 608].split(b'\0')[0].decode().split()
-drop = {'rootrw=1', 'sweetfb_noconsole=1'}
+# rootrw=1 again (2026-11-20): the macOS root exists now, and a read-only root at bsd_init made the SWEETBOX root
+# pass install nothing ("done, 0/0 files, 0/1 root files").
+drop = {'sweetfb_noconsole=1'}
 a = [x for x in a if x not in drop]
 a = ['ufsroot=macos' if x.startswith('ufsroot=') else 'sweettime=%d' % time.time() if x.startswith('sweettime=') else x for x in a]
+# sweetwifid stays 1 (2026-11-20: with sweetwifid=0 the phone went to Qualcomm CrashDump during wland's modem bring-up;
+# with 1 the modem came up). wland skips the bridge itself on macOS (WLAND_NO_BRIDGE, tools/macos27-extras.sh).
 for x in ('-v', 'keepsyms=1'):
     if x not in a:
         a.insert(0, x)
