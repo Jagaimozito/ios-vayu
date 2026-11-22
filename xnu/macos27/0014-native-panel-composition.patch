@@ -1,0 +1,71 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1406,6 +1406,10 @@
+ void
+ AppleCLCD::swap(const uint8_t *rec_in)
+ {
++#if XNU_TARGET_OS_OSX
++	/* The macOS GUI owns this service; stop the video console on its first submitted frame, before vsync presentation. */
++	pauseConsole();
++#endif
+ 	/*
+ 	 * 0184: the layers this swap does not set keep what earlier swaps gave them (surface, rects, transform, the
+ 	 * opaque flag byte); rec+0x108 (cleared by kern_SwapSetLayer) is taken as "turn this layer off".
+@@ -2006,10 +2010,14 @@
+ 		/* On macOS the first WindowServer present owns scanout; suppress video
+ 		 * console writes but leave serial and SWEETLOG output available. */
+ 		sweet_console_muted = 1;
+-		IOLog("SWEET FB: macOS video console muted on first GUI present\n");
++		IOLog("SWEET FB: macOS video console muted on first GUI swap\n");
+ 		if (fPixels != 0 && fRowBytes != 0 && fHeight != 0) {
+ 			/* Discard the boot console's last pixels before the first GUI swap. */
+ 			bzero((void *)fPixels, (size_t)fRowBytes * fHeight);
++			if (fSurface != NULL && fSurface->memory != NULL) {
++				fSurface->memory->performOperation(kIOMemoryIncoherentIOStore, 0, fSurface->memory->getLength());
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
+ 		}
+ #else
+ 		int quiet = 0;
+@@ -2725,9 +2733,25 @@
+ bool
+ AppleCLCD::presentComposed(const uint8_t *rec, uintptr_t dst, bool force)
+ {
+-	if (!sweet_fb_compose || !fScaleUp || fColMap == NULL) {
++	if (!sweet_fb_compose) {
++		return false;
++	}
++#if XNU_TARGET_OS_OSX
++	/* The macOS mode is already panel-native: compose layer swaps at 1:1, without the iOS scale map. */
++	if (fLogicalW != fWidth || fLogicalH != fHeight) {
++		return false;
++	}
++	static uint32_t macosComposeRouteLogged;
++	if (macosComposeRouteLogged < 16) {
++		macosComposeRouteLogged++;
++		IOLog("SWEET FB: macOS native compose swap %u mask %#x panel %ux%u logical %ux%u force %u\n",
++		    get32(rec, 0x50), get32(rec, 0x104), fWidth, fHeight, fLogicalW, fLogicalH, force ? 1u : 0u);
++	}
++#else
++	if (!fScaleUp || fColMap == NULL) {
+ 		return false;
+ 	}
++#endif
+ 	uint32_t mask = get32(rec, 0x104), layers = 0;
+ 	bool scaled = false;
+ 	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
+@@ -2921,7 +2945,13 @@
+ 		const uint32_t *srow = fCompose + (uint64_t)ly * fLogicalW;
+ 		uint32_t *drow = (uint32_t *)((dst != 0 ? dst : fPixels) + (uint64_t)py * fRowBytes);
+ 		for (uint32_t px = 0; px < fWidth; px++) {
+-			drow[px] = srow[fColMap[px]];
++			uint32_t lx;
++#if XNU_TARGET_OS_OSX
++			lx = fColMap != NULL ? fColMap[px] : px;
++#else
++			lx = fColMap[px];
++#endif
++			drow[px] = srow[lx];
+ 		}
+ 	}
+ 	sweet_fb_stats.composed++;

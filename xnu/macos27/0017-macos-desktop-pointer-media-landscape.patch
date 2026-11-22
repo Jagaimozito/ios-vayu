@@ -1,0 +1,710 @@
+macOS 27 desktop (2026-11-22): touch as a pointer, frame pitch, root disk in Disk Arbitration, landscape.
+
+- SweetHID: SweetHIDPointer (absolute pointer, finger 0 of the touchscreen); the press is sent after a move-only event
+  and the release where the finger last was; the digitizer's own events are not sent on macOS (sweettouchdigi=1 does);
+  positions turned with sweetfb_rot. Personality in KernelConfigTables.
+- SweetFramebuffer: sweet_fb_bpr (plane 0's row pitch for WindowServer's padded '&BGA' frames); macOS screen
+  rotated (sweetfb_rot, default 1) and divided (sweetfb_div, default 2: 1560x720), presentRotated.
+- SweetMedia (new): IOMedia stand-in for /dev/ufsroot0 under an internal storage device, published by sweet_ufs.c,
+  so Disk Arbitration knows the root volume (Finder's sidebar no longer aborts in LaunchServices).
+
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -368,6 +368,27 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 4; }
+ };
+ OSDefineMetaClassAndStructors(SweetHIDKeyboard, IOHIDEventService);
++#if XNU_TARGET_OS_OSX
++/*
++ * macOS has no touch screens: WindowServer takes our digitizer ("acquired main display digitizer") and drops its
++ * touches. What it does understand is an absolute pointer (a tablet, a virtual machine's mouse). This service turns
++ * the first finger into one: the pointer goes where the finger is, button 1 is down while the finger is (2026-11-22).
++ * Positions are normalised 0..1 like the digitizer's; boot-arg sweetptrpx=1 sends panel pixels instead.
++ */
++class SweetHIDPointer : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDPointer);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void point(IOFixed nx, IOFixed ny, int px, int py, bool down, bool was);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Mouse; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 5; }
++private:
++	bool fPixels;
++};
++OSDefineMetaClassAndStructors(SweetHIDPointer, IOHIDEventService);
++#endif
+ 
+ /*
+  * Touch screen: digitizer collection events with finger children,
+@@ -427,6 +448,9 @@
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDKeyboard *gSweetKeyboard;
+ static SweetHIDTouch *gSweetTouch;
++#if XNU_TARGET_OS_OSX
++static SweetHIDPointer *gSweetPointer;
++#endif
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -574,6 +598,72 @@
+ 	}
+ }
+ 
++#if XNU_TARGET_OS_OSX
++bool
++SweetHIDPointer::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	int v = 0;
++	fPixels = PE_parse_boot_argn("sweetptrpx", &v, sizeof(v)) && v;
++	setProperty(kIOHIDProductKey, "Sweet touch pointer");
++	setProperty("HIDPointerAccelerationType", "HIDMouseAcceleration");
++	gSweetPointer = this;
++	registerService();
++	IOLog("SWEET HID: touch pointer registered (%s positions)\n", fPixels ? "pixel" : "normalised");
++	return true;
++}
++
++void
++SweetHIDPointer::point(IOFixed nx, IOFixed ny, int px, int py, bool down, bool was)
++{
++	/* 2026-11-22: the screen is turned by boot-arg sweetfb_rot (SweetFramebuffer.cpp, default 1): so is the pointer */
++	static int rot = -1;
++	if (rot < 0) {
++		uint32_t r = 1;
++		(void)PE_parse_boot_argn("sweetfb_rot", &r, sizeof(r));
++		rot = (r == 0 || r == 3) ? (int)r : 1;
++	}
++	const IOFixed one = 0x10000;
++	IOFixed rx = nx, ry = ny;
++	if (rot == 1) {
++		rx = ny;
++		ry = one - nx;
++	} else if (rot == 3) {
++		rx = one - ny;
++		ry = nx;
++	}
++	rx = rx < 0 ? 0 : (rx > one ? one : rx);
++	ry = ry < 0 ? 0 : (ry > one ? one : ry);
++	IOFixed x = fPixels ? (IOFixed)(px << 16) : rx;
++	IOFixed y = fPixels ? (IOFixed)(py << 16) : ry;
++	IOHIDEvent *event;
++	/*
++	 * 2026-11-22: a touch puts the pointer somewhere new and presses in the same instant. A mouse never does; the
++	 * press is sent as its own event after a move-only one, so the press is taken where the finger is.
++	 */
++	if (down && !was) {
++		event = IOHIDEvent::absolutePointerEvent(mach_absolute_time(), x, y, 0, 0, 0);
++		if (event) {
++			dispatchEvent(event);
++			event->release();
++		}
++	}
++	event = IOHIDEvent::absolutePointerEvent(mach_absolute_time(), x, y, 0, down ? 1 : 0, was ? 1 : 0);
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++	static uint32_t logged;
++	if (down != was && logged < 40) {
++		logged++;
++		IOLog("SWEET HID: pointer %s at %d.%03d, %d.%03d (panel %d,%d)\n", down ? "down" : "up",
++		    x >> 16, (int)(((x & 0xffff) * 1000) >> 16), y >> 16, (int)(((y & 0xffff) * 1000) >> 16), px, py);
++	}
++}
++#endif
++
+ bool
+ SweetHIDTouch::start(IOService *provider)
+ {
+@@ -678,6 +768,12 @@
+ 		any |= d;
+ 	}
+ 	fDown[finger] = down;
++	/*
++	 * 2026-11-22: the pointer releases where the finger last was. A lift's own coordinates are not a position (often
++	 * 0,0), so the mouse-up went to a corner: menus and buttons, which act on mouse-up, never got the click; only
++	 * things that act on mouse-down (the keyboard panel's keys) did.
++	 */
++	const IOFixed pnx = down ? nx : fX[finger], pny = down ? ny : fY[finger];
+ 	if (down) {
+ 		fX[finger] = nx;
+ 		fY[finger] = ny;
+@@ -691,7 +787,28 @@
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+ 	IOLockUnlock(fLock);
+ 
++#if XNU_TARGET_OS_OSX
++	/*
++	 * 2026-11-22: on macOS WindowServer also takes this display-integrated digitizer as a pointing device, with the
++	 * panel's (unrotated) positions: a second click stream besides SweetHIDPointer's, somewhere else in landscape.
++	 * The pointer alone is the input; boot-arg sweettouchdigi=1 sends the digitizer events too, as before.
++	 */
++	static int digi = -1;
++	if (digi < 0) {
++		int v = 0;
++		digi = PE_parse_boot_argn("sweettouchdigi", &v, sizeof(v)) && v ? 1 : 0;
++	}
++	if (digi) {
++		dispatchEvent(collection);
++	}
++#else
+ 	dispatchEvent(collection);
++#endif
++#if XNU_TARGET_OS_OSX
++	if (finger == 0 && gSweetPointer) {
++		gSweetPointer->point(pnx, pny, x, y, down, was);
++	}
++#endif
+ 	if (was != down) {
+ 		/* SWEET diagnostics: per client, queue head/tail after this event, notifications,
+ 		 * events enqueued, enqueue failures, open state. head catching up with tail = the
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -401,6 +401,23 @@
+ #endif
+ }
+ 
++/*
++ * The row pitch the pixels really have. macOS 27 (2026-11-22): WindowServer's 1440x3120 '&BGA' frames carry a
++ * surface-level bytesPerRow of 5760 (width * 4) but one plane whose bytesPerRow is 5888 (padded), and the GPU writes
++ * them at 5888. Reading at 5760 shifted every row 32 pixels further left: the panel showed the desktop sheared into
++ * near-horizontal streaks while the frame in memory was correct. A single-plane surface's plane pitch is the real one.
++ */
++static inline uint32_t
++sweet_fb_bpr(const SweetSurface *s)
++{
++#if XNU_TARGET_OS_OSX
++	if (s->planeCount == 1 && s->planes[0].bytesPerRow >= s->width * s->bytesPerElement) {
++		return s->planes[0].bytesPerRow;
++	}
++#endif
++	return s->bytesPerRow;
++}
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -457,6 +474,9 @@
+ 	bool presentComposed(const uint8_t *rec, uintptr_t dst = 0, bool force = false);
+ 	uint32_t     *fCompose;       /* 0170: fLogicalW x fLogicalH BGRA, cached */
+ 	uint32_t     *fComposeX;      /* 0170: per destination column of a layer, its source column */
++	uint32_t      fRot;           /* macOS: 0 portrait, 1/3 landscape (sweetfb_rot) */
++	uint32_t     *fRotA, *fRotB;  /* macOS: panel x / panel y -> parts of the fCompose index (rotated, scaled) */
++	void          presentRotated(uintptr_t dst);
+ 	void pauseConsole(void);
+ 	void publishRefresh(void);
+ 	void presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
+@@ -593,10 +613,80 @@
+ 	 * to 828x1792 even though scanout is 1440x3120. */
+ 	sweet_fb_logical_w = fWidth;
+ 	sweet_fb_logical_h = fHeight;
++	/*
++	 * 2026-11-22: landscape and a lower resolution. Boot-arg sweetfb_rot: 1 (default) landscape with the panel's
++	 * right edge (power button) up, 3 the other way, 0 portrait. sweetfb_div (default 2): the panel is divided by it,
++	 * so WindowServer draws 1560x720 for the 3120x1440 panel and every logical pixel covers div x div panel
++	 * pixels. The CPU present (presentComposed) rotates and scales up (presentRotated); the touch pointer turns
++	 * with the same boot-arg (SweetHID.cpp). sweetfb_rot=0 sweetfb_div=1: the native 1440x3120 portrait mode.
++	 */
++	fRot = 1;
++	uint32_t div = 2;
++	(void)PE_parse_boot_argn("sweetfb_rot", &fRot, sizeof(fRot));
++	(void)PE_parse_boot_argn("sweetfb_div", &div, sizeof(div));
++	if (fRot != 0 && fRot != 1 && fRot != 3) {
++		fRot = 1;
++	}
++	if (div < 1 || div > 4) {
++		div = 2;
++	}
++	if (fRot != 0) {
++		sweet_fb_logical_w = fHeight / div;
++		sweet_fb_logical_h = fWidth / div;
++	} else {
++		sweet_fb_logical_w = fWidth / div;
++		sweet_fb_logical_h = fHeight / div;
++	}
++	fRotA = NULL;
++	fRotB = NULL;
++	if (fRot != 0 || div != 1) {
++		fRotA = (uint32_t *)IOMallocData((vm_size_t)fWidth * 4);
++		fRotB = (uint32_t *)IOMallocData((vm_size_t)fHeight * 4);
++		if (fRotA == NULL || fRotB == NULL) {
++			IOLog("SWEET FB: no memory for the rotation tables: native portrait\n");
++			if (fRotA != NULL) {
++				IOFreeData(fRotA, (vm_size_t)fWidth * 4);
++			}
++			if (fRotB != NULL) {
++				IOFreeData(fRotB, (vm_size_t)fHeight * 4);
++			}
++			fRotA = fRotB = NULL;
++			fRot = 0;
++			sweet_fb_logical_w = fWidth;
++			sweet_fb_logical_h = fHeight;
++		} else {
++			const uint32_t lw = sweet_fb_logical_w, lh = sweet_fb_logical_h;
++			/* panel pixel (px, py) shows fCompose[fRotA[px] + fRotB[py]] */
++			for (uint32_t px = 0; px < fWidth; px++) {
++				if (fRot == 1) {
++					fRotA[px] = (uint32_t)(((uint64_t)(fWidth - 1 - px) * lh) / fWidth) * lw;
++				} else if (fRot == 3) {
++					fRotA[px] = (uint32_t)(((uint64_t)px * lh) / fWidth) * lw;
++				} else {
++					fRotA[px] = (uint32_t)(((uint64_t)px * lw) / fWidth);
++				}
++			}
++			for (uint32_t py = 0; py < fHeight; py++) {
++				if (fRot == 1) {
++					fRotB[py] = (uint32_t)(((uint64_t)py * lw) / fHeight);
++				} else if (fRot == 3) {
++					fRotB[py] = (uint32_t)(((uint64_t)(fHeight - 1 - py) * lw) / fHeight);
++				} else {
++					fRotB[py] = (uint32_t)(((uint64_t)py * lh) / fHeight) * lw;
++				}
++			}
++		}
++	}
++	IOLog("SWEET FB: macOS screen %ux%u, rotation %u, panel %ux%u divided by %u\n", sweet_fb_logical_w,
++	    sweet_fb_logical_h, fRot, fWidth, fHeight, div);
+ #endif
+ 	IOLog("SWEET FB: presented screen %ux%u (@%ux, 0240)\n", sweet_fb_logical_w, sweet_fb_logical_h, pscale == 2 ? 2u : 3u);
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
++#if XNU_TARGET_OS_OSX
++	fLogicalW = sweet_fb_logical_w;
++	fLogicalH = sweet_fb_logical_h;
++#endif
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+@@ -1594,7 +1684,7 @@
+ 	if (w <= 0 || h <= 0) {
+ 		return;
+ 	}
+-	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * sweet_fb_bpr(s) +
+ 	    (uint64_t)(sx + w) * 4;
+ 	if (last > s->memory->getLength()) {
+ 		return;
+@@ -1614,7 +1704,7 @@
+ 	const uintptr_t base = src + s->offset + (uint64_t)sx * 4;
+ 	for (uint32_t py = py0; py < py1; py++) {
+ 		uint32_t ly = (uint32_t)(((uint64_t)py * fLogicalH) / fHeight);
+-		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + (int32_t)ly - dy) * s->bytesPerRow);
++		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + (int32_t)ly - dy) * sweet_fb_bpr(s));
+ 		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
+ 		for (uint32_t px = px0; px < px1; px++) {
+ 			drow[px] = srow[fColMap[px] - (uint32_t)dx];
+@@ -2053,11 +2143,11 @@
+ 	}
+ 	if (src == 0 || s->memory == NULL || s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 	    sx < 0 || sy < 0 || sx + sw > (int32_t)s->width || sy + sh > (int32_t)s->height ||
+-	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
++	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * sweet_fb_bpr(s) + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
+ 		return false;
+ 	}
+ 	for (int32_t j = 0; j < 8; j++) {
+-		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * s->bytesPerRow + (uint64_t)sx * 4;
++		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * sweet_fb_bpr(s) + (uint64_t)sx * 4;
+ 		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
+ 		const uint32_t *row = (const uint32_t *)(src + off);
+ 		for (int32_t i = 0; i < 8; i++) {
+@@ -2116,7 +2206,7 @@
+ 	o->src = src;
+ 	o->sw = s->width;
+ 	o->sh = s->height;
+-	o->spitch = s->bytesPerRow;
++	o->spitch = sweet_fb_bpr(s);
+ 	/* source edges in 1/256 pixel; the end is inclusive as before ((sx + aw - 1) << 8 for the whole layer) */
+ 	o->sx0 = (uint32_t)(sx * 256 + (int32_t)(((int64_t)(x0 - dx) * aw * 256) / w));
+ 	o->sx1 = (uint32_t)(sx * 256 + (int32_t)(((int64_t)(x1 - dx) * aw * 256) / w) - 256);
+@@ -2144,11 +2234,11 @@
+ 	}
+ 	if (src == 0 || s->memory == NULL || s->bytesPerElement != 4 || sx < 0 || sy < 0 || sx + sw > (int32_t)s->width ||
+ 	    sy + sh > (int32_t)s->height ||
+-	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
++	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * sweet_fb_bpr(s) + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
+ 		return false;
+ 	}
+ 	for (int32_t j = 0; j < 8; j++) {
+-		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * s->bytesPerRow + (uint64_t)sx * 4;
++		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * sweet_fb_bpr(s) + (uint64_t)sx * 4;
+ 		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
+ 		const uint32_t *row = (const uint32_t *)(src + off);
+ 		for (int32_t i = 0; i < 8; i++) {
+@@ -2187,7 +2277,7 @@
+ 	}
+ 	if (src == 0 || s->memory == NULL || s->bytesPerElement != 4 || sx < 0 || sy < 0 || sx + sw > (int32_t)s->width ||
+ 	    sy + sh > (int32_t)s->height ||
+-	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
++	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * sweet_fb_bpr(s) + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
+ 		return false;
+ 	}
+ 	enum { ROWS = 128 };
+@@ -2195,7 +2285,7 @@
+ 	int32_t band = sh / 16, nrows = 0, first = -1, last = -1;
+ 	band = band > 2 * ROWS ? 2 * ROWS : band;
+ 	for (int32_t y = 0; y < band; y += 2, nrows++) {
+-		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4;
++		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + y) * sweet_fb_bpr(s) + (uint64_t)sx * 4;
+ 		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
+ 		const uint32_t *row = (const uint32_t *)(src + off);
+ 		int32_t lo = -1, hi = -1;
+@@ -2248,12 +2338,12 @@
+ 	}
+ 	if (src == 0 || s->memory == NULL || s->bytesPerElement != 4 || sx < 0 || sy < 0 || sx + sw > (int32_t)s->width ||
+ 	    sy + sh > (int32_t)s->height ||
+-	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
++	    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * sweet_fb_bpr(s) + (uint64_t)(sx + sw) * 4 > s->memory->getLength()) {
+ 		return 0;
+ 	}
+ 	uint32_t black = 0;
+ 	for (int32_t j = 0; j < 8; j++) {
+-		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * s->bytesPerRow + (uint64_t)sx * 4;
++		uint64_t off = (uint64_t)s->offset + (uint64_t)(sy + (sh * (2 * j + 1)) / 16) * sweet_fb_bpr(s) + (uint64_t)sx * 4;
+ 		s->memory->performOperation(kIOMemoryIncoherentIOFlush, off, (uint64_t)sw * 4);
+ 		const uint32_t *row = (const uint32_t *)(src + off);
+ 		for (int32_t i = 0; i < 8; i++) {
+@@ -2347,7 +2437,7 @@
+ 		uint32_t l = order[i];
+ 		SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * l));
+ 		if (s == NULL || s == fSurface || s->memory == NULL || !sweet_fb_gpu_bgra(s->pixelFormat) ||
+-		    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || (s->bytesPerRow & 63) ||
++		    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || (sweet_fb_bpr(s) & 63) ||
+ 		    (s->offset & 63)) {
+ 			OSSafeReleaseNULL(s);
+ 			sweet_fb_stats.gpu_skip[3]++;
+@@ -2744,10 +2834,13 @@
+ 		return false;
+ 	}
+ #if XNU_TARGET_OS_OSX
+-	/* The macOS mode is already panel-native: compose layer swaps at 1:1, without the iOS scale map. */
+-	if (fLogicalW != fWidth || fLogicalH != fHeight) {
++	/* The macOS mode is panel-native (composed 1:1) or rotated/scaled by presentRotated (2026-11-22). */
++	if ((fLogicalW != fWidth || fLogicalH != fHeight) && fRotA == NULL) {
+ 		return false;
+ 	}
++	if (fRotA != NULL) {
++		force = true;           /* every frame goes through fCompose, one layer or not */
++	}
+ 	static uint32_t macosComposeRouteLogged;
+ 	if (macosComposeRouteLogged < 16) {
+ 		macosComposeRouteLogged++;
+@@ -2857,13 +2950,13 @@
+ 		bool ok = s != NULL && s != fSurface && src != 0 && s->memory != NULL && s->elementWidth == 1 &&
+ 		    s->elementHeight == 1 && (s->bytesPerElement == 4 || s->bytesPerElement == 0) && sx >= 0 && sy >= 0 &&
+ 		    sw > 0 && sh > 0 && sx + sw <= (int32_t)s->width && sy + sh <= (int32_t)s->height &&
+-		    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * s->bytesPerRow + (uint64_t)(sx + sw) * 4 <= s->memory->getLength();
++		    (uint64_t)s->offset + (uint64_t)(sy + sh - 1) * sweet_fb_bpr(s) + (uint64_t)(sx + sw) * 4 <= s->memory->getLength();
+ 		uint32_t zero = 0, full = 0, part = 0;
+ 		bool blend = false;
+ 		if (ok) {
+ 			s->memory->performOperation(kIOMemoryIncoherentIOFlush, 0, s->memory->getLength());
+ 			const uint8_t *base = (const uint8_t *)(src + s->offset);
+-			sweet_fb_alpha_samples(base, s->bytesPerRow, sx, sy, sw, sh, &zero, &full, &part);
++			sweet_fb_alpha_samples(base, sweet_fb_bpr(s), sx, sy, sw, sh, &zero, &full, &part);
+ 			/* 0172: a layer flagged opaque is copied, its alpha ignored */
+ 			bool flagged = sweet_fb_opaque_flag && rec[0x467 + l] != 0 && videoMask == 0;
+ 			blend = !first && !flagged && (full != 64 || videoMask != 0);   /* over video: always per pixel */
+@@ -2886,7 +2979,7 @@
+ 			}
+ 			for (int32_t y = y0; y < y1; y++) {
+ 				const uint32_t *srow = (const uint32_t *)(base +
+-				    (uint64_t)(sy + (int32_t)(((int64_t)(y - dy) * sh) / dh)) * s->bytesPerRow);
++				    (uint64_t)(sy + (int32_t)(((int64_t)(y - dy) * sh) / dh)) * sweet_fb_bpr(s));
+ 				uint32_t *drow = fCompose + (uint64_t)y * fLogicalW;
+ 				if (!blend) {
+ 					if (sw == dw) {
+@@ -2922,7 +3015,7 @@
+ 			IOLog("SWEET FB: compose swap %u layer %u surface %u %ux%u fmt 0x%x bpe %u bpr %u a %d,%d %dx%d b %d,%d %dx%d "
+ 			    "xform %u flags %02x %02x %02x %02x %02x %02x alpha 0:%u 255:%u mid:%u -> %s\n",
+ 			    get32(rec, 0x50), l, id, s ? s->width : 0, s ? s->height : 0, s ? s->pixelFormat : 0,
+-			    s ? s->bytesPerElement : 0, s ? s->bytesPerRow : 0, sx, sy, sw, sh, dx, dy, dw, dh,
++			    s ? s->bytesPerElement : 0, s ? sweet_fb_bpr(s) : 0, sx, sy, sw, sh, dx, dy, dw, dh,
+ 			    get32(rec, 0x114 + 4 * l), rec[0x2ca + l], rec[0x2cc + l], rec[0x2e3 + l], rec[0x2e5 + l],
+ 			    rec[0x2e6 + l], rec[0x467 + l], zero, full, part, !ok ? "skipped" : blend ? "blended" : "opaque");
+ 		}
+@@ -2947,6 +3040,14 @@
+ 		sweet_fb_stats.comp_time += mach_absolute_time() - began;
+ 		return true;
+ 	}
++#if XNU_TARGET_OS_OSX
++	if (fRotA != NULL) {
++		presentRotated(dst != 0 ? dst : fPixels);
++		sweet_fb_stats.composed++;
++		sweet_fb_stats.comp_time += mach_absolute_time() - began;
++		return true;
++	}
++#endif
+ 	for (uint32_t py = 0; py < fHeight; py++) {
+ 		uint32_t ly = (uint32_t)(((uint64_t)py * fLogicalH) / fHeight);
+ 		const uint32_t *srow = fCompose + (uint64_t)ly * fLogicalW;
+@@ -2966,10 +3067,39 @@
+ 	return true;
+ }
+ 
++/*
++ * macOS (2026-11-22): the composed logical frame onto the panel, rotated and scaled up (nearest neighbour) by the
++ * tables start() made. In 64x32 panel tiles, so the logical pixels a tile reads (a few rows of fCompose, columns
++ * when rotated) stay in the cache, and every panel row is written 256 bytes at a time.
++ */
++void
++AppleCLCD::presentRotated(uintptr_t dst)
++{
++	enum { TW = 64, TH = 32 };
++	for (uint32_t ty = 0; ty < fHeight; ty += TH) {
++		const uint32_t yend = ty + TH < fHeight ? ty + TH : fHeight;
++		for (uint32_t tx = 0; tx < fWidth; tx += TW) {
++			const uint32_t xend = tx + TW < fWidth ? tx + TW : fWidth;
++			for (uint32_t py = ty; py < yend; py++) {
++				const uint32_t *src = fCompose + fRotB[py];
++				uint32_t *drow = (uint32_t *)(dst + (uint64_t)py * fRowBytes);
++				for (uint32_t px = tx; px < xend; px++) {
++					drow[px] = src[fRotA[px]];
++				}
++			}
++		}
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++#if XNU_TARGET_OS_OSX
++	if (fRotA != NULL) {
++		return;                 /* rotated/scaled: only presentComposed can draw it */
++	}
++#endif
+ 
+ 
+ 	pauseConsole();
+@@ -2990,7 +3120,7 @@
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+ 			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+-			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
++			    s ? s->pixelFormat : 0, s ? sweet_fb_bpr(s) : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+ 		if (s == NULL || s == fSurface) {
+@@ -3047,7 +3177,7 @@
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * sweet_fb_bpr(s) +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+@@ -3056,7 +3186,7 @@
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++				    (const void *)(src + s->offset + (uint64_t)(sy + y) * sweet_fb_bpr(s) + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+ 		}
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -119,6 +119,13 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDKeyboard;"
+     "   },"
++#if XNU_TARGET_OS_OSX
++    "   {"
++    "     'IOClass'         = SweetHIDPointer;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDPointer;"
++    "   },"
++#endif
+     "   {"
+     "     'IOClass'         = SweetHIDTouch;"
+     "     'IOProviderClass' = IOResources;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -23,6 +23,7 @@
+ iokit/Kernel/arm/SweetCamera.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetMedia.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -41,6 +41,8 @@
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
+ 
++extern void sweet_media_publish(const char *name, int major, int minor, uint64_t bytes, uint32_t blockSize, int writable);
++
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -678,6 +680,8 @@
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
++	/* macOS: describe the disk to Disk Arbitration (iokit/Kernel/arm/SweetMedia.cpp); a no-op on iOS. */
++	sweet_media_publish("ufsroot0", su.bmajor, 0, su.nblocks * UFS_BLOCK, su.secsize, su.writable);
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMedia.cpp
+@@ -0,0 +1,150 @@
++/*
++ * SweetMedia: publish the SWEET root disk (bsd/dev/sweet_ufs.c, /dev/ufsroot0) in the I/O Registry as
++ * macOS storage does, a storage device with an IOMedia under it (2026-11-22, macOS 27 only).
++ *
++ * The root is a BSD block device the kernel makes directly; nothing in the IOStorage stack describes it. Disk
++ * Arbitration builds its disks from IOMedia objects, so it never knew the root: `diskutil info /` said "Could not
++ * find disk", the volume had no identity (vRefNum 0, no name), and LaunchServices asserted in
++ * LinkBinding::resolveBinding when Finder's sidebar asked for the root volume's icon (Finder crash-looped).
++ *
++ * These objects carry only what Disk Arbitration and CoreServices read (IOMedia keys, BSD name/major/minor/unit,
++ * the parent's Protocol Characteristics); no I/O goes through them. The class is named IOMedia because clients
++ * match on that class name; this kernel has no IOStorageFamily, so nothing else defines it. Published from a
++ * thread call shortly after the root device is made, so root mounting is untouched.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBSD.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSBoolean.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++
++#if XNU_TARGET_OS_OSX
++
++class SweetBlockStorage : public IOService {
++	OSDeclareDefaultStructors(SweetBlockStorage);
++};
++OSDefineMetaClassAndStructors(SweetBlockStorage, IOService);
++
++class IOMedia : public IOService {
++	OSDeclareDefaultStructors(IOMedia);
++};
++OSDefineMetaClassAndStructors(IOMedia, IOService);
++
++static struct {
++	char     name[32];
++	int      major, minor;
++	uint64_t bytes;
++	uint32_t blockSize;
++	bool     writable;
++} gSweetMediaArgs;
++static thread_call_t gSweetMediaCall;
++
++static void
++sweet_set_bool(IOService *s, const char *key, bool v)
++{
++	s->setProperty(key, v ? kOSBooleanTrue : kOSBooleanFalse);
++}
++
++static void
++sweet_media_publish_now(thread_call_param_t, thread_call_param_t)
++{
++	SweetBlockStorage *dev = OSTypeAlloc(SweetBlockStorage);
++	IOMedia *media = OSTypeAlloc(IOMedia);
++	if (!dev || !media || !dev->init() || !media->init()) {
++		IOLog("SWEET MEDIA: allocation failed\n");
++		OSSafeReleaseNULL(dev);
++		OSSafeReleaseNULL(media);
++		return;
++	}
++
++	/* The device: internal, like a Mac's built-in SSD (Disk Arbitration reads Protocol Characteristics). */
++	OSDictionary *proto = OSDictionary::withCapacity(2);
++	OSDictionary *chars = OSDictionary::withCapacity(3);
++	if (proto) {
++		OSString *ic = OSString::withCString("Apple Fabric");
++		OSString *loc = OSString::withCString("Internal");
++		proto->setObject("Physical Interconnect", ic);
++		proto->setObject("Physical Interconnect Location", loc);
++		OSSafeReleaseNULL(ic);
++		OSSafeReleaseNULL(loc);
++		dev->setProperty("Protocol Characteristics", proto);
++		proto->release();
++	}
++	if (chars) {
++		OSString *vendor = OSString::withCString("OnePlus");
++		OSString *product = OSString::withCString("Sweet UFS");
++		OSString *medium = OSString::withCString("Solid State");
++		chars->setObject("Vendor Name", vendor);
++		chars->setObject("Product Name", product);
++		chars->setObject("Medium Type", medium);
++		OSSafeReleaseNULL(vendor);
++		OSSafeReleaseNULL(product);
++		OSSafeReleaseNULL(medium);
++		dev->setProperty("Device Characteristics", chars);
++		chars->release();
++	}
++
++	/* The media: the whole disk, holding the HFS root (IOMedia.h keys). */
++	media->setProperty("Content", "Apple_HFS");
++	media->setProperty("Content Hint", "Apple_HFS");
++	media->setProperty("Base", 0ULL, 64);
++	media->setProperty("Size", gSweetMediaArgs.bytes, 64);
++	media->setProperty("Preferred Block Size", (unsigned long long)gSweetMediaArgs.blockSize, 64);
++	sweet_set_bool(media, "Whole", true);
++	sweet_set_bool(media, "Leaf", true);
++	sweet_set_bool(media, "Open", true);
++	sweet_set_bool(media, "Writable", gSweetMediaArgs.writable);
++	sweet_set_bool(media, "Removable", false);
++	sweet_set_bool(media, "Ejectable", false);
++	media->setProperty(kIOBSDNameKey, gSweetMediaArgs.name);
++	media->setProperty(kIOBSDMajorKey, (unsigned long long)gSweetMediaArgs.major, 32);
++	media->setProperty(kIOBSDMinorKey, (unsigned long long)gSweetMediaArgs.minor, 32);
++	media->setProperty(kIOBSDUnitKey, 0ULL, 32);
++
++	if (!dev->attach(IOService::getResourceService()) || !media->attach(dev)) {
++		IOLog("SWEET MEDIA: attach failed\n");
++		dev->release();
++		media->release();
++		return;
++	}
++	dev->registerService();
++	media->registerService();
++	IOLog("SWEET MEDIA: published IOMedia %s (major %d minor %d, %llu MiB, %u-byte blocks, %s)\n",
++	    gSweetMediaArgs.name, gSweetMediaArgs.major, gSweetMediaArgs.minor, gSweetMediaArgs.bytes >> 20,
++	    gSweetMediaArgs.blockSize, gSweetMediaArgs.writable ? "writable" : "read-only");
++	dev->release();         /* the registry holds them now */
++	media->release();
++}
++
++extern "C" void
++sweet_media_publish(const char *name, int major, int minor, uint64_t bytes, uint32_t blockSize, int writable)
++{
++	if (gSweetMediaCall) {
++		return;
++	}
++	strlcpy(gSweetMediaArgs.name, name, sizeof(gSweetMediaArgs.name));
++	gSweetMediaArgs.major = major;
++	gSweetMediaArgs.minor = minor;
++	gSweetMediaArgs.bytes = bytes;
++	gSweetMediaArgs.blockSize = blockSize;
++	gSweetMediaArgs.writable = writable != 0;
++	gSweetMediaCall = thread_call_allocate(sweet_media_publish_now, NULL);
++	if (gSweetMediaCall) {
++		uint64_t deadline;
++		clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);   /* after the root is mounted */
++		thread_call_enter_delayed(gSweetMediaCall, deadline);
++	}
++}
++
++#else /* !XNU_TARGET_OS_OSX */
++
++extern "C" void
++sweet_media_publish(const char *, int, int, uint64_t, uint32_t, int)
++{
++}
++
++#endif /* XNU_TARGET_OS_OSX */

@@ -37,6 +37,8 @@ def cmd_pack(args):
     pairs = [(args[i], args[i+1]) for i in range(1, len(args), 2)]
     files = []
     for dst, src in pairs:
+        if dst.lstrip('/') == 'ROOT/private/var/local/metal-renderserver-only':
+            sys.exit('refusing to pack the retired metal-renderserver-only marker')
         data = open(src, 'rb').read()
         files.append((dst.encode('utf-8'), data))
         print(f'  + {dst}  ({len(data)} bytes)')

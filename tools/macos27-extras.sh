@@ -17,6 +17,10 @@
 #   com.sweet.diag: wland / address / cfprefsd status on the console every 30 s (bring-up)
 #   macOS's own sshd (com.openssh.sshd) enabled through launchd's override database
 #       (/var/db/com.apple.xpc.launchd/disabled.plist)
+#   com.apple.clocksyncd disabled there (it blocks WindowServer: NOTES.md)
+#   com.apple.bluetoothd disabled there (it blocks the Language Chooser: NOTES.md)
+#   work/UniXNU/build/adreno-metal-plugin-macos27/NativeAdrenoMetal.bundle (METAL_BUNDLE) -> /System/Library/Extensions,
+#       + NativeAdrenoMetal.publish
 set -euo pipefail
 R=${1:?usage: macos27-extras.sh ROOT}
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -109,11 +113,60 @@ import os, plistlib, sys
 p = sys.argv[1]
 d = plistlib.load(open(p, 'rb')) if os.path.exists(p) else {}
 d['com.openssh.sshd'] = False
+# clocksyncd waits forever for IOTimeSyncFamily's IOTimeSyncDaemonService (no such kext here) and never answers
+# com.apple.timesync.expositor, so WindowServer hung in CAWindowServer init; with it off the lookup fails at once and
+# CoreAnimation goes on without external display sync.
+d['com.apple.clocksyncd'] = True
+# bluetoothd: macOS Bluetooth is not brought up here and the daemon never answers; the Language Chooser (and Setup
+# Assistant) waits forever in +[IOBluetoothHostController defaultController] before showing a window (black screen).
+# With it off the lookups fail at once and the Language Chooser draws.
+d['com.apple.bluetoothd'] = True
+# AppSSODaemon aborts in PODaemonCoreProcess initForBaseSystem when its base-system string is NULL on this root.
+d['com.apple.AppSSODaemon'] = True
 plistlib.dump(d, open(p, 'wb'))
 print('launchd overrides:', d)
 PYEOF
 sudo chown 0:0 "$D/disabled.plist"; sudo chmod 0644 "$D/disabled.plist"
 echo "sshd: enabled, root key installed"
+
+# HFS+ does not recreate /var/run on each boot. Clear logind's first-run marker only once per kernel boot; the stamp
+# prevents a launchd KeepAlive restart during the same boot from being mistaken for a fresh boot.
+sudo install -o 0 -g 0 -m 0755 "$REPO/userland/macos/sweet-logind-start.sh" "$L/bin/sweet-logind-start.sh"
+LOGIND="$R/System/Library/LaunchDaemons/com.apple.logind.plist"
+sudo test -f "$LOGIND" || { echo "missing $LOGIND" >&2; exit 1; }
+sudo python3 - "$LOGIND" <<'PYEOF'
+import plistlib, sys
+p = sys.argv[1]
+d = plistlib.load(open(p, 'rb'))
+d['ProgramArguments'] = ['/bin/sh', '/var/local/bin/sweet-logind-start.sh']
+with open(p, 'wb') as f:
+    plistlib.dump(d, f, fmt=plistlib.FMT_BINARY)
+PYEOF
+sudo chown 0:0 "$LOGIND"; sudo chmod 0644 "$LOGIND"
+echo "logind: clears stale first-run marker once per boot"
+
+# GPU: UniXNU's NativeAdrenoMetal plugin, macOS build (macOS bundle layout, Contents/MacOS with Turnip beside it), and the
+# .publish marker (without it the plugin only runs its self-test and returns nil). The kernel names it in the
+# accelerator's MetalPluginName; WindowServer aborts every 30 s while Metal has no device (NOTES.md).
+MB=${METAL_BUNDLE:-$REPO/work/UniXNU/build/adreno-metal-plugin-macos27/NativeAdrenoMetal.bundle}
+ext="$R/System/Library/Extensions"
+if [ -f "$MB/Contents/MacOS/NativeAdrenoMetal" ] && [ -f "$MB/Contents/MacOS/libvulkan_freedreno.dylib" ]; then
+	sudo rm -rf "$ext/NativeAdrenoMetal.bundle"
+	sudo cp -R "$MB" "$ext/NativeAdrenoMetal.bundle"
+	sudo chown -R 0:0 "$ext/NativeAdrenoMetal.bundle"
+	sudo find "$ext/NativeAdrenoMetal.bundle" -type d -exec chmod 0755 {} \;
+	sudo find "$ext/NativeAdrenoMetal.bundle" -type f -exec chmod 0644 {} \;
+	sudo chmod 0755 "$ext/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal" \
+		"$ext/NativeAdrenoMetal.bundle/Contents/MacOS/libvulkan_freedreno.dylib"
+	sudo install -o 0 -g 0 -m 0644 /dev/null "$ext/NativeAdrenoMetal.publish"
+	# The system shader cache the render server fills (UniXNU SharedShaderCache.h systemcache::kWriterPath): owner _windowserver
+	# (88), mode 0755. UniXNU's kernel makes it at boot; here it is in the image (/private/var/tmp is not emptied at boot).
+	# WindowServer's home is /var/empty, so without it the plugin has no cache directory of its own.
+	sudo install -d -o 88 -g 0 -m 0755 "$R/private/var/tmp/NativeAdrenoMetal.cache"
+	echo "GPU: NativeAdrenoMetal.bundle (macOS) from $MB ($(shasum -a 256 "$MB/Contents/MacOS/NativeAdrenoMetal" | cut -c1-16))"
+else
+	echo "WARNING: no macOS NativeAdrenoMetal bundle at $MB (set METAL_BUNDLE): WindowServer will have no Metal device" >&2
+fi
 
 # launchd's job cache: our two jobs added, sshd's Disabled cleared (macOS reads its jobs from this cache, as iOS does).
 sudo python3 - "$R" <<'PYEOF'
@@ -125,6 +178,11 @@ ld = d['LaunchDaemons']
 for name in ('com.sweet.wland', 'com.sweet.diag'):
     key = '/System/Library/LaunchDaemons/%s.plist' % name
     ld[key] = plistlib.load(open(R + key, 'rb'))
+logind_key = '/System/Library/LaunchDaemons/com.apple.logind.plist'
+if logind_key in ld:
+    ld[logind_key] = plistlib.load(open(R + logind_key, 'rb'))
+else:
+    print('WARNING: no com.apple.logind.plist in the launchd job cache')
 ssh = ld.get('/System/Library/LaunchDaemons/ssh.plist')
 if ssh is not None:
     ssh['Disabled'] = False

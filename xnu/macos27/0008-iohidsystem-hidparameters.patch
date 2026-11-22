@@ -1,0 +1,113 @@
+--- a/iokit/Kernel/arm/hid/SweetHIDSystem.cpp
++++ b/iokit/Kernel/arm/hid/SweetHIDSystem.cpp
+@@ -52,12 +52,83 @@
+ 	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOService *getService(void) APPLE_KEXT_OVERRIDE;
+ private:
+ 	IOHIDSystem *fOwner;
+ 	UInt32 fType;
+ };
+ 
+ OSDefineMetaClassAndStructors(IOHIDSystem, IOService);
++
++/*
++ * HID parameters with a Mac's defaults (IOKit/hidsystem/IOHIDParameter.h). IOKit's IOHIDCopyCFTypeParameter
++ * (NXClickTime, IOHIDGetParameter, ...) reads the IOHIDSystem service's HIDParameters dictionary, then the key as a
++ * property of its own, and only when both miss asks com.apple.iohideventsystem synchronously. WindowServer asks for
++ * HIDClickTime in createSessionWithOwner, before it checks that service in itself: without these it deadlocked there.
++ * Times are nanoseconds; accelerations are IOFixed; HIDClickSpace is UInt32 x, y.
++ */
++static const struct {
++	const char *key;
++	uint64_t value;
++} sweet_hidsys_numbers[] = {
++	{ "HIDClickTime", 500000000ULL },
++	{ "HIDKeyRepeat", 83333333ULL },
++	{ "HIDInitialKeyRepeat", 500000000ULL },
++	{ "HIDIdleTime", 0 },
++	{ "HIDWaitCursorFrameInterval", 16666667ULL },
++	{ "HIDPointerAcceleration", 0xB000 },
++	{ "HIDMouseAcceleration", 0xB000 },
++	{ "HIDTrackpadAcceleration", 0xB000 },
++	{ "HIDScrollAcceleration", 0x5000 },
++	{ "HIDMouseScrollAcceleration", 0x5000 },
++	{ "HIDTrackpadScrollAcceleration", 0x5000 },
++	{ "HIDPointerResolution", 400ULL << 16 },
++	{ "HIDScrollResolution", 10ULL << 16 },
++	{ "HIDPointerButtonMode", 2 },
++	{ "HIDScrollMouseButton", 0 },
++	{ "HIDFKeyMode", 0 },
++	{ "HIDF12EjectDelay", 250 },
++	{ "HIDSlowKeysDelay", 0 },
++	{ "HIDStickyKeysDisabled", 0 },
++	{ "HIDStickyKeysOn", 0 },
++	{ "HIDStickyKeysShiftToggles", 0 },
++	{ "HIDMouseKeysOptionToggles", 0 },
++	{ "HIDMouseKeysOn", 0 },
++	{ "HIDUseKeyswitch", 0 },
++	{ "HIDKeyboardModifierMappingPairs", 0 },
++	{ "AutoDimThreshold", 0 },
++	{ "AutoDimTime", 0 },
++	{ "IdleDimTime", 0 },
++	{ "Brightness", 64 },
++	{ "AutoDimBrightness", 64 },
++	{ "HIDDefaultParameters", 1 },
++};
++
++static void
++sweet_hidsys_publish_parameters(IOService *svc)
++{
++	OSDictionary *params = OSDictionary::withCapacity(40);
++	if (!params) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(sweet_hidsys_numbers) / sizeof(sweet_hidsys_numbers[0]); i++) {
++		OSNumber *n = OSNumber::withNumber(sweet_hidsys_numbers[i].value, 64);
++		if (n) {
++			params->setObject(sweet_hidsys_numbers[i].key, n);
++			svc->setProperty(sweet_hidsys_numbers[i].key, n);	/* the second lookup: the key on the service itself */
++			n->release();
++		}
++	}
++	static const UInt32 clickSpace[2] = { 4, 4 };
++	OSData *d = OSData::withBytes(clickSpace, sizeof(clickSpace));
++	if (d) {
++		params->setObject("HIDClickSpace", d);
++		svc->setProperty("HIDClickSpace", d);
++		d->release();
++	}
++	svc->setProperty("HIDParameters", params);
++	params->release();
++}
+ OSDefineMetaClassAndStructors(SweetHIDSystemUserClient, IOUserClient);
+ 
+ /* Per (connect type, selector): log the first few calls only. */
+@@ -70,8 +141,9 @@
+ 		return false;
+ 	}
+ 	setProperty(kIOHIDSystemClass, true);
++	sweet_hidsys_publish_parameters(this);
+ 	registerService();
+-	IOLog("SWEET HIDSystem: published (stand-in for IOHIDFamily's IOHIDSystem; EvGlobals %u bytes, version %u)\n",
++	IOLog("SWEET HIDSystem: published (stand-in for IOHIDFamily's IOHIDSystem; EvGlobals %u bytes, version %u; HIDParameters set)\n",
+ 	    (unsigned)sizeof(EvGlobals), (unsigned)kIOHIDCurrentShmemVersion);
+ 	return true;
+ }
+@@ -214,4 +286,15 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * IOConnectGetService: IOUserClient's default answers none (kIOReturnUnsupported). IOKit's IOHIDCopyCFTypeParameter
++ * needs the IOHIDSystem behind the connection to read HIDParameters from the registry; without it it went straight
++ * to the com.apple.iohideventsystem request that deadlocks WindowServer (IOHIDFamily's user clients return the owner).
++ */
++IOService *
++SweetHIDSystemUserClient::getService(void)
++{
++	return fOwner;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET && XNU_TARGET_OS_OSX */

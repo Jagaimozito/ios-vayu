@@ -1,0 +1,30 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14027,7 +14027,26 @@
+ 		}
+ 		/* Invoke the filesystem-specific code */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-		if (!sweet_fpfs_fsctl(vp, cmd, data, ctx, &error))
++		bool sweet_fsctl_handled = false;
++#if XNU_TARGET_OS_OSX
++		if (cmd == FSIOC_GET_GRAFT_INFO && vp->v_mount != NULL &&
++		    strncmp(vp->v_mount->mnt_vfsstat.f_fstypename, "hfs", MFSNAMELEN) == 0) {
++			/* cryptexd's hdi_copy_grafted() asks the root volume for APFS graft
++			 * records. HFS has no cryptex grafts; answer the query as an empty
++			 * list so the caller doesn't retry its ENOTTY path forever. */
++			fsioc_get_graft_info_t *ggi = (fsioc_get_graft_info_t *)data;
++			ggi->ggi_count = 0;
++			ggi->ggi_graft_index = 0;
++			ggi->ggi_is_in_graft = 0;
++			bzero(ggi->ggi_padding, sizeof(ggi->ggi_padding));
++			error = 0;
++			sweet_fsctl_handled = true;
++		}
++#endif
++		if (!sweet_fsctl_handled && sweet_fpfs_fsctl(vp, cmd, data, ctx, &error)) {
++			sweet_fsctl_handled = true;
++		}
++		if (!sweet_fsctl_handled)
+ #endif
+ 			error = VNOP_IOCTL(vp, cmd, data, (int)options, ctx);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)

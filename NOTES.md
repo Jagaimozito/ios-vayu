@@ -1,3 +1,326 @@
+# macOS 27 SWEET HID keyboard identity (2026-11-22)
+- Added `xnu/macos27/0016-sweethid-keyboard-identity.patch` for the `SweetHID.cpp` change already
+  present in `work/xnu-12377`: `SweetHIDKeyboard::getPrimaryUsagePage()` now returns
+  `kHIDPage_GenericDesktop` (1) with `kHIDUsage_GD_Keyboard` (6). The previous page 7 / usage 6
+  described the C key, preventing WindowServer from registering this service as a keyboard event
+  source. `SweetHIDButtons` remains a separate consumer-control service. No kernel was rebuilt and
+  no image was installed. If injected keys arrive but do not reach the password field, investigate
+  loginwindow keyboard-focus routing next.
+
+# macOS 27 NativeAdrenoMetal regression gate (2026-11-22)
+- Do not accept/install a new macOS plugin unless `LoginwindowUIShown` is reached, WindowServer has
+  no exit/crash after that milestone, and a continuous 120-second post-milestone observation has
+  zero NativeAdrenoMetal refusal lines. This is intentionally stricter than an allowlist: the
+  490b9191 leak-fix build had zero refusals at 23:04 and 23:42, so any refusal
+  category is new relative to that baseline. Run
+  `python3 tools/check-macos27-plugin-gate.py --system-log <unified-log.txt> --gpu-trace <WindowServer-trace.txt>`;
+  include `GATE_OBSERVED_THROUGH=YYYY-MM-DD HH:MM:SS` as the final line of the system-log export.
+  The trace must contain a WindowServer `dump cb` capture; absent coverage fails closed.
+- Correction to the earlier comparison: 08324cb6 was the leaking build. 490b9191 fixed that leak and
+  is the zero-refusal baseline; its 23:04 and 23:42 observations were stable. Do not attribute the
+  marker-triggered SecurityAgent login loop to either 490b9191 or bridge patch 0044. The observed
+  cause was `/var/local/metal-renderserver-only` being restored from the SWEETBOX archive; the
+  non-render-server decline path is now changed to reject allocation before an
+  `IOGPUMetalDevice` instance exists.
+- Built the updated macOS plugin locally with
+  `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target macos27 --no-replay`.
+  Bundle signature verification passed. `NativeAdrenoMetal` SHA-256:
+  `094e2d1be8db7ebefa3cc813b78e4cd550b2917f9228e339bbf5f2dc96cbc1d9`. Build emitted the existing
+  linker warning `ignoring duplicate libraries: '-lobjc'`. Not installed.
+
+# 2026-11-22 macOS GUI console and GPU rebuild
+- Permanent macOS boot-argument policy: `tools/mkmacos27boot.sh` filters `-v`, `keepsyms=1`, `debug=0xc`,
+  `serial=3`, `diag=1`, and `sweetfb_noconsole=1` from inherited arguments and asserts none remain. The earlier note
+  below that kept the diagnostics arguments is superseded. `serial_console.c` now mutes SWEET video-console output
+  at `console_init()` for macOS, and `AppleCLCD::start` clears/mutes the scanout as soon as it is ready. iOS guards
+  remain unchanged.
+- Rebuilt the macOS kernel and menu image with `bash tools/mkmacos27kernel.sh` and
+  `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`. Kernel SHA-256
+  `99034d9710babe012962cd6285ec40dcf766352d26860ec0f880d804b7f60b40`; wrapped image
+  `outputs/guacamole-macos27-kernel.img` SHA-256 `a7c95aad8945fd9d86d9d4d2c4aed9d20c44c91b367bb117054b5e3102d32c47`;
+  menu image `outputs/guacamole-menu-ios27-macos27.img` SHA-256
+  `4ad804473cb05b082927a7f257ce329a6f3ec032545650196728c78163d405c0` (49,426,432 bytes). MacOS args are in
+  `outputs/guacamole-menu-ios27-macos-boot-args.txt` and retain GPU/display/Wi-Fi settings, with no console/debug args.
+- Rebuilt the macOS plugin from current UniXNU sources with bridge patch 0045 (Vulkan heap live/high-water accounting
+  and bounded transient-image reuse). Turnip and plugin builds succeeded; both arm64e binaries were lowered with 0
+  refused and the bundle signature verifies. The runtime already handles the CoreVideo `444f` 4:4:4 full-range
+  bi-planar surface through its YCBCR8_444_2P path and matrix/range conversion.
+- The original box5 and box6 archives both contained `ROOT/private/var/local/metal-renderserver-only`;
+  box6 inherited it from box5. Removed that entry from both archives so a later mailbox restore cannot
+  recreate the policy marker. `tools/sweet-mailbox.py pack` now refuses that destination as well.
+  The bundle, primelist and publish marker remain in box6. Repacked box5 is 40,026,624 bytes,
+  SHA-256 `5833a7b554d083cc2b5e0e4a8359b696605dbbeba99725fa861f42d5008ff8ab`; box6 is
+  40,043,520 bytes, SHA-256 `e4179a26f67f5db890545e74070ec801bb8ab5cbbb1475355af95128ff5f1cda`.
+  No install or restore step in `tools/macos27-extras.sh` or `tools/mkios27root-mac.sh` creates the
+  marker. The bundle has not been installed; GPU
+  behavior and the console handoff have not yet been confirmed on the phone. `tools/macos27-extras.sh` already disables
+  AppSSODaemon in the root's launchd override.
+
+# macOS 27.2 UI bring-up: cryptex, SIMD traps, and display handoff (2026-11-21)
+- Follow-up: `xnu/macos27/0014-native-panel-composition.patch` enables the existing CPU layer compositor at
+  macOS panel-native resolution. The previous gate required `fScaleUp` and an iOS `fColMap`; macOS deliberately
+  sets logical dimensions to the 1440x3120 panel and has neither. Its fallback copied each layer independently,
+  so it did not alpha-compose multiple layers. The new route log is `SWEET FB: macOS native compose swap ...`;
+  existing per-layer and `composed` counters show which surfaces were used. iOS stays on the prior scale-map path.
+- macOS now calls `pauseConsole()` on WindowServer's first framebuffer swap, before waiting for vsync. It mutes video
+  console writes in `serial_console.c`, preserves serial output/SWEETLOG, clears the visible framebuffer, writes the
+  cache back, and issues a barrier. The expected log is `SWEET FB: macOS video console muted on first GUI swap`.
+- Follow-up after the phone still showed only console text: SSH confirmed WindowServer/loginwindow processes were
+  present, but `screencapture` still returned "could not create image from display". `0015-early-console-mute.patch`
+  adds an opt-in `sweetfb_noconsole=1` mute-and-clear immediately after the macOS framebuffer is initialized, covering
+  boots that do not reach the synthetic swap callback. The macOS wrapper now keeps that argument, drops `diag=1`,
+  and still retains `keepsyms=1 debug=0xc serial=3`; generated args are 600 characters. Kernel build succeeded; no
+  warning was emitted at the new `SweetFramebuffer.cpp` lines. Kernel SHA-256:
+  `71f54772d372466f9d638db4b906e0d088a8528b353257d4d9328a02d71e4d24`. Test menu image:
+  `outputs/guacamole-menu-ios27-macos27.img`, 49,422,336 bytes, SHA-256
+  `8a634740b200b448cea9a89db5b18990b76312b7b9d6ccadb9b3ebda224b5ac9`. The original iOS 27 payload was preserved;
+  the existing menu shim was reused. Not flashed.
+- Quiet-boot follow-up: SSH confirmed the phone was running that image, but the panel still showed text. Rewrapped the
+  same macOS kernel without `keepsyms=1`, `debug=0xc`, or `serial=3` (and with no `-v` or `diag=1`), retaining
+  `sweetfb_noconsole=1`; the args are 570 characters. New image:
+  `outputs/guacamole-menu-ios27-macos27-quiet.img` (49,422,336 bytes, SHA-256
+  `86c05c7ee55a5c284881e9433ab6574384092d567254b164e7e4de3dce7a978f`). The current shim and iOS 27 payload were
+  verified unchanged. Not flashed.
+- Added `research/macos27/iosurface-gradient-test.{mm,metal}` and
+  `tools/build-macos27-iosurface-gradient-test.sh`. The test creates a 402x152 BGRA IOSurface (1664-byte rows),
+  renders a known two-axis gradient directly into its imported texture, validates selected bytes, and keeps the
+  IOSurface alive so `tools/macos-surfdump` can read it by ID. Objective-C++ syntax checks passed. The full Metal
+  build is pending: this host's Xcode reports `missing Metal Toolchain` and suggests
+  `xcodebuild -downloadComponent MetalToolchain`; no GPU result is claimed yet.
+- Added `userland/macos/sweet-logind-start.sh`, installed by `tools/macos27-extras.sh` as the launchd ProgramArguments
+  for `com.apple.logind` (also updated in `/System/Library/xpc/launchd.plist`). It compares `kern.boottime` with a
+  persistent stamp and removes `/var/run/com.apple.logind.didRunThisBoot` once on a new boot, while preserving the
+  marker across a same-boot KeepAlive restart. This prevents the HFS+ `/var/run` marker from making logind report
+  `isFirstRun=0` after reboot. Root selection remains macOS-specific (`ufsroot=macos`); the iOS 27 selector payload
+  remains `ufsroot=ios27`. No image was built or flashed for this follow-up.
+- Added the kernel patches `xnu/macos27/0011-cryptexd-zero-grafts.patch`,
+  `0012-user-simd-emulation.patch`, and `0013-macos-display-console.patch`.
+- `cryptexd`'s `hdi_copy_grafted()` calls `fsctl()` on `/System/Volumes/Preboot` with
+  `FSIOC_GET_GRAFT_INFO` (`_IOWR('J', 102, fsioc_get_graft_info_t)`, command `0xc0104a66`, 16-byte struct).
+  An empty initial reply (`ggi_count=0`) means HFS has no graft records and prevents cryptexd's retry loop.
+  Its later `fsgetpath()` lookup only runs when graft records were returned, so this response skips that APFS-only
+  path query too.
+- The SWEET user-instruction emulator uses the saved NEON exception state and covers SHA3 EOR3/BCAX/RAX1/XAR,
+  SHA512 H/H2/SU0/SU1, FHM FMLAL/FMLSL lower/upper and by-element forms, and scalar/vector FRINT32/64 Z/X.
+  Feature discovery remains unchanged. `outputs/undef-insns.txt` and the SecurityAgent crash report show EOR3
+  (`0xce000820`) as the only observed unsupported instruction; no new runtime trap counts are available because
+  this build has not been booted. The existing 10-second counters and first-32 per-instruction logs remain enabled.
+- Added `tools/tests/macos27-simd-emul-test.c`, a user-space test using C reference calculations and known values.
+  It compiles with `clang -arch arm64 -O2 -mcpu=apple-m1`; it must be run on a CPU that supports these instructions.
+- macOS display publication now uses the physical 1440x3120 scanout plus a 2x HiDPI mode, clears stale scanout
+  pixels on first GUI present, and mutes video console writes once WindowServer presents. Panic output, serial, and
+  SWEETLOG continue. The iOS scaling branch is behind an OS X preprocessor guard. The iOS kernel target also
+  compiled successfully to `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`
+  (SHA-256 `a3694146f83ecf9102fd4cffefcc455b005adb9ebe01a586b9bcb5301761c329`); no iOS boot image was changed.
+  The compile check initially found `XNU_TARGET_OS_OSX` is not defined in the iOS target; moved that condition
+  into `#if !defined(XNU_TARGET_OS_OSX) || !XNU_TARGET_OS_OSX`, leaving the iOS scaling code unchanged.
+- The menu keeps the two root names distinct: iOS 27 uses `ufsroot=ios27`; macOS 27 uses `ufsroot=macos`. The
+  macOS entry must select the macOS root volume, not the iOS root. `tools/mkmenuboot.py` verifies each payload's
+  corresponding root token.
+- macOS boot args drop `-v`, retain `keepsyms=1 debug=0xc serial=3`, and are 587 characters. Sidecars:
+  `outputs/guacamole-macos27-kernel-boot-args.txt`,
+  `outputs/guacamole-menu-ios27-macos27-macos-boot-args.txt`, and
+  `outputs/guacamole-menu-ios27-macos27-ios-boot-args.txt`. The packaged iOS payload now correctly says
+  `ufsroot=ios27`; its source payload and ADT were not modified. `outputs/console.txt` now reflects the macOS args
+  without `-v`.
+- Kernel: `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`,
+  21,325,336 bytes, plain arm64, SHA-256 `1b59d8a7d8afef7f2406ac3394884b13ac378e333a6cc46f0edea5e86e922082`.
+- Boot images: `outputs/guacamole-macos27-kernel.img` (29,200,384 bytes), SHA-256
+  `88a3167309fa4f9360e0ad0fb049b074503f6735a209a3f7ff831bee6a657ae8`; selector image
+  `outputs/guacamole-menu-ios27-macos27.img` (49,422,336 bytes), SHA-256
+  `b13432e1d3d479f2f1f168b3dce7a4e6511c8cf6d72c1ce443d331f2431f4444`. Combined ramdisk is 41,657,344 bytes
+  of 48,234,496 (within the 46 MiB limit). No selector warning; no boot or flash performed.
+- Fastboot command: `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img`.
+
+# macOS 27.2 Security CMS binding patch (2026-11-21)
+- Runtime follow-up: patch 1 alone did not change `codesign -vvv loginwindow.app`; the phone still reports
+  `invalid signature`, Authority unavailable, and `SecCodeCheckValidity` `-67061`. The failure was earlier
+  than patch 1's signer-status gate: `CMSDecoderCopySignerStatus` at `0x18516a6f0` returns the OSStatus in
+  `w0`, and `cbnz w0` at `0x18516a6f4` immediately branches to `0x18516b36c`. Thus the later status-3 gate
+  at `0x18516a700` never ran. Patch 2 redirects only that API-error path: exact `-67061` is tolerated only
+  when the current CodeDirectory platform check returns 27, then control rejoins at `0x18516a704` so the
+  existing subsequent validation continues. Other API errors take the original generic error path; a
+  non-platform-27 `-67061` takes the original `errSecCSSignatureFailed` path at `0x18516b360`.
+- Patch-2 output: `outputs/dsc.01.security-patched2`, 130,711,552 bytes, SHA-256
+  `1cca1c50f9d4b1baa1220e1451d42acbb0d928309f55906441d3d9a9ecd4a302`. It was generated from the
+  exact patch-1 file SHA-256 `004c09cf74e2722027e50f3facd24e56561a69e5d20ae71a53cd09b75ae2b29c`.
+  The patch script's `--extend --restore` was tested on a copy and reproduced that patch-1 SHA exactly.
+  The `.01` cache CodeDirectory page hashes were refreshed and verified; the Apple CMS blob is unchanged.
+  Bytes: at `0x18516b36c`, `e2910494` (original call) becomes `6e56ba14` (branch to the gate); the verified
+  NOP pad at `0x188000d24` becomes `68419f52c8ffbf721f00086b21ffff5424342f9720ffff3472a64517`, and the pad at
+  `0x188000d14` becomes `783b4a9702ab451791a94517` (both byte strings are little-endian AArch64 instructions).
+- Both `arm64e` and `arm64e.x1` slices of lowered loginwindow report CodeDirectory platform 27, identifier
+  `com.apple.loginwindow`, and a 4,202-byte CMS blob. The x1 slice has CodeDirectory hash beginning
+  `0a65d8b821c656bb...`; it goes through the same shared Security.framework `validateDirectory` implementation,
+  whose platform check reads the CodeDirectory being validated. The host-side parser can enumerate the
+  embedded Apple certificate chain, but that does not override the phone's runtime `Authority=(unavailable)`
+  result before patch 2.
+- Patch 2 has **not** been installed on the phone. If tested, replace both hard-link locations in the macOS
+  root with this exact `.01` file:
+  `/System/Library/dyld/dyld_shared_cache_arm64e.01` and
+  `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e.01`.
+- `LFSMRegisterSessionOwner` is a login.framework client call to the `com.apple.logind` XPC service, invoking
+  `SMRegisterSessionOwner:reply:`. The returned integer 22 is logind's `EINVAL` response, not the XPC
+  transport status. The available trace establishes that owner registration was rejected; it does not
+  identify which request field logind rejects, nor prove this blocks creation of the login session. Treat it
+  as a failed session-owner endpoint registration; auto-login's independent credential/session creation path
+  must be checked separately before attributing the login failure to this result.
+- Added `tools/patch-macos27-security-cms.py`. It verifies the expected 26B123 bytes, patches the
+  lowered system cache subcache `.01` in place, refreshes its CodeDirectory page hashes, and supports
+  `--restore` (restore was checked against a copy and reproduced the original SHA-256 exactly).
+- Output: `outputs/dsc.01.security-patched`, 130,711,552 bytes, SHA-256
+  `004c09cf74e2722027e50f3facd24e56561a69e5d20ae71a53cd09b75ae2b29c`. Input archive member
+  `./System/Library/dyld/dyld_shared_cache_arm64e.01` in
+  `research/macos27/overlay/dsc-system-lowered-0.tar` has SHA-256
+  `76860d29a3bf679b9015909d588ee6906bb100525c9992d3ddd53bbc8ee38af7`.
+- In Security.framework `SecStaticCode::validateDirectory` (`0x18516a2f0`), the `CMSDecoderCopySignerStatus`
+  failure branch now tolerates only signer status 3 (`kCMSSignerInvalidSignature`) when the current
+  CodeDirectory platform byte (offset 38) is 27. The two CMS hash-agility mismatch branches are also
+  bypassed only for platform 27. Trampolines occupy verified, skipped NOP padding in the same cache
+  subcache. All other signer statuses and non-27 platform directories retain the original failure path.
+- The CMS blob, certificate trust evaluation, caller-supplied requirements, and CodeDirectory page/resource
+  validation are unchanged; only the four affected cache code pages have their hashes refreshed. This
+  lets Apple-signed platform binaries with the expected lowering-induced CMS/CD mismatch pass the binding
+  check while the later Apple signer/requirement checks still decide whether they are Apple code.
+- Install the patched subcache at both hard-link locations in the macOS root:
+  `/System/Library/dyld/dyld_shared_cache_arm64e.01` and
+  `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e.01`.
+  No phone files were changed.
+
+# macOS 27 GPU second pass (2026-11-20)
+- Rebuilt the macOS 27 bundle with `python3 work/UniXNU/scripts/build-turnip-darwin.py --target macos27`
+  and `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 work/UniXNU/scripts/build-adreno-metal-plugin.py --target macos27 --no-replay`.
+  The plugin build completed; the linker emitted only `ignoring duplicate libraries: '-lobjc'`.
+- Changed `build-adreno-metal-plugin.py` to use `build/prime-list-macos27.txt` for macOS and retain
+  `build/prime-list.txt` for iOS. This keeps the macOS paths out of later iOS builds. The macOS list
+  contains 434 `.metallib` paths and is embedded in `__DATA,__primelist`; QuartzCore’s cryptex library,
+  SkyLight’s shader library, and the root QuartzCore library lead the list. It is also packed as
+  `/System/Library/Extensions/NativeAdrenoMetal.primelist` for the plugin's sibling-file lookup.
+- `PrimeShaders.h` now writes a macOS-only `thread started` line before the 90-second delay and preserves
+  macOS list order. Before this, the first `prime.log` line was written only after the delay and library
+  enumeration; without a list file/embedded section, the fallback recursively scans protected system
+  trees. That makes a missing log at 150 seconds consistent with enumeration still running; it did not
+  by itself prove the thread was never launched. The new early line will distinguish those cases.
+- The archive miss is the Metal binary-archive path: the failed pipeline has an archive miss and the
+  compiler status remains `untried`, which means the strict miss returned before `codeGenRequest()` could
+  load MTLCompiler. `quartzcore_cache.mm` is our API test: it attaches an `MTLBinaryArchive` to the
+  descriptor and expects `MTLPipelineOptionFailOnBinaryArchiveMiss` to fail on a missing entry. Apple's
+  `default.pipelinelib` uses the separate `newPipelineLibraryWithFilePath:` SPI; the frontend currently
+  returns nil for that Apple-GPU-specific library (its implementation comment says the caller should
+  build pipelines from the shader library). The
+  runtime now logs the caller and URL when QuartzCore creates an `MTLBinaryArchive`, so the next macOS
+  log can identify the actual archive URL. For WindowServer only, and only for an archive created by
+  QuartzCore, the frontend clears `FailOnBinaryArchiveMiss`; this allows a missing QuartzCore entry to
+  go through runtime compilation. Other clients, non-QuartzCore archives, and iOS retain strict misses.
+- Lowered `NativeAdrenoMetal` (2,822 PAC words) and `libvulkan_freedreno.dylib` (11,522 words): 0 refused
+  in either binary. Re-signed the bundle ad hoc after lowering; `codesign --verify --strict` passes for
+  the bundle and dylib. Bundle CDHash: `e2158d7178d93882af675457dc1f494dd086bc6c`.
+- Packed the five bundle files, the 42,927-byte primelist, and empty publish marker into
+  `outputs/macos27-metal-box2.img` (40,026,624 bytes; 7 entries; SHA-256
+  `1952358a400de9ab68169bc855e49fbe10b2233868c5f3bb18ff9f5896e7be6a`). No phone install or kernel
+  image change was made.
+- macOS support the kernel/root still needs: create `/private/var/tmp/NativeAdrenoMetal.cache` before
+  WindowServer starts, owned by `_windowserver` (uid 88), mode `0755` (no group/other write; the plugin
+  intentionally does not create it); expose that cache read-only at
+  `/Library/GPUBundles/NativeAdrenoMetal.cache` for client processes; do not set `gpu-prime-system=0`
+  (that explicitly disables the shared cache). The primelist can be installed beside the bundle at
+  `/System/Library/Extensions/NativeAdrenoMetal.primelist`; the box contains that path and the same list
+  is embedded as a sandbox fallback. Runtime behavior still needs a macOS boot to confirm.
+
+# macOS 27 GPU first pass (2026-11-20)
+- Built the macOS SWEET kernel with `bash tools/mkmacos27kernel.sh` (PLATFORM=MacOSX,
+  `obj-macos27-sweet`, DEVELOPMENT ARM64 SWEET; plain arm64). The macOS-only `IOAccelerator`
+  base is guarded by `XNU_TARGET_OS_OSX`; the iOS `IOAcceleratorES : IOService` branch is unchanged.
+  No iOS kernel was rebuilt. `SweetAccelerator.cpp` still rejects Apple IOGPU open type 5; the
+  plugin uses `0x4147`.
+- Wrapped with `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`.
+  Args include `sweetmtl=3 sweetgpu=11 sweetfbgpu=1 rootrw=1 sweetwifid=1`; `sweetaccel` is
+  omitted and defaults on. `sweettime` refreshed.
+- Kernel: `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`,
+  SHA-256 `a6994449133f7197ccedbf2e6f6f7e498552ccb7a97830d630626c39f41fb4f9`.
+- Boot images: `outputs/guacamole-macos27-kernel.img`, SHA-256
+  `afb039c3b3682782ff9e2b98dd1a756be5473cafc9e431e2e5c9fd1b812eb4f8`; selector/triple image
+  `outputs/guacamole-menu-ios27-macos27.img` (49,422,336 bytes), SHA-256
+  `d7549c00eb469f881eeb623bb747f2b34124822c651fee884a9fc389632d0221`. Fastboot:
+  `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img`.
+- Built Turnip with `python3 scripts/build-turnip-darwin.py --target macos27` and built the
+  NativeAdrenoMetal macOS bundle under `work/UniXNU/build/adreno-metal-plugin-macos27/`.
+  The plugin command required `--no-replay`: the optional host replay checker fails to link newer
+  `NativeAdrenoPool*` / `NativeAdrenoPreempt*` symbols; no repository sources were changed to bypass it.
+  The pinned Rust 1.98 compiler was made visible via temporary wrappers in `/private/tmp/adreno-cargo-bin`.
+- Lowered both arm64e Mach-Os with `python3 research/ios26/tools/lower-macho.py`: `NativeAdrenoMetal`
+  2,817 words lowered, 0 refused; `libvulkan_freedreno.dylib` 11,522 words lowered, 0 refused.
+  Re-sealed the outer bundle ad-hoc after lowering; `codesign --verify --strict` passes for bundle
+  and Turnip dylib (4 KiB pages).
+- Verified `NativeAdrenoMetalDevice : IOGPUMetalDevice`; `IOGPUMetalDeviceShim.h` implements
+  `-acceleratorPort` by returning the stored service port. Bundle and Turnip are arm64e. macOS-specific
+  code selects `AGXAccelerator`, uses plain rows and disables framebuffer compression; iOS-only
+  QuartzCore address hooks are under `#if !TARGET_OS_OSX`. GPU runtime behavior remains untested.
+- Packed all bundle files plus the empty publish marker in `outputs/macos27-metal-box.img` (39,950,336
+  bytes, 6 entries; below 64 MiB), SHA-256 `a2047a02974eae9582e89550888d4bc70f5471c0e351b5aa8f9771eb766ea517`.
+  No phone install or flash was performed.
+
+# macOS 27: IOHIDSystem getService override (2026-11-20)
+- Rebuilt with `bash tools/mkmacos27kernel.sh`, then wrapped with
+  `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`. The macOS args keep
+  `rootrw=1 sweetwifid=1`; `sweettime` was refreshed. No source fixes were needed.
+- The cache disassembly confirms `_IOHIDCopyCFTypeParameter` at `0x184e74728`: it calls
+  `_IOConnectGetService` at `0x184e7475c`, then `cbz w0` at `0x184e74760` branches to the registry lookup when
+  the result is success (zero). A nonzero error falls through to the event-system call at `0x184e74770`
+  (function offset +0x48 / +72 bytes); `0x184e74774` is the return address after that call. The new user-client
+  `getService()` override returns `fOwner`, enabling that successful registry path.
+- Kernel build succeeded with no errors. `SweetHIDSystem.cpp` still reports four warnings: two generated zalloc
+  reserved-identifier warnings and two shared-memory cast-alignment warnings. The unstripped kernel has both
+  `HIDClickTime` and `HIDParameters set`. Its source is guarded by
+  `ARM64_BOARD_CONFIG_SWEET && XNU_TARGET_OS_OSX`; the KernelConfigTables personality is also OS X guarded,
+  so the iOS build path excludes this implementation. No iOS kernel rebuild was run.
+- Kernel: `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, 21,305,392
+  bytes, SHA-256 `3289b94399f9666aa98ddc222c53f3f063b3ec23caabe9c90d09af8ebda3fb87`.
+- Flashable selector image: `outputs/guacamole-menu-ios27-macos27.img`, 49,401,856 bytes,
+  SHA-256 `0694efa76c9627cb4d80e8e8c54a883bb56b96f57eb1589baa89025b6858f9b6`.
+- macOS-only payload: `outputs/guacamole-macos27-kernel.img`, 29,179,904 bytes,
+  SHA-256 `18a1f314657ddee7711301b3ec19a551d12fb9c24ca07f488fa09f3db3c3a0e5`.
+- Flash with `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img`.
+
+# macOS 27: IOHIDSystem HIDParameters registry fast path (2026-11-20)
+- Built the macOS 27 SWEET kernel with `bash tools/mkmacos27kernel.sh` (PLATFORM=MacOSX,
+  `BUILD/obj-macos27-sweet`, DEVELOPMENT ARM64 SWEET). The source change is in
+  `xnu/macos27/0008-iohidsystem-hidparameters.patch`; it publishes `HIDParameters` and the individual
+  properties before `registerService()`. Build succeeded with no errors; the iOS path remains excluded by
+  `#if defined(ARM64_BOARD_CONFIG_SWEET) && XNU_TARGET_OS_OSX` and the matching KernelConfigTables entry guard.
+- The unstripped kernel contains `HIDClickTime` and `HIDParameters set`. It is plain arm64. The source compiled
+  with four warnings in `SweetHIDSystem.cpp`: two reserved-identifier warnings from generated zalloc names and
+  two cast-alignment warnings for the shared-memory `EvOffsets`/`EvGlobals` casts. No source fixes were needed.
+- Wrapped with `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`; generated macOS
+  boot args retain `rootrw=1 sweetwifid=1` (and use `ufsroot=macos`).
+- Kernel: `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, 20 MiB,
+  SHA-256 `c8790d85302349d71959135b0b04062e4b6fb8295506c419db6d21aaae5645fa`.
+- Flashable selector image: `outputs/guacamole-menu-ios27-macos27.img`, 47 MiB,
+  SHA-256 `759421a9f331bf7aff1a282dedd10d09fde27c9ef828e2d3013c5aa14e55a714`.
+- macOS-only payload: `outputs/guacamole-macos27-kernel.img`, 28 MiB,
+  SHA-256 `775df9c6f149a3e1a3698b09c17301a8d9107c66d284d91f6b1245d755e1a1bd`.
+- Flash the selector image with `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img`.
+
+# macOS 27: WindowServer runs; blocked in TimeSync (clocksyncd) (2026-11-20, Claude)
+- 0006 works: "SWEET HIDSystem: WindowServer opens connect type 0", selector 0 (createShmem, version 4); WindowServer
+  stays up (status 0). Then "Initializing CAWindowServer... / Apple display manager unsupported" and silence.
+- sample WindowServer: main thread in -[CAWindowServer _init] -> CAWindowServerDisplayExternalSyncManager ->
+  DisplayExternalSyncObserver startObservingSSAMDevices -> +[TSSyncEntityManager sharedSyncEntityManager] ->
+  synchronous NSXPC reply from com.apple.timesync.expositor, forever.
+- That service is com.apple.clocksyncd (running): "TSDDaemon waiting for daemon service to become available" = an
+  IOKit IOTimeSyncDaemonService (IOTimeSyncFamily kext; then IOTimeSyncClockManager, gPTP manager). It never comes, so
+  clocksyncd never answers. Test: take clocksyncd out (launchctl bootout) so the XPC call fails at once.
+
+# macOS 27: IOHIDSystem stand-in, round 1 (2026-11-20, Claude) -- source, not built
+- xnu/macos27/0006-iohidsystem-standin.patch: iokit/Kernel/arm/hid/SweetHIDSystem.cpp (SWEET + XNU_TARGET_OS_OSX
+  only) + files.arm64 + a KernelConfigTables personality (IOClass IOHIDSystem on IOResources, OSX only). Service
+  "IOHIDSystem"; IOServiceOpen types 0/1/3 -> one user client that accepts every external method (zeroed outputs,
+  first 3 calls per type/selector logged "SWEET HIDSystem: ..."); clientMemoryForType(0) = EvOffsets + EvGlobals
+  (version 4, structSize = sizeof(EvGlobals) from our IOHIDShared.h, empty lleq ring) + 4 KiB private zone.
+  Purpose: get WindowServer past "IOHIDSystem not found" and log what it calls next (ssh guacmac dmesg).
+- SDK headers read from /Library/Developer/CommandLineTools/SDKs/MacOSX27.2.sdk (IOKit hidsystem): connect types
+  0 server, 1 param, 3 event system; kIOHIDGlobalMemory 0; shmem version 4 (3 last compatible).
+
 # macOS 27: cfprefsd fixed (0005); WindowServer needs IOHIDSystem (2026-11-20, Claude)
 - After 0005: cfprefsd runs, sw_vers / log show work. launchctl list non-zero: WindowServer 1, mobileactivationd -5,
   iomfb_fdr_loader 1, iomfb_bics_daemon -11, digest-service 1, security.xprotectd 1, endpointsecurityd 35.
@@ -8045,3 +8368,15 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   and length of the packed buffer (0x23fea9b80: u32 count, items u32 len + data padded to 4), with_acm flag.
 - passcode19 (SOURCE, NOT BUILT): pc_verify_packed takes the by-address form via sweet_pc_verify_packed_user()
   (copyin, item 0, ACM-context resolution, check). Staged as outputs/pc19-*.
+
+### macOS 27: WindowServer past TimeSync, then IOSurface (2026-11-20)
+
+- With com.apple.clocksyncd booted out, WindowServer's `com.apple.timesync.expositor` lookup fails at once ("TSSyncEntityManager not available") and CAWindowServer init goes on: IOMobileFramebuffer finds and opens `primary`, IOHIDSystem gets connect type 0 + selector 0 (createShmem, version 4). clocksyncd is now disabled in launchd's override database by `tools/macos27-extras.sh`.
+- Next hang (sample): `-[CAWindowServer _detectDisplays]` -> `AppleDisplay::AppleDisplay` -> `kern_CopyLayerDisplayedSurface` -> `-[IOSurface initWithMachPort:]` -> `_ioSurfaceConnectInternal`, which sleeps in a retry loop around `IOServiceGetMatchingServices`. macOS's IOSurface.framework matches the name `IOSurfaceRoot` (the cache has no `IOCoreSurfaceRoot` string); iOS's matches `IOCoreSurfaceRoot`. `xnu/macos27/0007-iosurfaceroot-name-on-macos.patch`: on macOS the same service is named `IOSurfaceRoot`.
+- Then (IOSurface found): WindowServer set up the display (IOMFB selectors, IOSurface 13/34), its HID event system (touch, buttons, proximity) and session 257, and deadlocked in createSessionWithOwner -> CGSMouseStateCreate -> NXClickTime -> IOHIDCopyCFTypeParameter -> IOHIDCopyHIDParameterFromEventSystem -> io_hideventsystem_open: a synchronous message to com.apple.iohideventsystem, WindowServer's own service, which it checks in only later (launchd: active = 0). Codex's disassembly of IOKit (26B123): IOHIDCopyCFTypeParameter (0x184e74728) first reads the IOHIDSystem service's HIDParameters dictionary, then the key as a property of the service, and asks the event system only when both miss. `xnu/macos27/0008-iohidsystem-hidparameters.patch`: the stand-in publishes the classic HID parameters (HIDClickTime 500 ms in ns, key repeat, accelerations, HIDClickSpace 4x4, ...) in HIDParameters and as properties of their own.
+- First 0008 build: the properties were in the registry (ioreg) but the stack was unchanged. IOHIDCopyCFTypeParameter+76 calls the event system when IOConnectGetService fails, and XNU's IOUserClient::getService() returns NULL (kIOReturnUnsupported). 0008 now also overrides SweetHIDSystemUserClient::getService() to return the IOHIDSystem.
+- With 0008 complete WindowServer initializes (display LCD 828x1792 @ 90 Hz, modes, digitizer, iohideventsystem active) and then aborts every 30 s: "(IOGPU) Failed to create an IOGPUDevice... IOServiceOpen returned 0xE00002C2", "Metal device initially absent", "No suitable Metal devices present after 30 seconds" -> abort(). Codex (26B123): IOGPUDeviceCreate (0x193f393b0) opens the accelerator with type 5 (IOGPUDeviceUserClient protocol: selectors 2/0/5, shmem 14), which SweetAccelerator refuses (only 0x4147 / 2) -- fine, as UniXNU's NativeAdrenoPublish refuses IOGPU's open. +[IOGPUMetalDevice registerAcceleratorService:] (0x193f26630) matches IOAccelerator and reads MetalPluginName / MetalPluginClassName; the class must subclass IOGPUMetalDevice (UniXNU's macOS NativeAdrenoMetalDevice does, IOGPUMetalDeviceShim.h). Our accelerator was an IOAcceleratorES only. `xnu/macos27/0009-ioaccelerator-base-on-macos.patch`: on macOS IOAcceleratorES derives from an IOAccelerator. Userland: UniXNU build-turnip-darwin.py / build-adreno-metal-plugin.py --target macos27; tools/macos27-extras.sh installs the bundle + .publish. Per IOGPUMetalDeviceShim.h, SkyLight composites in software (CompositorSW) when the device has no accelerator port, Metal (WSGetDefaultMetalAccelerator) when it has one.
+- First macOS Metal boot (0009 + UniXNU macos27 bundle via box): "Metal compositor activated", WindowServer stays up, swaps/page flips 828x1792. Screen showed garbage, then black: every CoreAnimation pipeline fails "BinaryArchiveMiss ... compiler untried" (attachment_clear_frag_lph, fixed_frag_lph_cpf). WindowServer's home is /var/empty: the plugin's cache needs /private/var/tmp/NativeAdrenoMetal.cache (owner 88, 0755; UniXNU's kernel makes it at boot), now made by tools/macos27-extras.sh. With it the plugin writes ir3/, v1/, pipeline-records-WindowServer.bin, but no prime.log after 150 s and still no compile on a miss: handed to Codex (quartzcore_cache.mm / PrimeShaders.h).
+- '&BGA' framebuffer: Codex's QuartzCore patch (tools/patch-macos27-framebuffer-format.py, after UniXNU-sheng board.toml's 26C5035r NOP; here subcache .03 offset 0x5ca42b0, the TBNZ after CADeviceIsVirtualized in framebuffer_pixel_format) is installed on the phone (both cache paths, .orig kept) but WindowServer still uses &BGA: that branch is not the choice of compression on 26B123. screencapture over SSH: "Could not create image from display". SweetFramebuffer's GPU blit accepted only 'BGRA' (gpu_skip[3]), so &BGA frames went through the CPU copy. `xnu/macos27/0010-fb-accept-lossless-bgra-name.patch`: on macOS the GPU blit also takes 0x26424741 (the surface is 4 bytes a pixel, rows 3328, linear as created by our IOSurface). Test: does the panel show WindowServer's frame?
+- 0010 (GPU blit takes '&BGA'): WindowServer's frames reach the panel through the GPU blit, sampled black: nothing to draw. loginwindow is never started by WindowServer (runs = 0; WindowServer logged "PKGInitializeAppearanceTransitions running on installer"); `launchctl kickstart -p system/com.apple.loginwindow` starts it: session 257, first boot -> Language Chooser. The Language Chooser's main thread waited forever in +[IOBluetoothHostController defaultController] -> -[IOBluetoothCoreBluetoothCoordinator init] (semaphore; macOS bluetoothd never answers). `launchctl bootout system/com.apple.bluetoothd` + restarting the session: the panel turns white (Language Chooser's background), ~30 frames/s, samples not black. bluetoothd now disabled by tools/macos27-extras.sh. MenuBarAgent dies in _libsecinit_appsandbox (App Sandbox) every 10 s.
+- Login without Setup Assistant: account made with dscl (sysadminctl segfaults: no com.apple.systemadministration.writeconfig), password written as SALTED-SHA512-PBKDF2 ShadowHashData by tools/macos27-user-password.py (+ /etc/kcpassword, autoLoginUser, /var/db/.AppleSetupDone, AppleLanguages en-US). Every password check crashed opendirectoryd: securetoken_helpers_list_unlockrecords locks a NULL SecureToken context (no SEP, no APFS Preboot: "failed to get token path"); ;DisabledTags;SecureToken does not avoid it. corecrypto PBKDF2/SHA-512 on the phone match the Mac (tools/macos-pbkdf2-test.c). Codex's tools/patch-macos27-plistfile.py: CBZ x0 to the epilogue at the list wrapper's frame setup (both arm64e slices). NOTE: Codex patched the original from os-root.tar; the phone runs the PAC-lowered PlistFile from overlay/os-root-lowered.tar (8756 bytes differ), so the patch must be applied to the lowered file (the script does so cleanly: outputs/PlistFile.lowered-patched).

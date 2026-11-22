@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -465,8 +465,13 @@
+ 	}
+ 	sweet_surface_init_lock();
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
++#if XNU_TARGET_OS_OSX
++	/* macOS's IOSurface.framework looks up IOServiceNameMatching("IOSurfaceRoot") (iOS: "IOCoreSurfaceRoot") and
++	 * sleeps in a retry loop until it appears: WindowServer hung there in CAWindowServer _detectDisplays. */
++	setName("IOSurfaceRoot");
++#endif
+ 	registerService();
+-	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
++	IOLog("SWEET SURF: IOCoreSurfaceRoot registered as %s\n", getName());
+ 	return true;
+ }
+ 

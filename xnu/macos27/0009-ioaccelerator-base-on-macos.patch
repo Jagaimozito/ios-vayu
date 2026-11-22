@@ -1,0 +1,35 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -455,11 +455,32 @@
+  * Metal (MTLRegisterDevices), which leaves the renderers as they were.
+  * Boot-arg sweetaccel=0 turns it off.
+  */
++#if XNU_TARGET_OS_OSX
++/*
++ * macOS 27: Metal's discovery (IOGPU's +[IOGPUMetalDevice registerAcceleratorService:]) matches
++ * IOServiceMatching("IOAccelerator"), IOGraphicsFamily's base, not IOAcceleratorES; without it WindowServer logged
++ * "No suitable Metal devices present after 30 seconds" and aborted every 30 s. Here IOAcceleratorES (and so
++ * AGXAccelerator) derives from an IOAccelerator, as UniXNU's OriginalAcceleratorABI.h does on macOS. IOGPU's own open
++ * of it (type 5, IOGPUDeviceUserClient) stays refused (SweetAccelerator.cpp); the plugin opens with its own type.
++ */
++class IOAccelerator : public IOService {
++	OSDeclareDefaultStructors(IOAccelerator);
++};
++
++OSDefineMetaClassAndStructors(IOAccelerator, IOService);
++
++class IOAcceleratorES : public IOAccelerator {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOAccelerator);
++#else
+ class IOAcceleratorES : public IOService {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++#endif
+ 
+ /*
+  * sweetmtl=3 (iOS 26): the accelerator is published as class AGXAccelerator, an IOAcceleratorES (as UniXNU's
