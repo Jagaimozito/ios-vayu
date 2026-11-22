@@ -2,6 +2,1158 @@
 - Branch macos27 from ios27 (rebased onto 9f37afc). Target macOS 27.2 26B123, Mac17,5 IPSW. Plan in docs/macos27.md, working
   area macos27/. Apple artifacts go to research/macos27/ (git-ignored).
 
+# macOS 27 SWEET HID keyboard identity (2026-11-22)
+- Added `xnu/macos27/0016-sweethid-keyboard-identity.patch` for the `SweetHID.cpp` change already
+  present in `work/xnu-12377`: `SweetHIDKeyboard::getPrimaryUsagePage()` now returns
+  `kHIDPage_GenericDesktop` (1) with `kHIDUsage_GD_Keyboard` (6). The previous page 7 / usage 6
+  described the C key, preventing WindowServer from registering this service as a keyboard event
+  source. `SweetHIDButtons` remains a separate consumer-control service. No kernel was rebuilt and
+  no image was installed. If injected keys arrive but do not reach the password field, investigate
+  loginwindow keyboard-focus routing next.
+
+# macOS 27 NativeAdrenoMetal regression gate (2026-11-22)
+- Do not accept/install a new macOS plugin unless `LoginwindowUIShown` is reached, WindowServer has
+  no exit/crash after that milestone, and a continuous 120-second post-milestone observation has
+  zero NativeAdrenoMetal refusal lines. This is intentionally stricter than an allowlist: the
+  490b9191 leak-fix build had zero refusals at 23:04 and 23:42, so any refusal
+  category is new relative to that baseline. Run
+  `python3 tools/check-macos27-plugin-gate.py --system-log <unified-log.txt> --gpu-trace <WindowServer-trace.txt>`;
+  include `GATE_OBSERVED_THROUGH=YYYY-MM-DD HH:MM:SS` as the final line of the system-log export.
+  The trace must contain a WindowServer `dump cb` capture; absent coverage fails closed.
+- Correction to the earlier comparison: 08324cb6 was the leaking build. 490b9191 fixed that leak and
+  is the zero-refusal baseline; its 23:04 and 23:42 observations were stable. Do not attribute the
+  marker-triggered SecurityAgent login loop to either 490b9191 or bridge patch 0044. The observed
+  cause was `/var/local/metal-renderserver-only` being restored from the SWEETBOX archive; the
+  non-render-server decline path is now changed to reject allocation before an
+  `IOGPUMetalDevice` instance exists.
+- Built the updated macOS plugin locally with
+  `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target macos27 --no-replay`.
+  Bundle signature verification passed. `NativeAdrenoMetal` SHA-256:
+  `094e2d1be8db7ebefa3cc813b78e4cd550b2917f9228e339bbf5f2dc96cbc1d9`. Build emitted the existing
+  linker warning `ignoring duplicate libraries: '-lobjc'`. Not installed.
+
+# 2026-11-22 macOS GUI console and GPU rebuild
+- Permanent macOS boot-argument policy: `tools/mkmacos27boot.sh` filters `-v`, `keepsyms=1`, `debug=0xc`,
+  `serial=3`, `diag=1`, and `sweetfb_noconsole=1` from inherited arguments and asserts none remain. The earlier note
+  below that kept the diagnostics arguments is superseded. `serial_console.c` now mutes SWEET video-console output
+  at `console_init()` for macOS, and `AppleCLCD::start` clears/mutes the scanout as soon as it is ready. iOS guards
+  remain unchanged.
+- Rebuilt the macOS kernel and menu image with `bash tools/mkmacos27kernel.sh` and
+  `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`. Kernel SHA-256
+  `99034d9710babe012962cd6285ec40dcf766352d26860ec0f880d804b7f60b40`; wrapped image
+  `outputs/guacamole-macos27-kernel.img` SHA-256 `a7c95aad8945fd9d86d9d4d2c4aed9d20c44c91b367bb117054b5e3102d32c47`;
+  menu image `outputs/guacamole-menu-ios27-macos27.img` SHA-256
+  `4ad804473cb05b082927a7f257ce329a6f3ec032545650196728c78163d405c0` (49,426,432 bytes). MacOS args are in
+  `outputs/guacamole-menu-ios27-macos-boot-args.txt` and retain GPU/display/Wi-Fi settings, with no console/debug args.
+- Rebuilt the macOS plugin from current UniXNU sources with bridge patch 0045 (Vulkan heap live/high-water accounting
+  and bounded transient-image reuse). Turnip and plugin builds succeeded; both arm64e binaries were lowered with 0
+  refused and the bundle signature verifies. The runtime already handles the CoreVideo `444f` 4:4:4 full-range
+  bi-planar surface through its YCBCR8_444_2P path and matrix/range conversion.
+- The original box5 and box6 archives both contained `ROOT/private/var/local/metal-renderserver-only`;
+  box6 inherited it from box5. Removed that entry from both archives so a later mailbox restore cannot
+  recreate the policy marker. `tools/sweet-mailbox.py pack` now refuses that destination as well.
+  The bundle, primelist and publish marker remain in box6. Repacked box5 is 40,026,624 bytes,
+  SHA-256 `5833a7b554d083cc2b5e0e4a8359b696605dbbeba99725fa861f42d5008ff8ab`; box6 is
+  40,043,520 bytes, SHA-256 `e4179a26f67f5db890545e74070ec801bb8ab5cbbb1475355af95128ff5f1cda`.
+  No install or restore step in `tools/macos27-extras.sh` or `tools/mkios27root-mac.sh` creates the
+  marker. The bundle has not been installed; GPU
+  behavior and the console handoff have not yet been confirmed on the phone. `tools/macos27-extras.sh` already disables
+  AppSSODaemon in the root's launchd override.
+
+# macOS 27.2 UI bring-up: cryptex, SIMD traps, and display handoff (2026-11-21)
+- Follow-up: `xnu/macos27/0014-native-panel-composition.patch` enables the existing CPU layer compositor at
+  macOS panel-native resolution. The previous gate required `fScaleUp` and an iOS `fColMap`; macOS deliberately
+  sets logical dimensions to the 1440x3120 panel and has neither. Its fallback copied each layer independently,
+  so it did not alpha-compose multiple layers. The new route log is `SWEET FB: macOS native compose swap ...`;
+  existing per-layer and `composed` counters show which surfaces were used. iOS stays on the prior scale-map path.
+- macOS now calls `pauseConsole()` on WindowServer's first framebuffer swap, before waiting for vsync. It mutes video
+  console writes in `serial_console.c`, preserves serial output/SWEETLOG, clears the visible framebuffer, writes the
+  cache back, and issues a barrier. The expected log is `SWEET FB: macOS video console muted on first GUI swap`.
+- Follow-up after the phone still showed only console text: SSH confirmed WindowServer/loginwindow processes were
+  present, but `screencapture` still returned "could not create image from display". `0015-early-console-mute.patch`
+  adds an opt-in `sweetfb_noconsole=1` mute-and-clear immediately after the macOS framebuffer is initialized, covering
+  boots that do not reach the synthetic swap callback. The macOS wrapper now keeps that argument, drops `diag=1`,
+  and still retains `keepsyms=1 debug=0xc serial=3`; generated args are 600 characters. Kernel build succeeded; no
+  warning was emitted at the new `SweetFramebuffer.cpp` lines. Kernel SHA-256:
+  `71f54772d372466f9d638db4b906e0d088a8528b353257d4d9328a02d71e4d24`. Test menu image:
+  `outputs/guacamole-menu-ios27-macos27.img`, 49,422,336 bytes, SHA-256
+  `8a634740b200b448cea9a89db5b18990b76312b7b9d6ccadb9b3ebda224b5ac9`. The original iOS 27 payload was preserved;
+  the existing menu shim was reused. Not flashed.
+- Quiet-boot follow-up: SSH confirmed the phone was running that image, but the panel still showed text. Rewrapped the
+  same macOS kernel without `keepsyms=1`, `debug=0xc`, or `serial=3` (and with no `-v` or `diag=1`), retaining
+  `sweetfb_noconsole=1`; the args are 570 characters. New image:
+  `outputs/guacamole-menu-ios27-macos27-quiet.img` (49,422,336 bytes, SHA-256
+  `86c05c7ee55a5c284881e9433ab6574384092d567254b164e7e4de3dce7a978f`). The current shim and iOS 27 payload were
+  verified unchanged. Not flashed.
+- Added `research/macos27/iosurface-gradient-test.{mm,metal}` and
+  `tools/build-macos27-iosurface-gradient-test.sh`. The test creates a 402x152 BGRA IOSurface (1664-byte rows),
+  renders a known two-axis gradient directly into its imported texture, validates selected bytes, and keeps the
+  IOSurface alive so `tools/macos-surfdump` can read it by ID. Objective-C++ syntax checks passed. The full Metal
+  build is pending: this host's Xcode reports `missing Metal Toolchain` and suggests
+  `xcodebuild -downloadComponent MetalToolchain`; no GPU result is claimed yet.
+- Added `userland/macos/sweet-logind-start.sh`, installed by `tools/macos27-extras.sh` as the launchd ProgramArguments
+  for `com.apple.logind` (also updated in `/System/Library/xpc/launchd.plist`). It compares `kern.boottime` with a
+  persistent stamp and removes `/var/run/com.apple.logind.didRunThisBoot` once on a new boot, while preserving the
+  marker across a same-boot KeepAlive restart. This prevents the HFS+ `/var/run` marker from making logind report
+  `isFirstRun=0` after reboot. Root selection remains macOS-specific (`ufsroot=macos`); the iOS 27 selector payload
+  remains `ufsroot=ios27`. No image was built or flashed for this follow-up.
+- Added the kernel patches `xnu/macos27/0011-cryptexd-zero-grafts.patch`,
+  `0012-user-simd-emulation.patch`, and `0013-macos-display-console.patch`.
+- `cryptexd`'s `hdi_copy_grafted()` calls `fsctl()` on `/System/Volumes/Preboot` with
+  `FSIOC_GET_GRAFT_INFO` (`_IOWR('J', 102, fsioc_get_graft_info_t)`, command `0xc0104a66`, 16-byte struct).
+  An empty initial reply (`ggi_count=0`) means HFS has no graft records and prevents cryptexd's retry loop.
+  Its later `fsgetpath()` lookup only runs when graft records were returned, so this response skips that APFS-only
+  path query too.
+- The SWEET user-instruction emulator uses the saved NEON exception state and covers SHA3 EOR3/BCAX/RAX1/XAR,
+  SHA512 H/H2/SU0/SU1, FHM FMLAL/FMLSL lower/upper and by-element forms, and scalar/vector FRINT32/64 Z/X.
+  Feature discovery remains unchanged. `outputs/undef-insns.txt` and the SecurityAgent crash report show EOR3
+  (`0xce000820`) as the only observed unsupported instruction; no new runtime trap counts are available because
+  this build has not been booted. The existing 10-second counters and first-32 per-instruction logs remain enabled.
+- Added `tools/tests/macos27-simd-emul-test.c`, a user-space test using C reference calculations and known values.
+  It compiles with `clang -arch arm64 -O2 -mcpu=apple-m1`; it must be run on a CPU that supports these instructions.
+- macOS display publication now uses the physical 1440x3120 scanout plus a 2x HiDPI mode, clears stale scanout
+  pixels on first GUI present, and mutes video console writes once WindowServer presents. Panic output, serial, and
+  SWEETLOG continue. The iOS scaling branch is behind an OS X preprocessor guard. The iOS kernel target also
+  compiled successfully to `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`
+  (SHA-256 `a3694146f83ecf9102fd4cffefcc455b005adb9ebe01a586b9bcb5301761c329`); no iOS boot image was changed.
+  The compile check initially found `XNU_TARGET_OS_OSX` is not defined in the iOS target; moved that condition
+  into `#if !defined(XNU_TARGET_OS_OSX) || !XNU_TARGET_OS_OSX`, leaving the iOS scaling code unchanged.
+- The menu keeps the two root names distinct: iOS 27 uses `ufsroot=ios27`; macOS 27 uses `ufsroot=macos`. The
+  macOS entry must select the macOS root volume, not the iOS root. `tools/mkmenuboot.py` verifies each payload's
+  corresponding root token.
+- macOS boot args drop `-v`, retain `keepsyms=1 debug=0xc serial=3`, and are 587 characters. Sidecars:
+  `outputs/guacamole-macos27-kernel-boot-args.txt`,
+  `outputs/guacamole-menu-ios27-macos27-macos-boot-args.txt`, and
+  `outputs/guacamole-menu-ios27-macos27-ios-boot-args.txt`. The packaged iOS payload now correctly says
+  `ufsroot=ios27`; its source payload and ADT were not modified. `outputs/console.txt` now reflects the macOS args
+  without `-v`.
+- Kernel: `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`,
+  21,325,336 bytes, plain arm64, SHA-256 `1b59d8a7d8afef7f2406ac3394884b13ac378e333a6cc46f0edea5e86e922082`.
+- Boot images: `outputs/guacamole-macos27-kernel.img` (29,200,384 bytes), SHA-256
+  `88a3167309fa4f9360e0ad0fb049b074503f6735a209a3f7ff831bee6a657ae8`; selector image
+  `outputs/guacamole-menu-ios27-macos27.img` (49,422,336 bytes), SHA-256
+  `b13432e1d3d479f2f1f168b3dce7a4e6511c8cf6d72c1ce443d331f2431f4444`. Combined ramdisk is 41,657,344 bytes
+  of 48,234,496 (within the 46 MiB limit). No selector warning; no boot or flash performed.
+- Fastboot command: `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img`.
+
+# macOS 27.2 Security CMS binding patch (2026-11-21)
+- Runtime follow-up: patch 1 alone did not change `codesign -vvv loginwindow.app`; the phone still reports
+  `invalid signature`, Authority unavailable, and `SecCodeCheckValidity` `-67061`. The failure was earlier
+  than patch 1's signer-status gate: `CMSDecoderCopySignerStatus` at `0x18516a6f0` returns the OSStatus in
+  `w0`, and `cbnz w0` at `0x18516a6f4` immediately branches to `0x18516b36c`. Thus the later status-3 gate
+  at `0x18516a700` never ran. Patch 2 redirects only that API-error path: exact `-67061` is tolerated only
+  when the current CodeDirectory platform check returns 27, then control rejoins at `0x18516a704` so the
+  existing subsequent validation continues. Other API errors take the original generic error path; a
+  non-platform-27 `-67061` takes the original `errSecCSSignatureFailed` path at `0x18516b360`.
+- Patch-2 output: `outputs/dsc.01.security-patched2`, 130,711,552 bytes, SHA-256
+  `1cca1c50f9d4b1baa1220e1451d42acbb0d928309f55906441d3d9a9ecd4a302`. It was generated from the
+  exact patch-1 file SHA-256 `004c09cf74e2722027e50f3facd24e56561a69e5d20ae71a53cd09b75ae2b29c`.
+  The patch script's `--extend --restore` was tested on a copy and reproduced that patch-1 SHA exactly.
+  The `.01` cache CodeDirectory page hashes were refreshed and verified; the Apple CMS blob is unchanged.
+  Bytes: at `0x18516b36c`, `e2910494` (original call) becomes `6e56ba14` (branch to the gate); the verified
+  NOP pad at `0x188000d24` becomes `68419f52c8ffbf721f00086b21ffff5424342f9720ffff3472a64517`, and the pad at
+  `0x188000d14` becomes `783b4a9702ab451791a94517` (both byte strings are little-endian AArch64 instructions).
+- Both `arm64e` and `arm64e.x1` slices of lowered loginwindow report CodeDirectory platform 27, identifier
+  `com.apple.loginwindow`, and a 4,202-byte CMS blob. The x1 slice has CodeDirectory hash beginning
+  `0a65d8b821c656bb...`; it goes through the same shared Security.framework `validateDirectory` implementation,
+  whose platform check reads the CodeDirectory being validated. The host-side parser can enumerate the
+  embedded Apple certificate chain, but that does not override the phone's runtime `Authority=(unavailable)`
+  result before patch 2.
+- Patch 2 has **not** been installed on the phone. If tested, replace both hard-link locations in the macOS
+  root with this exact `.01` file:
+  `/System/Library/dyld/dyld_shared_cache_arm64e.01` and
+  `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e.01`.
+- `LFSMRegisterSessionOwner` is a login.framework client call to the `com.apple.logind` XPC service, invoking
+  `SMRegisterSessionOwner:reply:`. The returned integer 22 is logind's `EINVAL` response, not the XPC
+  transport status. The available trace establishes that owner registration was rejected; it does not
+  identify which request field logind rejects, nor prove this blocks creation of the login session. Treat it
+  as a failed session-owner endpoint registration; auto-login's independent credential/session creation path
+  must be checked separately before attributing the login failure to this result.
+- Added `tools/patch-macos27-security-cms.py`. It verifies the expected 26B123 bytes, patches the
+  lowered system cache subcache `.01` in place, refreshes its CodeDirectory page hashes, and supports
+  `--restore` (restore was checked against a copy and reproduced the original SHA-256 exactly).
+- Output: `outputs/dsc.01.security-patched`, 130,711,552 bytes, SHA-256
+  `004c09cf74e2722027e50f3facd24e56561a69e5d20ae71a53cd09b75ae2b29c`. Input archive member
+  `./System/Library/dyld/dyld_shared_cache_arm64e.01` in
+  `research/macos27/overlay/dsc-system-lowered-0.tar` has SHA-256
+  `76860d29a3bf679b9015909d588ee6906bb100525c9992d3ddd53bbc8ee38af7`.
+- In Security.framework `SecStaticCode::validateDirectory` (`0x18516a2f0`), the `CMSDecoderCopySignerStatus`
+  failure branch now tolerates only signer status 3 (`kCMSSignerInvalidSignature`) when the current
+  CodeDirectory platform byte (offset 38) is 27. The two CMS hash-agility mismatch branches are also
+  bypassed only for platform 27. Trampolines occupy verified, skipped NOP padding in the same cache
+  subcache. All other signer statuses and non-27 platform directories retain the original failure path.
+- The CMS blob, certificate trust evaluation, caller-supplied requirements, and CodeDirectory page/resource
+  validation are unchanged; only the four affected cache code pages have their hashes refreshed. This
+  lets Apple-signed platform binaries with the expected lowering-induced CMS/CD mismatch pass the binding
+  check while the later Apple signer/requirement checks still decide whether they are Apple code.
+- Install the patched subcache at both hard-link locations in the macOS root:
+  `/System/Library/dyld/dyld_shared_cache_arm64e.01` and
+  `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e.01`.
+  No phone files were changed.
+
+# macOS 27 GPU second pass (2026-11-20)
+- Rebuilt the macOS 27 bundle with `python3 work/UniXNU/scripts/build-turnip-darwin.py --target macos27`
+  and `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 work/UniXNU/scripts/build-adreno-metal-plugin.py --target macos27 --no-replay`.
+  The plugin build completed; the linker emitted only `ignoring duplicate libraries: '-lobjc'`.
+- Changed `build-adreno-metal-plugin.py` to use `build/prime-list-macos27.txt` for macOS and retain
+  `build/prime-list.txt` for iOS. This keeps the macOS paths out of later iOS builds. The macOS list
+  contains 434 `.metallib` paths and is embedded in `__DATA,__primelist`; QuartzCore’s cryptex library,
+  SkyLight’s shader library, and the root QuartzCore library lead the list. It is also packed as
+  `/System/Library/Extensions/NativeAdrenoMetal.primelist` for the plugin's sibling-file lookup.
+- `PrimeShaders.h` now writes a macOS-only `thread started` line before the 90-second delay and preserves
+  macOS list order. Before this, the first `prime.log` line was written only after the delay and library
+  enumeration; without a list file/embedded section, the fallback recursively scans protected system
+  trees. That makes a missing log at 150 seconds consistent with enumeration still running; it did not
+  by itself prove the thread was never launched. The new early line will distinguish those cases.
+- The archive miss is the Metal binary-archive path: the failed pipeline has an archive miss and the
+  compiler status remains `untried`, which means the strict miss returned before `codeGenRequest()` could
+  load MTLCompiler. `quartzcore_cache.mm` is our API test: it attaches an `MTLBinaryArchive` to the
+  descriptor and expects `MTLPipelineOptionFailOnBinaryArchiveMiss` to fail on a missing entry. Apple's
+  `default.pipelinelib` uses the separate `newPipelineLibraryWithFilePath:` SPI; the frontend currently
+  returns nil for that Apple-GPU-specific library (its implementation comment says the caller should
+  build pipelines from the shader library). The
+  runtime now logs the caller and URL when QuartzCore creates an `MTLBinaryArchive`, so the next macOS
+  log can identify the actual archive URL. For WindowServer only, and only for an archive created by
+  QuartzCore, the frontend clears `FailOnBinaryArchiveMiss`; this allows a missing QuartzCore entry to
+  go through runtime compilation. Other clients, non-QuartzCore archives, and iOS retain strict misses.
+- Lowered `NativeAdrenoMetal` (2,822 PAC words) and `libvulkan_freedreno.dylib` (11,522 words): 0 refused
+  in either binary. Re-signed the bundle ad hoc after lowering; `codesign --verify --strict` passes for
+  the bundle and dylib. Bundle CDHash: `e2158d7178d93882af675457dc1f494dd086bc6c`.
+- Packed the five bundle files, the 42,927-byte primelist, and empty publish marker into
+  `outputs/macos27-metal-box2.img` (40,026,624 bytes; 7 entries; SHA-256
+  `1952358a400de9ab68169bc855e49fbe10b2233868c5f3bb18ff9f5896e7be6a`). No phone install or kernel
+  image change was made.
+- macOS support the kernel/root still needs: create `/private/var/tmp/NativeAdrenoMetal.cache` before
+  WindowServer starts, owned by `_windowserver` (uid 88), mode `0755` (no group/other write; the plugin
+  intentionally does not create it); expose that cache read-only at
+  `/Library/GPUBundles/NativeAdrenoMetal.cache` for client processes; do not set `gpu-prime-system=0`
+  (that explicitly disables the shared cache). The primelist can be installed beside the bundle at
+  `/System/Library/Extensions/NativeAdrenoMetal.primelist`; the box contains that path and the same list
+  is embedded as a sandbox fallback. Runtime behavior still needs a macOS boot to confirm.
+
+# macOS 27 GPU first pass (2026-11-20)
+- Built the macOS SWEET kernel with `bash tools/mkmacos27kernel.sh` (PLATFORM=MacOSX,
+  `obj-macos27-sweet`, DEVELOPMENT ARM64 SWEET; plain arm64). The macOS-only `IOAccelerator`
+  base is guarded by `XNU_TARGET_OS_OSX`; the iOS `IOAcceleratorES : IOService` branch is unchanged.
+  No iOS kernel was rebuilt. `SweetAccelerator.cpp` still rejects Apple IOGPU open type 5; the
+  plugin uses `0x4147`.
+- Wrapped with `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`.
+  Args include `sweetmtl=3 sweetgpu=11 sweetfbgpu=1 rootrw=1 sweetwifid=1`; `sweetaccel` is
+  omitted and defaults on. `sweettime` refreshed.
+- Kernel: `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`,
+  SHA-256 `a6994449133f7197ccedbf2e6f6f7e498552ccb7a97830d630626c39f41fb4f9`.
+- Boot images: `outputs/guacamole-macos27-kernel.img`, SHA-256
+  `afb039c3b3682782ff9e2b98dd1a756be5473cafc9e431e2e5c9fd1b812eb4f8`; selector/triple image
+  `outputs/guacamole-menu-ios27-macos27.img` (49,422,336 bytes), SHA-256
+  `d7549c00eb469f881eeb623bb747f2b34124822c651fee884a9fc389632d0221`. Fastboot:
+  `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img`.
+- Built Turnip with `python3 scripts/build-turnip-darwin.py --target macos27` and built the
+  NativeAdrenoMetal macOS bundle under `work/UniXNU/build/adreno-metal-plugin-macos27/`.
+  The plugin command required `--no-replay`: the optional host replay checker fails to link newer
+  `NativeAdrenoPool*` / `NativeAdrenoPreempt*` symbols; no repository sources were changed to bypass it.
+  The pinned Rust 1.98 compiler was made visible via temporary wrappers in `/private/tmp/adreno-cargo-bin`.
+- Lowered both arm64e Mach-Os with `python3 research/ios26/tools/lower-macho.py`: `NativeAdrenoMetal`
+  2,817 words lowered, 0 refused; `libvulkan_freedreno.dylib` 11,522 words lowered, 0 refused.
+  Re-sealed the outer bundle ad-hoc after lowering; `codesign --verify --strict` passes for bundle
+  and Turnip dylib (4 KiB pages).
+- Verified `NativeAdrenoMetalDevice : IOGPUMetalDevice`; `IOGPUMetalDeviceShim.h` implements
+  `-acceleratorPort` by returning the stored service port. Bundle and Turnip are arm64e. macOS-specific
+  code selects `AGXAccelerator`, uses plain rows and disables framebuffer compression; iOS-only
+  QuartzCore address hooks are under `#if !TARGET_OS_OSX`. GPU runtime behavior remains untested.
+- Packed all bundle files plus the empty publish marker in `outputs/macos27-metal-box.img` (39,950,336
+  bytes, 6 entries; below 64 MiB), SHA-256 `a2047a02974eae9582e89550888d4bc70f5471c0e351b5aa8f9771eb766ea517`.
+  No phone install or flash was performed.
+
+# macOS 27: IOHIDSystem getService override (2026-11-20)
+- Rebuilt with `bash tools/mkmacos27kernel.sh`, then wrapped with
+  `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`. The macOS args keep
+  `rootrw=1 sweetwifid=1`; `sweettime` was refreshed. No source fixes were needed.
+- The cache disassembly confirms `_IOHIDCopyCFTypeParameter` at `0x184e74728`: it calls
+  `_IOConnectGetService` at `0x184e7475c`, then `cbz w0` at `0x184e74760` branches to the registry lookup when
+  the result is success (zero). A nonzero error falls through to the event-system call at `0x184e74770`
+  (function offset +0x48 / +72 bytes); `0x184e74774` is the return address after that call. The new user-client
+  `getService()` override returns `fOwner`, enabling that successful registry path.
+- Kernel build succeeded with no errors. `SweetHIDSystem.cpp` still reports four warnings: two generated zalloc
+  reserved-identifier warnings and two shared-memory cast-alignment warnings. The unstripped kernel has both
+  `HIDClickTime` and `HIDParameters set`. Its source is guarded by
+  `ARM64_BOARD_CONFIG_SWEET && XNU_TARGET_OS_OSX`; the KernelConfigTables personality is also OS X guarded,
+  so the iOS build path excludes this implementation. No iOS kernel rebuild was run.
+- Kernel: `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, 21,305,392
+  bytes, SHA-256 `3289b94399f9666aa98ddc222c53f3f063b3ec23caabe9c90d09af8ebda3fb87`.
+- Flashable selector image: `outputs/guacamole-menu-ios27-macos27.img`, 49,401,856 bytes,
+  SHA-256 `0694efa76c9627cb4d80e8e8c54a883bb56b96f57eb1589baa89025b6858f9b6`.
+- macOS-only payload: `outputs/guacamole-macos27-kernel.img`, 29,179,904 bytes,
+  SHA-256 `18a1f314657ddee7711301b3ec19a551d12fb9c24ca07f488fa09f3db3c3a0e5`.
+- Flash with `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img`.
+
+# macOS 27: IOHIDSystem HIDParameters registry fast path (2026-11-20)
+- Built the macOS 27 SWEET kernel with `bash tools/mkmacos27kernel.sh` (PLATFORM=MacOSX,
+  `BUILD/obj-macos27-sweet`, DEVELOPMENT ARM64 SWEET). The source change is in
+  `xnu/macos27/0008-iohidsystem-hidparameters.patch`; it publishes `HIDParameters` and the individual
+  properties before `registerService()`. Build succeeded with no errors; the iOS path remains excluded by
+  `#if defined(ARM64_BOARD_CONFIG_SWEET) && XNU_TARGET_OS_OSX` and the matching KernelConfigTables entry guard.
+- The unstripped kernel contains `HIDClickTime` and `HIDParameters set`. It is plain arm64. The source compiled
+  with four warnings in `SweetHIDSystem.cpp`: two reserved-identifier warnings from generated zalloc names and
+  two cast-alignment warnings for the shared-memory `EvOffsets`/`EvGlobals` casts. No source fixes were needed.
+- Wrapped with `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`; generated macOS
+  boot args retain `rootrw=1 sweetwifid=1` (and use `ufsroot=macos`).
+- Kernel: `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, 20 MiB,
+  SHA-256 `c8790d85302349d71959135b0b04062e4b6fb8295506c419db6d21aaae5645fa`.
+- Flashable selector image: `outputs/guacamole-menu-ios27-macos27.img`, 47 MiB,
+  SHA-256 `759421a9f331bf7aff1a282dedd10d09fde27c9ef828e2d3013c5aa14e55a714`.
+- macOS-only payload: `outputs/guacamole-macos27-kernel.img`, 28 MiB,
+  SHA-256 `775df9c6f149a3e1a3698b09c17301a8d9107c66d284d91f6b1245d755e1a1bd`.
+- Flash the selector image with `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img`.
+
+# macOS 27: WindowServer runs; blocked in TimeSync (clocksyncd) (2026-11-20, Claude)
+- 0006 works: "SWEET HIDSystem: WindowServer opens connect type 0", selector 0 (createShmem, version 4); WindowServer
+  stays up (status 0). Then "Initializing CAWindowServer... / Apple display manager unsupported" and silence.
+- sample WindowServer: main thread in -[CAWindowServer _init] -> CAWindowServerDisplayExternalSyncManager ->
+  DisplayExternalSyncObserver startObservingSSAMDevices -> +[TSSyncEntityManager sharedSyncEntityManager] ->
+  synchronous NSXPC reply from com.apple.timesync.expositor, forever.
+- That service is com.apple.clocksyncd (running): "TSDDaemon waiting for daemon service to become available" = an
+  IOKit IOTimeSyncDaemonService (IOTimeSyncFamily kext; then IOTimeSyncClockManager, gPTP manager). It never comes, so
+  clocksyncd never answers. Test: take clocksyncd out (launchctl bootout) so the XPC call fails at once.
+
+# macOS 27: IOHIDSystem stand-in, round 1 (2026-11-20, Claude) -- source, not built
+- xnu/macos27/0006-iohidsystem-standin.patch: iokit/Kernel/arm/hid/SweetHIDSystem.cpp (SWEET + XNU_TARGET_OS_OSX
+  only) + files.arm64 + a KernelConfigTables personality (IOClass IOHIDSystem on IOResources, OSX only). Service
+  "IOHIDSystem"; IOServiceOpen types 0/1/3 -> one user client that accepts every external method (zeroed outputs,
+  first 3 calls per type/selector logged "SWEET HIDSystem: ..."); clientMemoryForType(0) = EvOffsets + EvGlobals
+  (version 4, structSize = sizeof(EvGlobals) from our IOHIDShared.h, empty lleq ring) + 4 KiB private zone.
+  Purpose: get WindowServer past "IOHIDSystem not found" and log what it calls next (ssh guacmac dmesg).
+- SDK headers read from /Library/Developer/CommandLineTools/SDKs/MacOSX27.2.sdk (IOKit hidsystem): connect types
+  0 server, 1 param, 3 event system; kIOHIDGlobalMemory 0; shmem version 4 (3 last compatible).
+
+# macOS 27: cfprefsd fixed (0005); WindowServer needs IOHIDSystem (2026-11-20, Claude)
+- After 0005: cfprefsd runs, sw_vers / log show work. launchctl list non-zero: WindowServer 1, mobileactivationd -5,
+  iomfb_fdr_loader 1, iomfb_bics_daemon -11, digest-service 1, security.xprotectd 1, endpointsecurityd 35.
+- WindowServer (log show): "Server is starting up" -> "IOHIDSystem not found e00002be" -> "Cannot open the HID and
+  display/cursor system." -> exit 1, every 10 s. IOHIDSystem is a macOS-only IOHIDFamily class (kext on a Mac); our
+  kernel's HID (iokit/Kernel/arm/hid) is the iOS event-service path only. Next: a SWEET IOHIDSystem stand-in for
+  macOS (service + user clients + the shared event/cursor memory WindowServer maps), from Apple's open-source
+  IOHIDFamily (APSL) as reference. The GPU comes after that.
+- mobileactivationd: BootPolicy "SEP command 38 returned 2", "Failed to retrieve OIC" (no SEP), Activation State
+  Unactivated, then crashes (-5). Needed later for login/setup; not for WindowServer.
+
+# macOS 27: SSH in over Wi-Fi; cfprefsd = missing Quarantine policy (2026-11-20, Claude) -- fix in source
+- MILESTONE: `ssh guacmac` (root by key) works on macOS 27.2 26B123 (default route added by sweet-diag.sh v4).
+  Root /dev/ufsroot0 hfs rw, 16 GB free. launchctl list: only WindowServer 1, iomfb_bics_daemon -11,
+  digest-service 1, cfprefsd 254, endpointsecurityd 35 fail. Anything reading preferences (sw_vers, log show) hangs.
+- cfprefsd by hand: silent exit 254. Its strings: "Failure to configure quarantine: qtn_proc_apply_to_self() failed.
+  Exiting daemon." qtn_proc_apply_to_self is __mac_syscall("Quarantine", ...); no Quarantine policy without the kext.
+- Fix: xnu/macos27/0005-quarantine-policy-standin.patch (bsd/kern/sweet_amfi.c, XNU_TARGET_OS_OSX only): a
+  "Quarantine" MAC policy whose policy_syscall returns 0 for everything (first 32 calls logged "SWEET Quarantine").
+
+# macOS 27: Wi-Fi joins and gets its lease; no ping -> no route (2026-11-20, Claude)
+- With rootrw=1 the box installed the macOS wland: joined GuestConnect (WPA2), DHCP ACK 172.28.200.71/255.255.248.0,
+  router 172.28.207.252, utun0 configured; "netsvc -> No such file" (iOS-only). Packets reach the IP side (rx 26..68),
+  only 6 sent: replies have no route (no configd service on macOS, so no default route).
+- sweet-diag.sh v3: once a utun has an address and there is no default route, `route -n add default -interface utunN`
+  (console line "SWEET DIAG: default route -> ..."); also prints the routes each round; runs 40 rounds (20 min).
+  Lasting fix later: a macOS netsvc (SystemConfiguration) or the route from wland itself.
+
+# macOS 27: SWEETBOX root installs did nothing -> rootrw=1 for macOS (2026-11-20, Claude)
+- Boxes with ROOT/private/var/local/bin/{wland,sweet-diag.sh}: the late pass logged "1 file(s) to extract; done, 0/0
+  files, 0/1 root files" and the old files stayed. mkmacos27boot.sh dropped rootrw=1 (written before a macOS root
+  existed), so the root was read-only at bsd_init and the root pass could write nothing (vfs_subr.c: rootrw=1 is
+  what mounts the SWEET root read-write from the start). rootrw=1 is kept for macOS now (boot image only).
+- The wland box was never installed either: wland reached the radio ("radio: stats: state 0") and waited for wifid.
+
+# macOS 27: our jobs run; wland waits for an iOS wifid that macOS does not have (2026-11-20, Claude)
+- SWEET DIAG works: wland running (rmtfs writes), inet only 127.0.0.1; cfprefsd: runs 11, last exit code 254 (the
+  console's "status -2"). Kernel GPU now finds its firmware: "Adreno 640 backend published (RedwoodGPU)".
+- With boot-arg sweetwifid=1 wland opens /dev/wlan and leaves joining to wifid (bridge_joins) -> never joins on macOS.
+  wland.c: WLAND_NO_BRIDGE skips the bridge (wlan.conf join + DHCP on its utun); the macOS job sets it. iOS unchanged.
+- Tried sweetwifid=0 for macOS (boot image only): Qualcomm CrashDump right after wland's modem power votes (rpmh
+  mss.lvl, pmem alloc for pid 80); with sweetwifid=1 the modem had come up (rmtfs running). Reverted: macOS keeps
+  sweetwifid=1 and gets the WLAND_NO_BRIDGE wland through a box (ROOT/private/var/local/bin/wland, rawdump).
+
+# macOS 27: jobs in /Library/LaunchDaemons never run -> into launchd's job cache (2026-11-20, Claude)
+- Boot with the extras: files all present in the image (checked in macos27-root.cdr), but no "SWEET WLAND: starting"
+  and no "SWEET DIAG" on the console: launchd never started /Library/LaunchDaemons jobs (macOS 27 reads its daemons
+  from /System/Library/xpc/launchd.plist, 918 jobs + SystemLibraryTreeState; third-party ones come later, if at all,
+  probably through Background Task Management, which needs the cfprefsd that is looping). Also seen: init_featureflags
+  SIGABRT (tolerated now), IOMFB_bics_daemon SIGSEGV, WindowServer exit 1, cfprefsd -2 loop.
+- macos27-extras.sh now writes com.sweet.wland / com.sweet.diag to /System/Library/LaunchDaemons and adds them to
+  launchd.plist's LaunchDaemons (as mkios27root does on iOS); ssh.plist's Disabled is cleared there too.
+
+# macOS 27 with NVRAM: no panic; loop continues; GPU firmware missing; no sign of wland (2026-11-20, Claude)
+- 0004 (NVRAM) works: kernelmanagerd no longer dies. Still: cfprefsd exit -2 loop, WindowServer exit 1,
+  digest-service 1, endpointsecurityd 35, IOMFB_bics_daemon SIGSEGV. Kernel GPU stage 1: a640_gmu.bin, a630_sqe.fw,
+  a640_zap.* missing (the macOS root had no /usr/standalone/firmware/sweet). Touch, haptics, camera probe fine.
+  No "SWEET WLAND" line in the photos.
+- tools/macos27-extras.sh now: GPU firmware; the wland job runs through /bin/sh and prints "SWEET WLAND: starting";
+  com.sweet.diag prints every 30 s (from 45 s) the newest wland lines, the inet addresses and launchd's view of
+  cfprefsd ("SWEET DIAG n: ..."). Apply with tools/macos27-patch-cdr.sh.
+
+# macOS 27 boot video: NVRAM missing kills kernelmanagerd/kmutil (2026-11-20, Claude) -- fix in source
+- "kernelmanagerd/NVRAM.swift:123: Fatal error: NVRAM isn't supported on this system" -> kernelmanagerd and kmutil
+  crash (SIGTRAP). The SWEET platform expert never publishes /options (no NVRAM controller; ADT has no /options).
+- Fix: xnu/macos27/0004-nvram-options-node.patch (SweetPlatformExpert::processTopLevel, XNU_TARGET_OS_OSX only): an
+  empty /options DT node, then the stock publishNVRAM() -> IODTNVRAM. In-memory only, nothing persists.
+- First try panicked: "IONVRAMCHRPHandler creation failed" (IONVRAM.cpp:1602; getNVRAMProperties: no
+  nvram-bank-size in /chosen). 0004 now also puts iBoot's /chosen keys there when missing: nvram-bank-size 0x10000,
+  -bank-count 1, -current-bank 0 and nvram-proxy-data = an empty v1 CHRP image ("nvram" header, "common" 0x7fd0,
+  "system" 0x7ff0, adler32 from the generation field), checked against the handler's rules in a Python model.
+- Also seen, not acted on: "dyld_shared_cache_arm64e.NN: not in trust cache" for every subcache, then "dyld cache
+  mapped system-wide" (mapping works); WindowServer exit 1 (expected: no macOS Metal driver yet); cfprefsd exit -2
+  loop; prng_seedctl exit 13 (no saved seed); tzinit no data; sysstatuscheck 1; "Early boot complete. Continuing
+  system boot." reached.
+
+# macOS 27: daemons loop (cfprefsd -2, endpointsecurityd 35, digest-service 1); Wi-Fi + SSH added (2026-11-20, Claude)
+- Boot passes the Boot tasks; launchd starts daemons; cfprefsd exits status -2 and endpointsecurityd 35 again and again
+  (respawn loop), plus many harmless "triggered unnest of range ... DYLD shared region" warnings. No shell to see why.
+- Way in: userland/build-macos.sh builds wland for macOS (out/macos/wland; plain C, no frameworks). wland/ipnet.c now
+  also prints the DHCP lease to /dev/console ("SWEET WLAND: Wi-Fi up, utunN address A ... ssh root@A").
+  tools/macos27-extras.sh ROOT installs wland + modem/rmtfs firmware + wlan.conf + /Library/LaunchDaemons/
+  com.sweet.wland.plist, root's authorized_keys, fixed host keys (research/macos27/ssh_host_keys, made once) and
+  enables macOS's sshd (ssh.plist, com.openssh.sshd) in /var/db/com.apple.xpc.launchd/disabled.plist.
+  mkmacos27root-mac.sh calls it; tools/macos27-patch-cdr.sh applies it to the existing .cdr (hdiutil rw) + hfs2simg.
+- Same Wi-Fi MAC as iOS (from the radio), so DHCP likely gives the iOS address again. netsvc (configd/DNS) is iOS-only:
+  on macOS its spawn just fails and is logged.
+
+# macOS 27: past FIPS; init_featureflags aborts -> launchd panics; Boot tasks made tolerant (2026-11-20, Claude)
+- Next boot: "init_featureflags[17] exited -- exit reason namespace 2 subcode 0x6" (SIGABRT). Boot.init_featureflags
+  has no AllowCrash, so its crash panics. Without a shell the reason is unknown.
+- launchd-fips-noverify.py --tolerant: every Boot task gets AllowCrash and loses RequireSuccess (38 of 46 changed), so
+  failures are logged and the boot continues; mkmacos27root-mac.sh uses it. Revisit once there is SSH: each failing
+  task should be fixed and its RequireSuccess restored where it matters. Existing macos27-root.cdr patched in place again.
+
+# macOS 27: past fsck; cc_fips_test exits -2074 -> launchd panics (2026-11-20, Claude)
+- With the 0003 kernel: fsck passed, Boot tasks ran (MobileAssetEarlyBootTask log on screen), then "cc_fips_test[12]
+  exited -- (signal 0, exit status -2074)": Boot.fips is RequireSuccess, the same FIPS integrity failure as iOS (lowered
+  corecrypto). The root script's launchd step had skipped: macOS 27.2 /sbin/launchd is FAT (arm64e subtypes
+  0x80000002 and 0x8000000c, each with __config), launchd-fips-noverify.py only took thin files.
+- Fix: launchd-fips-noverify.py patches every arm64 slice of a fat file; mkmacos27root-mac.sh passes
+  --no-reboot-task sysstatuscheck too (it has RebootOnSuccess, as on iOS). Existing research/macos27/macos27-root.cdr
+  patched in place (/sbin/launchd: one extent, block 3124959, contents checked equal to the lowered overlay first);
+  the .simg must be regenerated with tools/hfs2simg.py.
+
+# macOS 27 root mounts, launchd runs; fsck_hfs panics in sweet_ufs_strategy (2026-11-20, Claude) -- fix in source
+- With research/macos27/macos27-root.simg on `macos`: root mounted, launchd started, pid 3 fsck_hfs (macOS checks a
+  non-APFS root at boot) read /dev/rdisk -> panic "Kernel data abort" (esr 0x9600004f: write, permission fault) in
+  memmove <- sweet_ufs_strategy+0x1ec <- physio <- spec_read <- read. Kernel slide 0 (symbols from
+  BUILD/obj-macos27-sweet/.../kernel.development.sweet.unstripped).
+- Cause: physio's B_PHYS buffer carries the caller's user address; buf_map returns it unchanged and the strategy
+  memcpy'd to it from the kernel (PAN). iOS never did raw disk reads.
+- Fix: bsd/dev/sweet_ufs.c uses copyout/copyin for B_PHYS buffers (physio calls the strategy in the caller's thread,
+  pages wired); xnu/macos27/0003-sweet-ufs-raw-io-copyout.patch. Same file is in the iOS kernel: harmless there.
+
+# macOS 27.2 arm64e userland lowering (UniversalMac_27.2_26B123_Restore, 2026-11-20)
+
+Unpacked and decrypted the OS, SystemOS and AppOS volumes from the Universal Mac restore IPSW for the
+Guacamole/Kryo 485 arm64 target (no FEAT_PAuth). The original IPSW, extracted AEA payloads and source tars
+remain under ignored `research/macos27/`; no root image was assembled and the phone was not touched. The
+SystemOS arm64e cache is in `System/Library/dyld/dyld_shared_cache_arm64e*` (not the iOS
+`com.apple.dyld` path). `ipsw dyld info` reports NewFormatTLVs, 4,115 images and 81 subcaches. The
+DriverKit cache has 66 images and no subcaches.
+
+Archive creation (after `ipsw fw aea` decrypted the OS and SystemOS `.aea` files; AppOS is a plain DMG):
+```
+# Extract from the IPSW ZIP into research/macos27/ (the component paths are listed in BuildManifest.plist):
+python3 - <<'PY2'
+import zipfile
+ipsw='research/macos27/UniversalMac_27.2_26B123_Restore.ipsw'
+with zipfile.ZipFile(ipsw) as z:
+    for name in ('141-12228-170.dmg.aea','141-12293-172.dmg.aea','141-12233-175.dmg'):
+        with z.open(name) as src, open('research/macos27/'+name, 'wb') as dst:
+            while b := src.read(8 << 20): dst.write(b)
+PY2
+ipsw fw aea research/macos27/141-12228-170.dmg.aea -o research/macos27
+ipsw fw aea research/macos27/141-12293-172.dmg.aea -o research/macos27
+mkdir -p research/macos27/mnt/{os,systemos,appos}
+hdiutil attach -readonly -nobrowse -mountpoint research/macos27/mnt/os research/macos27/141-12228-170.dmg
+hdiutil attach -readonly -nobrowse -mountpoint research/macos27/mnt/systemos research/macos27/141-12293-172.dmg
+hdiutil attach -readonly -nobrowse -mountpoint research/macos27/mnt/appos research/macos27/141-12233-175.dmg
+bash research/macos27/archive-volumes.sh
+# The archive script uses sudo tar --format pax --mac-metadata --acls --xattrs; then detach the three images.
+hdiutil detach research/macos27/mnt/os
+hdiutil detach research/macos27/mnt/systemos
+hdiutil detach research/macos27/mnt/appos
+```
+
+Source archive sizes: OS root 22,600,830,464 bytes; SystemOS cryptex 7,696,975,360 bytes; AppOS cryptex
+52,854,272 bytes. All three passed `tar -tf ... >/dev/null` integrity checks. Counts came from
+`python3 research/ios26/tools/macho-census.py <tar> <out.tsv>`; PAC census used
+`python3 research/ios26/tools/pac-census2.py` for caches and the macOS local tar lowerer for volume slices.
+Mach-O census before lowering:
+
+| Volume | Mach-O files | Fat files | arm64e subtype 2 slices | arm64e ABI-v2 subtype 12 slices |
+| --- | ---: | ---: | ---: | ---: |
+| OS root | 5,292 | 5,196 | 5,166 | 5,034 |
+| SystemOS cryptex | 81 | 21 | 60 | 0 |
+| AppOS cryptex | 30 | 30 | 29 | 30 |
+
+Volume lower/overlay and validation commands:
+```
+python3 research/macos27/lower-tar-macos.py research/macos27/os-root.tar research/macos27/low-os-root lower 300
+python3 research/macos27/lower-tar-macos.py research/macos27/systemos-cryptex.tar research/macos27/low-systemos-cryptex lower 300
+python3 research/macos27/lower-tar-macos.py research/macos27/appos-cryptex.tar research/macos27/low-appos-cryptex lower 300
+python3 research/macos27/lower-tar-macos.py research/macos27/os-root.tar research/macos27/low-os-root overlay research/macos27/overlay/os-root-lowered.tar
+python3 research/macos27/lower-tar-macos.py research/macos27/systemos-cryptex.tar research/macos27/low-systemos-cryptex overlay research/macos27/overlay/systemos-cryptex-lowered.tar
+python3 research/macos27/lower-tar-macos.py research/macos27/appos-cryptex.tar research/macos27/low-appos-cryptex overlay research/macos27/overlay/appos-cryptex-lowered.tar
+# Repeat lower against each *-lowered.tar into a fresh verify-* directory; it found no new convertible PAC words.
+```
+
+The macOS SDK also contains arm64e ABI-v2 subtype 12. I made an ignored, local copy
+`research/macos27/lower-tar-macos.py` of the iOS tar lowerer and expanded its slice filter to subtypes 2 and
+12; no shared/iOS lowerer was edited. It uses the same `zeta_userland_pauth.py` lowering routine and keeps
+original signatures’ CodeDirectory page hashes refreshed. Volume lowering results: OS root 5,292 inspected,
+5,057 changed, 19,281,625 PAC words lowered, 0 refused; SystemOS standalone 81 inspected, 58 changed,
+141,006 lowered, 0 refused; AppOS 30 inspected, all 30 changed, 26,175 lowered, 0 refused. The second
+pass over each lowered volume overlay inspected 5,057 / 58 / 30 Mach-Os respectively and found 0 further
+lowerable PAC words and 0 refused instructions.
+
+Cache lowering commands (system cache processed in resumable 500-image ranges through image 4,115):
+```
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-system research/macos27/dsc-system-arm64 copy
+for START in 0 500 1000 1500 2000 2500 3000 3500 4000; do
+  END=$((START + 500)); test "$END" -le 4115 || END=4115
+  python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-system research/macos27/dsc-system-arm64 lower "$START" "$END"
+done
+python3 research/ios26/tools/lower-stubs.py research/macos27/dsc-system-arm64 apply
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-system research/macos27/dsc-system-arm64 sign
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-driverkit research/macos27/dsc-driverkit-arm64 copy
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-driverkit research/macos27/dsc-driverkit-arm64 lower 0 66
+python3 research/ios26/tools/lower-dsc.py research/macos27/dsc-driverkit research/macos27/dsc-driverkit-arm64 sign
+python3 research/macos27/dsc-overlay-system.py research/macos27/systemos-cryptex.tar research/macos27/dsc-system-arm64 research/macos27/overlay/dsc-system-lowered
+python3 research/macos27/dsc-overlay-driverkit.py research/macos27/systemos-cryptex.tar research/macos27/dsc-driverkit-arm64 research/macos27/overlay/dsc-driverkit-lowered
+```
+
+System cache: 31,533,961 PAC instructions lowered across 8,194 code sections / 4,115 images; 563,597 stub
+island `BRAA X16,X17` instructions changed to `BR X16` across 37 cache files. CodeDirectory page hashes
+were refreshed in 82 system-cache files. DriverKit cache: 144,234 PAC instructions lowered across 129 code
+sections / 66 images; one cache file had its CodeDirectory hashes refreshed. Post-lowering PAC census found
+0 convertible PAC instructions and 0 remaining stub-island matches in either cache. It found one refused
+instruction in each cache; both are the same `LDRAB` encoding that has no exact one-word lowering:
+
+- System: `/usr/lib/system/libsystem_m.dylib`, `__text` VA `0x2ce01d518`, word `0xf8e397b6` — `ldrab offset -3640 fits no ordinary load`.
+- DriverKit: `/System/DriverKit/usr/lib/system/libsystem_m.dylib`, `__text` VA `0x181028ab8`, word `0xf8e397b6` — `ldrab offset -3640 fits no ordinary load`.
+
+Those two words remain untouched. Volume overlays are `research/macos27/overlay/{os-root,systemos-cryptex,appos-cryptex}-lowered.tar`
+(5.60 GiB / 21.5 MiB / 12.8 MiB respectively). Cache overlays are `dsc-system-lowered-0.tar` through
+`dsc-system-lowered-5.tar` (6.72 GiB total) and `dsc-driverkit-lowered-0.tar` (24.4 MiB). System and
+DriverKit `.atlas` data is included; `.map` and `.symbols` metadata is not overlaid. Apple CMS signatures are not re-signed; CodeDirectory page hashes were refreshed. The iOS 27.2 x86_64
+cache was left untouched. No combined macOS root image was built.
+
+# macOS 27 kernel, first boot: physmap_end assertion in arm_vm_init (2026-11-20, Claude) -- fix in source, not built
+- Panic (photo): SWEET EARLY 7 entering arm_vm_init, then arm_vm_init.c:1643 assert (temp_ptov_table[ptov_index-1].va +
+  .len) <= physmap_end. MacOSX builds get ARM_LARGE_MEMORY (makedefs/MakeInc.def); with no PPL that path sets
+  physmap_end = physmap_base + real_phys_size, no room for ARM64_GRANULE_ALLOW_BLOCK moving each ptov region up to a
+  twig (32 MiB) so VA and PA offsets match. Fine on Apple's VMs, not here.
+- Fix: xnu/macos27/0002-physmap-end-block-room.patch (already applied to work/xnu-12377): under
+  ARM64_BOARD_CONFIG_SWEET the ARM_LARGE_MEMORY non-PPL physmap_end gets + PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE, as the
+  !ARM_LARGE_MEMORY case. iOS builds are not ARM_LARGE_MEMORY: unchanged.
+
+# iOS 27 Bluetooth loop: BlueTool profile alias was missing from the root (2026-11-20, Claude)
+- Fresh root: BlueTool picks fwPos 62 (D73's own BCM4387C2/PCIe row), sees the bridge's BCM4357B1, logs "HCD file
+  corrupt!", then "no firmware for this platform ... BCM4357B1 USI"; Settings restarts Bluetooth forever. The old root
+  had tools/patch-bluetool27-profile.py applied by hand (2026-11-15, research/ios27.2/bluetooth/d73-profile-bridge.md).
+- The legacy BCM4357B1 rows carry their HCD inside BlueTool (row +48 data pointer, Tuborg USI 162013 bytes), so the
+  file under /usr/share/firmware/bluetooth is never read for them; the stand-in .hcd files are not needed.
+- patch-bluetool27-profile.py now refreshes the CodeDirectory page hashes itself (no codesign, entitlements kept), and
+  mkios27root-mac.sh runs it on $R/usr/sbin/BlueTool. Live phone: outputs/ios27-bluetooth/BlueTool + outputs/bt-fix.sh.
+
+# iOS 27 root script audit: everything the old phone root had by hand (2026-11-20, Claude)
+- A fresh 80g root came up with Setup, no GPU, no Bluetooth, no Wi-Fi IP, no Cellular row: the old root had been fixed
+  by hand (boxes, SSH, mgtool, launchd-*.py) and tools/mkios27root-mac.sh never got those changes. Audited NOTES from
+  the start of iOS 27 and the last launchd.plist pulled from the phone (outputs/launchd.plist.nocamera, 11-19 14:57):
+  its job differences against the fresh image are exactly btbridge, spinwatch, bootlog added and PerfPowerServices
+  removed. The script now installs (files in tools/ios27root/, binaries from userland/out, GPU bundle from the plugin
+  build folder): Setup-skip prefs; CoreAnimation no deep/compressed framebuffer prefs (backboardd + global) + en-US;
+  SystemConfiguration preferences.plist with the en0 Wi-Fi service; NativeAdrenoMetal.bundle + .publish +
+  .primelist; sweet-rs-atcall, sweet-rotate-flip, gnss.on (unlock=all); btbridge, spinwatch, bootlog, mgfix jobs;
+  tsample, ptop, oslog, mgtool; sweet-mgfix (MobileGestalt: WifiVendor USI, HasBaseband, cellular-data, telephony,
+  CellularTelephonyCapability, haptics x2, ringer-switch, ArtworkDeviceSubType 1792, ArtworkDeviceScaleFactor 2 -
+  reboot once after the first boot); PerfPowerServices dropped. wland/netsvc/etc. in the old 07:24 root were already
+  byte-identical to userland/out. Left out on purpose: the synthetic camera (cameracaptured stays removed; its
+  AVCaptureSession.plist edits not carried), bars.conf (user's own text).
+- Rule from now on: anything installed on the phone by hand goes into mkios27root-mac.sh in the same change.
+
+# iOS 27 root flash: the .simg was wrong (2026-11-20, Claude) -- fixed converter, re-flash pending
+- Symptom: after flashing research/ios27.2/ios27-root-80g.simg, iOS 27 panicked "initproc failed to start -- exit
+  reason namespace 2 subcode 0xb" (launchd SIGSEGV at pc 0x1000000000100, no shared region mapped).
+- Cause: the .simg (generic converter) marked all-zero 4 KiB blocks "don't care" even where HFS uses them (zero pages
+  inside dyld, the allocation bitmap, catalog/attribute nodes), and it does not match the final .cdr (catalog nodes
+  2005/2045 hold data in the .cdr but are "don't care" in the .simg). fastboot skips "don't care", so the old system's
+  blocks stayed: dyld blocks 190+ held old plist text, bitmap blocks 3-4 the old bitmap. The user was right that the
+  image was the problem; I first blamed the flash path (wasted runs: two fastboot flashes, the gzip pipe, a plain dd).
+- FIX: tools/hfs2simg.py builds the .simg from the .cdr using the HFS+ allocation bitmap: used blocks always written
+  (RAW, or FILL 0 when zero), free blocks "don't care". Test on the first 300,000 blocks: every used block correct,
+  none left as "don't care". Lesson: never ship a root .simg from a converter that drops zero blocks; and a verify
+  that hashes whole MiB windows cannot tell "not written" from "zero blocks skipped".
+- Side finding: fastboot "Writing ... OKAY [0.003s]" per piece is normal on this ABL (data is written as it arrives).
+
+# macOS 27 kernel, first build (2026-11-20, Claude) -- scripts ready, Codex builds
+- BUILD RESULT (2026-11-20): kernel build completed from branch `ios27` at `11bf5c2` (the requested `1aefafb`
+  is its ancestor). `bash tools/mkmacos27kernel.sh` produced
+  `work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, 21,280,088 bytes,
+  SHA-256 `4d6058e92a19e7d6dee9ad5abe302c5f044b16e6604877ded54b92041d41b10c`; cputype `0x100000c`, subtype 0
+  (plain arm64). Xcode's macOS 27.2 SDK has no `availability.pl`; the build script now defaults to
+  `tools/macos27-availability-versions.py`, which reads version defines from the selected SDK header. The script
+  stages `BUILD/sdk-macos27` separately from the iOS SDK and supplies its macOS 27.2 `libfirehose_kernel.a` from
+  `work/xnu-local-latest/dxb/fakeroot`; this fixed the initial platform-mismatch link failure without changing
+  the iOS SDK.
+- macOS-only source fix: `bsd/kern/syscalls.master` now exposes `pid_hibernate` only for embedded targets or
+  SWEET non-macOS targets. macOS gets `nosys`, matching the existing `#if !XNU_TARGET_OS_OSX` implementation
+  guard; iOS's `CONFIG_EMBEDDED` path remains enabled. Saved as
+  `xnu/macos27/0001-disable-pid-hibernate-on-macos.patch`. This fixed the unresolved `_pid_hibernate` link.
+  The kernel make target actually emits `kernel.development.sweet` (not `mach.development.sweet`), so the
+  macOS build and boot scripts now use that output name.
+- Shim rebuilt with `PATH=/private/tmp/guac-llvm18-cross:$PATH BOARD=guacamole sh shim/build.sh` (the host lacks
+  `aarch64-linux-gnu-gcc`; the LLVM 18 wrapper also links the small freestanding `strcmp` helper). Current
+  `shim/out/Image`: 3,498,048 bytes, SHA-256 `ad12995d6a74f50002171480e00c57b87455a18e8ba79639a98c985be55a9d4f`.
+- `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img` succeeded. Boot args printed:
+  `keepsyms=1 -v debug=0xc serial=3 cpus=8 bingrade=0x100000c:2 sweettouch=1 sweetkeys=1 sweetusb=1 wdt=-1 sweettime=1795161842 rd=ufsroot0 ufsroot=macos unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 launchd_unsecure_cache=1 sweetgpu=11 sb=2 sweetpmem=1 sweetwifid=1 guacwifi=wlfw sweetfb_hz=60 sweetmtl=3 sweetcpufreq=3 sweetfbgpu=1 sweetfbatswap=1 sweetfb_hwvsync=1 sweetaudio=0 sweetmailbox=1 sweetboxroot=1 sweetboxpart=rawdump validation_disables=0x10 sc=1 sweetfb_scale=2 tu-cb=1 sweetcamhw=1 thid_should_crash=0 sweetpasscode=1 sweetabp=3`
+- `mkmenuboot.py` output: macOS kernel image 29,155,328 bytes, SHA-256
+  `571c0526b8060fc01d3e8c0487e2bd8f54845a9969808764c3aa7e9a42feb1bb`; menu image 49,377,280 bytes, SHA-256
+  `6f73c3a58588607b23729e98194d26edcc645aad8e60f6afdc53444443f6517b`. Payloads: iOS 27 20,221,248 bytes,
+  macOS 27 21,390,144 bytes; combined ramdisk 41,612,096 of 48,234,496 bytes (below the 46 MiB limit).
+  Images are built only; nothing was flashed.
+- Goal: see how far the macOS kernel gets on the phone, before any macOS userland. Same work/xnu-12377 tree as iOS 27,
+  built with the macosx SDK (PLATFORM=MacOSX -> XNU_TARGET_OS_OSX) and xnu/macos27/MASTER.arm64.sweet.MacOSX
+  (Apple's MacOSX config with the SWEET changes: nos_arm_asm/nos_arm_pmap, sweet_hfs, no CPU counters; doconf
+  prefers MASTER.arm64.sweet.MacOSX over MASTER.arm64.sweet). Objects: BUILD/obj-macos27-sweet (iOS build untouched).
+- tools/mkmacos27kernel.sh builds it (log work/xnu12377-macos27-build.log). Source fixes for macOS only go under
+  #if XNU_TARGET_OS_OSX so the iOS kernel still builds.
+- REBUILD (2026-11-20): applied the SWEET-only `physmap_end` block-room change in
+  `work/xnu-12377/osfmk/arm64/arm_vm_init.c` (patch `xnu/macos27/0002-physmap-end-block-room.patch`).
+  `bash tools/mkmacos27kernel.sh` succeeded; plain arm64 (cputype `0x100000c`, subtype 0), 21,280,088 bytes,
+  SHA-256 `7de63bf0232ea21065408739366ca70aaa5ee3c5b8f37d65e58310a7fcf75aeb`. Rewrapped with
+  `bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img`: packaged macOS kernel image
+  `outputs/guacamole-macos27-kernel.img`, 29,155,328 bytes, SHA-256
+  `36e9618874c635a5e4f3aaeb0bfbf0205eba4a71acec07234c4dffa9ea6bf771`; menu image
+  `outputs/guacamole-menu-ios27-macos27.img`, 49,377,280 bytes, SHA-256
+  `233063f5b435f8dbd8c36602e6c848ec6ff5c86d41345b0e3f02a391d7c898ca`. Combined ramdisk is 41,612,096 bytes
+  of 48,234,496 (under the 46 MiB limit). No iOS kernel rebuild or modification.
+- tools/mkmacos27boot.sh IOS27.img: ADT and boot-args from the iOS 27 image (ufsroot=macos, no rootrw, console on
+  screen, -v), then outputs/guacamole-menu-ios27-macos27.img. `macos` starts mid-way through the old iOS 16 image,
+  so no HFS volume header is expected there: the kernel should stop at the root mount. Log: PART=macos.
+
+# Partition split: iOS 16 removed, ios27 + macos (2026-11-20, Claude) -- table written, images pending
+- GPT gpt-new2 written from recovery and read back (sha256 head e55ee144..., tail 1c4032f7...): entry 20 `ios26`
+  -> `ios27` 18723208-40065671 (81.42 GiB, same start and unique GUID); entry 19 `ios` (iOS 16) -> `macos`
+  40065672-61408250 (81.42 GiB, new unique GUID); 61408251-61409274 (4 MiB) left unallocated. A `bootmem`
+  entry there (gpt-new, -new3 32 MiB, -new4 in front of ios27) made ABL fastboot hang every time: fastboot
+  stops working at 119 partitions in total, 118 is fine. Tables local only in outputs/gpt-*.
+- Boot menu (shim, 2026-11-20): iOS 27 / macOS 27 / Android, no slider, default = last choice kept in the
+  first block of that free 4 MiB (shim/ufs.c ufs_bootmem_*, a fenced SCSI WRITE(10) that checks the GPT
+  first); tools/mkmenuboot.py replaces mktripleboot.py (iOS 27 payload first, macOS optional).
+- Menu pictures + Restart / Power off (2026-11-20): user's PNGs shim/art/src -> tools/mkmenuart.py -> 600x600
+  RGB shim/art/*.bin, linked last (.menuart after the stacks; inside .rodata the adr in start.S to _sec_stacks
+  overflowed). Shim Image 3.48 MB (was 0.23); mkmenuboot limit 46 MiB. Built clean on the device VM (gcc
+  aarch64, no ABS64 in C objects, icon bytes verified in the Image); not run on the phone yet.
+- Menu drawing speed (2026-11-20): the menu now runs with the milestone-3 MMU on (mmu_enable: image WB,
+  framebuffer Normal-NC, rest Device; on sweet that made a full fill 110 -> 3.5 ms) and the shim no longer
+  clears the screen before the menu with the MMU off (~190 ms at 1440x3120). New mmu_disable (one asm block:
+  dc civac image, SCTLR M/C/I off, dc civac again, ic iallu, tlbi) runs after the booting picture, before the
+  bootmem UFS write, android_boot and the loader. If mmu_enable fails the menu draws as before. Untested on
+  guacamole: if the phone hangs at a black screen after `fastboot boot`, this is the first suspect.
+- The current boot image's iOS 27 entry looks for ufsroot=ios26 and no longer boots; Android is unaffected.
+- Codex: (1) tools/mkios27root-mac.sh 80g with the current NativeAdrenoMetal (outputs/NativeAdrenoMetal-bindcache),
+  sparse -> research/ios27.2/ios27-root-80g.simg; (2) boot image = xfrot-nodiag kernel/args with ufsroot=ios27,
+  tools/mkmenuboot.py, iOS 27 payload only (no iOS 16) -> outputs/guacamole-ios27a-xfrot-ios27part.img.
+  tools/ios27-klog-pull.sh now defaults to ios27 (done).
+
+# UI ~29 fps: SwapWait experiment (2026-11-19 23:50, Claude) -- TESTED: SwapWait is NOT the bottleneck
+- Result (2026-11-20, outputs/ui-sw{1,2,0}.txt, swapwait-nodiag kernel at ~9 min uptime): SwapWait blocks almost nothing. Best
+  scrolling window (mode 2): 140 swaps (27.9/s); SwapWait 286 calls, 249 of them already shown, 27 on the newest swap, 10 on
+  the previous; blocked 13 ms in all (45 us a call). GPU busy at only 24 % of vsyncs. Swap gaps: <17 ms 42, <34 50, <50 25,
+  >50 ms 23 (longest 232 ms): frames come in fast runs broken by stalls, not at a steady 3 slots -> the stalls set the fps.
+  Mode 0 windows (11/s, every gap >50 ms, GPU 1 %) and mode 1 windows (6/s) look like little or no scrolling: not comparable.
+  Keep mode 1 (the default at every boot); the new 5 s SwapWait line stays as a measurement.
+- Next: find what the 50-230 ms stalls wait on: all-thread tsample of backboardd (and SpringBoard) while scrolling.
+- All-thread capture (2026-11-20, outputs/ui-bb-all1.txt, ui-sb-all1.txt): tsample's all-thread mode samples threads ONE AFTER
+  ANOTHER (600 samples each), so only threads #0-#3 were sampled while scrolling; target busy threads by index instead.
+  At the start: backboardd #13 78.5 %, #3 48.8 %, #14 16.5 %; SpringBoard main thread 5.9 % (not the limit).
+  backboardd #3 (CoreAnimation's render thread; NativeAdrenoMetal frames symbolicated with tools/machosym.py, which reads the
+  dSYM symbol table on Linux: `python3 tools/machosym.py DWARF_FILE < "0xOFFSET COUNT" lines`): 45 % of samples under
+  -[NBCommandBuffer commitAndWaitUntilSubmitted], 42 % in -[NBCommandBuffer waitUntilScheduled] <- encodeDrain(): CA commits each
+  frame with commitAndWaitUntilSubmitted, which (frontend line ~3584) = commit + waitUntilScheduled = encodeDrain (wait for the
+  frontend's encode thread, render server only, gEncodeThread) + nmb_command_buffer_wait_scheduled (wait for the runtime's
+  lowering + submission). So the render thread waits for the encode thread (likely #13, 78 %) every frame: the encode thread's
+  work is the critical path. Also seen on #3: texture/heap/no-copy-buffer creation (import_pointer, allocate_memory) ~5-10 %.
+- Next: profile backboardd #13 and #14 by index while scrolling (outputs/ui-bb-t13.txt).
+- Thread numbers shift between captures (ui-bb-t13.txt sampled the wrong ones; #13 there = the runtime lowering thread, ~20 %
+  busy, mostly idle). Let tsample pick the busiest thread (no 4th argument): outputs/ui-bb-busiest.txt, 1000 x 3 ms.
+- Busiest backboardd thread while scrolling = the frontend's encode thread (~78 % busy; 22 % idle). Of its samples:
+  draws ~25 % (draw_at_call -> RenderLowering::draw), setRenderPipelineState 12 %, ends ~23 %; WAITING on the lowering thread
+  ~21 %: RenderCommandEncoder::end -> reserve_end condvar 9 %, -[NBEncoder dealloc] -> nmb_encoder_discard -> slot give_back
+  10 %, Lowerer::ready -> previous end's drain 2.5 %; Vec growth from empty every frame (EncoderRecord in end_with_replay,
+  OwnedRecording in inline_splits Kept::draw, ...) ~7 % (realloc into the kernel).
+- So backboardd hands each frame twice (CA render thread -> frontend encode thread -> runtime lowering thread) and CA waits for
+  both at every commit: the second hand-off only adds waits there.
+- CHANGE (BUILT 2026-11-20): NativeAdrenoMetalPlugin.mm: with /var/local/sweet-rs-atcall present when backboardd starts (and no
+  metal-flow= boot arg), backboardd gets NATIVE_METAL_FLOW=6 (lowering thread off, commit submission and warm pass kept); other
+  processes unchanged. Diff xnu/ios27/adrenometal-rsatcall.diff; backup research/ios27.2/metal/NativeAdrenoMetalPlugin.mm.before-rsatcall.
+  Rebuilt bridge and iOS 27 plugin from current source (`PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-bridge.py --target ios27`,
+  then `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`). Bundle signature
+  verified. Executable copied byte-for-byte to outputs/NativeAdrenoMetal-rsatcall; SHA-256
+  `7d725dee61726c0433ef00beb87956227526b692d0f4d2246bf04933b5d64dbc`. No source compile fixes were needed. Not installed.
+  Test when ready: install, touch the file, reboot, scroll, compare swaps/s with 27-28 (ui-sw2 / ui-bb-t13 windows).
+- Later candidate (runtime): keep those Vec capacities across encoders (spares) instead of growing from empty each frame.
+- RESULT sweet-rs-atcall (2026-11-20, installed NativeAdrenoMetal-rsatcall, file present): outputs/ui-rsatcall1.txt at ~3.7 min
+  uptime 21.5-25.3/s (too early: priming); ui-rsatcall2.txt at ~6 min (load average still 9) 26.9/28.9/26.9 swaps/s while
+  scrolling, longest gaps 165-282 ms -> no measurable change from the 27-28 baseline. The waits on the lowering thread were not
+  what sets the frame rate; the encode thread's own work (draws, pipeline sets, pass ends, list growth) and CA's wait for it at
+  every commit remain. Previous plugin kept on the phone at /var/local/NativeAdrenoMetal.deferopen2.
+- User: scrolling feels less jittery with it -> KEPT ON (/var/local/sweet-rs-atcall stays). The fps numbers do not show it;
+  frame-time evenness is not in the 5 s lines beyond the gap buckets and the longest gap.
+- PAUSED here (2026-11-20 01:25, user: switching to the root filesystem expansion). Two options left, user to pick:
+  1. Cheaper encode-thread work (runtime): first keep the per-pass Vec capacities (EncoderRecord in end_with_replay,
+     OwnedRecording in inline_splits Kept::draw, ...) instead of growing from empty each frame (~7 % of the encode thread), then
+     re-profile (tsample backboardd 1000 3000, busiest thread) and take the next item. Low risk, a few % each; testable with the
+     GPU tests on the Mac before a Codex build. Claude's recommendation: do this first.
+  2. Overlap frames: commitAndWaitUntilSubmitted returns after commit; the kernel holds a swap until that frame's GPU work is
+     submitted. Needs frontend -> kernel "frame N committed/submitted" signals (no channel today; via a new call in Turnip's darwin
+     backend -> new SweetAccelerator selector -> SweetFramebuffer holds the swap). Per-process submit counts are not enough (a
+     late submit of frame N-1 would release swap N: an older surface shown). Several days, 2 Codex builds, glitch risk;
+     possible 30-40 % (estimate). Write the design first.
+- Observation (user): UI scrolling 25-30 fps, unchanged by the 0044 hand-off (now in backboardd too, draws fine).
+- Reading of the earlier data: no stage is saturated (backboardd's busiest thread ~40 %, outputs/tsample-bbd-scroll.txt; GPU busy
+  47-72 %; Reduce Transparency gave fewer GPU cycles but no more frames, dmesg-fps-reducetrans), yet frames land every 3rd panel
+  slot (88 Hz: 3 slots = 29 fps). Suspect: stages run one after another instead of overlapping. CoreAnimation calls SwapWait
+  (selector 6) ~2x a frame; ours blocks backboardd's render thread until the named swap is shown (up to 50 ms), and since
+  asyncflip a swap counts as shown only once the previous flip settled at the panel's next frame start. If CA names the swap it
+  just made, CPU drawing of frame N+1 cannot start before frame N is on the panel.
+- Change (iokit/Kernel/arm/SweetFramebuffer.cpp; diff research/ios27.2/kernel/xnu12377-fb-swapwait.diff, copy in xnu/ios27/;
+  backup kernel-backup/SweetFramebuffer.cpp.before-swapwait):
+  * New 5 s line: `SWEET FB: 5s: SwapWait mode M: on the newest swap N, the previous N, older N, not waited N; blocked X ms in
+    all (Y us a call)` -> which swap CA waits on, and how much of each 5 s the render thread spent blocked there.
+  * Runtime switch, no boot arg: `sysctl kern.sweet_fb_swapwait=1` (default, unchanged behaviour), `=2` (a wait on the newest
+    swap returns at once; earlier swaps still waited for), `=0` (never waits). Resets to 1 at boot.
+  * Risk in 2/0: CA may draw into a surface whose GPU blit to the flip buffer is still queued (the GPU runs submissions in order,
+    so expected safe) or that a CPU-composed frame still reads (possible tearing on such frames). Watch for glitches.
+- Status: the requested kernel and images are built; artifact hashes and sidecars are recorded below. The only boot-arg
+  change from xfrot-nodiag is a refreshed `sweettime`.
+- Build complete: `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256
+  `85093444842f631e824b73e9773258c449aadf10fedb4811f151231404127a6c`; build log `xnu12377-swapwait-build.log`.
+  Build exited 0; no compile fixes were needed. ADT reused unchanged: `work/guacamole-ios27a-yuv.adt`.
+- Boot images: `outputs/guacamole-ios27a-swapwait-nodiag.img`, SHA-256
+  `994447459897c7bddf4bb3b1c2c8283f3f6e50c55697316c151919bf9e1ce3e3`; triple image
+  `outputs/guacamole-ios27a-swapwait-nodiag-triple.img`, SHA-256
+  `aeb97cc0190935aca71750872ad0bc8ecb4516debcdfd3338d7ffa4265758539`.
+  Boot-args sidecars: `outputs/guacamole-ios27a-swapwait-nodiag-boot-args.txt` and
+  `outputs/guacamole-ios27a-swapwait-nodiag-triple-boot-args.txt` (identical, 589 characters; only `sweettime`
+  differs from xfrot-nodiag). The triple preserves the iOS 16 payload and selector shim; iOS 27 starts at `0x103a000`.
+  Not installed or flashed. Flash command (not run):
+  `fastboot flash boot_b outputs/guacamole-ios27a-swapwait-nodiag-triple.img`.
+- Phone test (user): boot it, wait ~8 min, then for each mode scroll the home screen ~15 s and capture:
+  `ssh root@PHONE 'dmesg | grep "SWEET FB: 5s" | tail -12' > outputs/ui-swN.txt` after `ssh root@PHONE 'sysctl kern.sweet_fb_swapwait=N'`.
+  Read: swaps/s per mode; "on the newest swap" high + large "blocked" in mode 1 confirms the serialisation.
+
+# ON HOLD (2026-11-19, Claude + user): 90 fps UI -- linear surface textures -> UBWC. Waiting on the 0044/upload-reuse build first.
+Nothing below is implemented.
+- Goal: UI at the panel's ~88-90 Hz (0199): ~11.3 ms a frame. Now 37-39 fps scrolling, GPU ~16-17 ms a frame (GPU-bound). CA
+  shows a frame only at a refresh: one missed slot = 44 fps, two = 29 fps (37-39 is a mix). Target GPU <= ~9-10 ms a frame.
+  Render size 828x1792 (sweetfb_scale=2, QSEED3 scales to the panel); Android runs this GPU at 1440p 90 Hz, so 16 ms is inefficiency.
+- Already known: UI renders in GMEM (gpu-diagB: 21,895 passes GMEM, 1 sysmem; ~10 passes, 72 draws, 5.4 Mpx GMEM work a frame).
+- What is linear (checked in the runtime source, .cache/gpu-reference/metal2vulkan/crates/metal2vulkan-runtime):
+  * Private Metal textures (newTextureWithDescriptor: -> image_plan.rs create_info): VK_IMAGE_TILING_OPTIMAL with a format list,
+    so Turnip should give them tiling + UBWC. Not verified.
+  * Every texture over an IOSurface: imported as DRM_FORMAT_MOD_LINEAR images rendered in place (dma_buf.rs,
+    HostPageTexturePolicy::InPlaceWrites): backboardd's framebuffer surface and every app layer backing store it samples. Cost is
+    at each pass's GMEM load/store and at sampling (no compression, poor texture-cache locality), not during drawing.
+- Plan, in order:
+  1. Inventory (1-2 days): for one scrolling frame, every texture rendered/sampled, size, and layout (linear surface / tiled /
+     tiled+UBWC); a Turnip log line in its image setup when and why UBWC is turned off. Decides whether this lever is worth 2 ms or 6.
+  2. Framebuffer path (days to 2 weeks): backboardd's framebuffer surface and the page-flip buffers in UBWC, scanned out as UBWC
+     by the DPU (VIG pipes support it on SM8150, as Android does). Runtime: import with DRM_FORMAT_MOD_QCOM_COMPRESSED (Turnip
+     supports it) instead of LINEAR. Kernel (SweetFramebuffer/SweetSurface): buffers in Turnip's UBWC layout (data + metadata),
+     VIG pipe UBWC format and UBWC static config matching the GPU's. Catch: CPU readers of the framebuffer (screenshots, the
+     kernel's CPU compose fallback) need a GPU decompress-to-linear first.
+  3. App layer backing stores (weeks, uncertain; the bigger share): cross-process (app renders, backboardd samples), so the
+     compressed form must live in the surface itself, not a per-process shadow. Idea: iOS's lossless-compressed IOSurface pixel
+     formats ('&' four-char codes) that QuartzCore uses on real iPhones for GPU-only surfaces; report support, map them to UBWC in
+     SweetSurface, import compressed. First find what iOS 27 QuartzCore checks before using those formats.
+  4. Private textures: confirm nothing turns their UBWC off (view formats without a list, unrequested storage usage).
+- Free diagnostic any time: Settings > Accessibility > Display & Text Size > Reduce Transparency on vs off, scroll the home screen
+  10 s each, then `ssh root@192.168.0.69 'dmesg | grep "SWEET FB: 5s" | tail -5'` -> how much of the 16 ms the glass/blur passes are.
+- Other GPU-time levers to weigh after the inventory: shader quality after Metal -> SPIR-V -> ir3, number of passes/offscreen copies.
+
+# PLANNED, NOT STARTED (2026-11-19, Claude + user): power management, boot-arg room, native GPU driver question
+Nothing below is implemented. Decisions and plans from a discussion, for a later session.
+
+## Boot arguments: the 607-character total is the limit (iOS 27 args at 589)
+- No new boot args for new features. New features default ON; the only boot-arg control is a DISABLE value, preferably on an
+  argument that already exists. Runtime on/off goes through sysctls (no boot-arg cost), like kern.sweet_passcode_reset.
+- Free room by making today's always-on values the iOS 27 kernel's defaults (each driver's PE_parse_boot_argn default), so the
+  args can be dropped and still work as overrides (e.g. sweetcamhw=0). Candidates (~270 chars):
+  sweettouch=1 sweetkeys=1 sweetusb=1 sweetpmem=1 sweetwifid=1 sweetmailbox=1 sweetboxroot=1 sweetfbgpu=1 sweetfbatswap=1
+  sweetfb_hwvsync=1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_scale=2 sweetcamhw=1 sweetpasscode=1 sweetabp=3 sweetgpu=11
+  sweetmtl=3 sb=2 sc=1. Keep as args: sweettime, ufsroot/rd, wdt, debug, diag and Apple's own. Do it together with the governor
+  kernel build, and write a new boot-args sidecar without the dropped entries. Expected: 589 -> ~320 chars.
+
+## Power management (state today: no saving at all)
+- CPU: sweetcpufreq=3 pins all three OSM domains at their top row (bsd/dev/sweet_cpufreq.c). GPU: fixed at level 5, 585 MHz
+  (sweetgpufreq default, bsd/dev/sweet_gpu.c, HFI perf vote). Idle cores: WFI only. SweetCPU::haltCPU/quiesceCPU panic
+  (iokit/Kernel/arm/SweetCPU.cpp); tools/mkadt.py sets sleep-disabled so iOS never tries system sleep.
+- A governor saves battery/heat; it does not add speed (clocks are already max), but may avoid LMh thermal throttling in long games.
+
+### Plan, in order
+1. Measure battery current screen-on idle and screen-off (SweetBattery readings) as the baseline for every step.
+2. CPU governor (days, low risk): sample per-cluster busy time every ~10-20 ms, pick an OSM table row (schedutil-like); optional
+   CLPC-lite through XNU's sched_perfcontrol callbacks (boost for user-interactive threads). Touch boost from sweet_touch.c.
+   Controls: default ON when sweetcpufreq is absent; sweetcpufreq=3 = pinned at max (the disable; delete it from the args to get
+   the governor, saves 15 chars); sysctl kern.sweet_cpugov=0/1 at runtime.
+3. GPU governor (days to a week): GPU busy time (already measured for the SWEET FB 5 s lines) -> GMU level 1-5 via HFI; also
+   DDR/bus bandwidth votes (probably stuck high). Controls: default ON; sweetgpufreq=5 pins 585 MHz (the disable);
+   sysctl kern.sweet_gpugov=0/1.
+4. Userland that keeps cores awake: wland polls Wi-Fi every 1 ms (~12% of a core); locationd can spin a core after boot.
+5. Deeper CPU idle (weeks, medium risk): PSCI CPU_SUSPEND core/cluster power collapse instead of WFI. Needs the PSCI state ids
+   (Android DT idle states), a wake timer that runs while cores are off (Qualcomm memory-mapped timer, as Linux), resume through
+   the existing CPU start vector. Default ON, sysctl back to WFI, a disable value on an existing arg if needed from boot.
+6. Real system sleep (months, high risk): SM8150 firmware has no usable whole-SoC suspend; Linux "sleeps" with every CPU in its
+   deepest idle state and RPMh sleep votes released (step 5 is the base). Also needs: wake interrupts routed through the PDC
+   (power key via PMIC, RTC alarm, modem), every driver powering down/up through iOS power states (UFS, display, touch, Wi-Fi,
+   ADSP audio, GMU, camera, USB), haltCPU = PSCI CPU_OFF for secondaries, then sleep-disabled removed from the ADT.
+- Expectation: steps 1-4 likely give most of the screen-off battery gain even with sleep still disabled.
+
+## Native Metal GPU driver vs metal2vulkan (question asked; answer: not now)
+- A native driver (Metal -> Adreno command streams directly) = multi-person-years (12+ months even with agents) for parity:
+  shaders AIR -> NIR -> Mesa ir3 (reusable), command streams (Turnip/freedreno scale), and all of Metal's semantics (hazard
+  tracking, retained resources, argument buffers, heaps, purgeable, IOSurface, tile shaders), which is most of metal2vulkan anyway.
+- Possible gain: games are CPU-bound (Minecraft GPU busy 13%), so per-draw overhead matters; rough guess 1.5-3x in draw-heavy
+  games, but much of the cost is Metal semantics, not Vulkan. UI is GPU-bound (16-17 ms/frame): a new driver barely helps; UBWC
+  instead of linear textures, fewer render-pass splits and GMEM vs sysmem choices help the same on Turnip.
+- Middle path if ever: a Metal frontend on Mesa Gallium + freedreno (Metal's default model is closer to GL than Vulkan; Gallium
+  already does implicit hazard tracking). Still a large project (compare Mesa's D3D9 frontend).
+- Decision trigger: profile per draw (frontend / bridge / metal2vulkan lowering / Turnip recording). Only if the cost is inherent
+  to the Metal -> Vulkan translation does the Gallium route make sense. First finish 0044 + upload reuse, then UI GPU time (UBWC).
+
+# Metal performance: upload buffer reuse + render passes open on the lowering thread (2026-11-19, Claude) -- INSTALLED AND KEPT (deferopen2)
+Goal: Minecraft 17-21 fps -> ~26 (profile mc-fps9: 22% of the render thread waited at pass boundaries, CommandBuffer::settle_ended;
+newBufferWithBytes ~5%). At handoff, both changes were source only and uncompiled; the Codex build and test results are recorded below.
+
+## 1. Upload buffer reuse (frontend only)
+- `work/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm`: gUploadPool. A newBufferWithBytes: buffer of <= 64 KiB, Shared
+  storage, is kept at -dealloc and handed to the next newBufferWithBytes: of the same length and options (bytes memcpy'd in). Safe at
+  dealloc because every bind holds the buffer object in its command buffer's resourceOwners (-own:) until completion. Never kept: GPU
+  address handed out (argument buffers skip own:), setPurgeableState: other than KeepCurrent, makeAliasable, heap/no-copy/surface.
+  Caps: 64 per (length, options), 8 MiB total; drained in native_bridge_metal_relieve_memory (memory pressure).
+- Off switch: `/var/local/sweet-nobufpool` (read once per process). Counters: uploads reused/made/kept/dropped (log line below).
+- Diff: `xnu/ios27/adrenometal-uploadpool.diff`; backup `research/ios27.2/metal/NativeBridgeMetalFrontend.mm.before-uploadpool`.
+
+## 2. Bridge patch 0044: a render pass opens on the lowering thread
+- Patch: `work/UniXNU/drivers/AdrenoMetal/bridge/patches/0044-render-pass-opens-on-the-lowering-thread.patch` (added to
+  scripts/build-adreno-metal-bridge.py's list; copies `xnu/ios27/adrenometal-deferopen.diff`,
+  `research/ios27.2/metal/0044-...patch`). The .cache source already has it applied (= pin + 0002..0044). Backups of the touched
+  files before it: `research/ios27.2/metal/before-deferopen/`.
+- Design (render/deferral.rs module docs, "Openings left to the thread"): render_command_encoder after a render encoder whose end is
+  in flight (CommandBuffer.ending held, the pass has no color groups / rate map / rebind log) makes the descriptor checks at the call
+  (check_descriptor, layout, PassShape, compatible pass), takes the end in flight into a PendingOpen held by the new encoder's slot
+  (Lowerer.opening), and returns an encoder that logs its calls, checked against the descriptor's layout (CallChecks::preview).
+  Lowerer::ready runs the opening before anything of the slot is lowered (Batch::lower, end_lowering, drain_locked, at_call,
+  give_back): finish the end before it (already lowered on the thread: slots are taken in hand order), then open_render as at the
+  call, from the carried draw. Under the opening, settle_ended is a no-op and State::open_refusal uses commit_refusal (a commit
+  queued since does not refuse it).
+- Command buffer state: `end_lowered: bool` became `ends_unlowered: u32` (several ends can be in flight now; a queued commit runs
+  when the last is lowered). `deferred_open` marks the pending opening: refusal() answers EncoderOpen while it is set, queue_commit
+  refuses, settle_ended runs it (open_pending) so any call that needs the encoders' work still sees them in order.
+- Ordering check: every render encoder takes a ticket at its call; State.render_opened checks they open in that order. Counters
+  (runtime `deferred_open_counts()`, bridge `nmb_deferred_open_counts`): [0] deferred at call, [1] opened by thread, [2] opened by
+  program, [3] OUT OF ORDER (must stay 0), [4] refused as it ran. Frontend os_log every 1000 commits with diag=1, or whenever [3]/[4]
+  change: `NativeAdrenoMetal opens: commit N | deferred .. (thread .., program ..) out-of-order .. refused .. | uploads reused ..`.
+- Off switch: `/var/local/sweet-nodeferopen` -> plugin sets M2V_DEFERRED_OPEN=0 (NativeAdrenoMetalPlugin.mm), read once per process.
+- Frontend/plugin/bridge diff: `xnu/ios27/adrenometal-deferopen-frontend.diff`; upload-pool frontend diff:
+  `xnu/ios27/adrenometal-uploadpool.diff`.
+- New tests in src/tests/deferred_calls.rs: passes_after_an_end_in_flight_open_without_waiting_and_keep_their_order (first pass's
+  lowering held, 3 more passes open/end without waiting, 6 passes in all, last color wins, out-of-order 0),
+  an_encoder_whose_opening_waits_is_open_to_the_program (commit and blit refused EncoderOpen, both policies alike),
+  an_encoder_dropped_before_its_deferred_opening_abandons_its_command_buffer.
+- Known risks (observations, not results): the layout is computed twice (call and opening), so a degradation notice from
+  render_pass::layout may be announced twice; protection options changed between the call and the opening apply at the opening; a
+  read like commandBuffer.error while the next pass is open but before its opening ran now settles that opening first.
+
+## Build and test result (Codex, 2026-11-19)
+- Runtime unit suite passes when run serially: `cargo test -p metal2vulkan-runtime --lib -- --test-threads=1` -> 1394 passed,
+  0 failed, 4 ignored (113.99 s). The default parallel run had two flaky `churn_counts` failures; both passed serially.
+- Deferred-call GPU tests are not verified. With the requested `RUSTFLAGS="--cfg m2v_gpu"`, I fetched MoltenVK 1.4.2 into
+  `/private/tmp/ios27-moltenvk` and exposed it as a temporary `VULKAN_SDK`; the loader opens, but all 25 tests fail at device setup
+  with `NoDevice`. This Mac execution environment has no Vulkan physical device available to MoltenVK. Do not install or phone-test
+  this build until those 25 tests run on a host with a usable MoltenVK device.
+- Build fixes needed: added `<map>` for the upload pool's `std::map`, and added `-Wno-frame-address` to the plugin compile flags
+  for the intentional caller-frame diagnostic. Refreshed `xnu/ios27/adrenometal-uploadpool.diff` to include the `<map>` fix.
+- Bridge and iOS 27 plugin build succeeded; bundle code signature verification passed. Executable copied byte-for-byte to
+  `outputs/NativeAdrenoMetal-deferopen`; SHA-256:
+  `09c7c1a4ac8ac35d7e503336e935c22bb2dd5f86cb6914d51d0ffd18d69cf76b`.
+- Rebuilt the bridge and plugin again from current source (Codex, 2026-11-19). Signature verification passed; executable copied
+  byte-for-byte to `outputs/NativeAdrenoMetal-deferopen2`; SHA-256:
+  `887e13d60536b45fd37ac6d9c81efc79b58986fc4e7b24950d53ddb5317bc0de`.
+- Device install and phone test plan remain pending the deferred-call tests on a host that exposes a Vulkan device.
+
+## Device tests on the user's Mac + fix (2026-11-19 22:00, Claude + user)
+- The GPU tests run in the user's own Terminal (Codex's sandbox has no GPU). Setup that works:
+  `brew install vulkan-loader molten-vk`; in the metal2vulkan folder, with a PATH WITHOUT /private/tmp/adreno-cargo-bin (its
+  wrapper pins stable 1.98.0, but the repo's rust-toolchain.toml needs nightly-2026-11-03 for -Z flags):
+  `export RUSTC="$(/opt/homebrew/bin/rustup which --toolchain nightly-2026-11-03 rustc)"`
+  `export VK_DRIVER_FILES=/opt/homebrew/.../MoltenVK_icd.json` (the brew icd.d path; VK_ICD_FILENAMES the same)
+  `RUSTFLAGS="--cfg m2v_gpu" /opt/homebrew/bin/rustup run nightly-2026-11-03 cargo test -p metal2vulkan-runtime --lib tests::deferred_calls -- --test-threads=1`
+- First run: 24/25 passed; passes_after_an_end_in_flight_open_without_waiting_and_keep_their_order failed: pass 1's opening was
+  deferred, pass 2's was not (deferred_open still marked pass 1, whose opening had not run, and take_end_for_deferred_open refused
+  to chain). FIX: hold_end clears State.deferred_open (an encoder that ended is no longer open to the program; its opening runs
+  through its end). The test now reports how far the encoding thread got (Stage) and the counts on failure.
+- After the fix: deferred_calls 25/25 passed on the Mac's GPU (MoltenVK). Then only formatting of Claude's own lines changed.
+- Patch 0044 regenerated with the fix (applies to the 0043 source and reproduces the tree; SHA-256 prefix fe81d4b7f2b2bccc).
+- outputs/NativeAdrenoMetal-deferopen (09c7c1a4...) is STALE: built before the fix, it opens only every other pass on the
+  lowering thread at best. Do not install it. Codex: rebuild bridge + iOS 27 plugin from the current source, copy to
+  outputs/NativeAdrenoMetal-deferopen2, record its SHA-256 here. Then the phone test plan above.
+
+## Phone result (2026-11-19 22:27, user + Claude) -- KEPT
+- Installed outputs/NativeAdrenoMetal-deferopen2 (SHA-256 887e13d6...bc0de) over SSH; previous plugin backed up on the phone at
+  /var/local/NativeAdrenoMetal.bindcache. Booted with /var/local/sweet-nodeferopen present (UI without the hand-off), then removed
+  it and relaunched Minecraft. The switch file is now absent: after the next reboot every process uses the hand-off.
+- Minecraft (outputs/mc-fps10.txt, xfrot-nodiag image): 22.9 fps in the measured 5 s window (baseline 17-21 with bindcache);
+  swap gaps <34 ms 35, <50 ms 45, more 35; longest gap 57 ms; GPU busy at 20% of vsyncs; minecraftpe 254% CPU (was 268%).
+  outputs/mc-opens10.txt empty: no opening out of order or refused. Rendering correct. User: frame times a bit better -> keep.
+  No same-session A/B was taken, so the gain is not separated from scene variation (~+2-4 fps at most).
+- Seen: memory tight while playing (free 45 MB, 810 page-ins in 5 s, minecraftpe 931 MB RSS): a possible stutter source.
+- Phone address on this network was 172.28.200.71 (not 192.168.0.69).
+- Rollback: `ssh root@PHONE 'cp /var/local/NativeAdrenoMetal.bindcache /System/Library/Extensions/NativeAdrenoMetal.bundle/NativeAdrenoMetal && sync && reboot'`;
+  hand-off only: `touch /var/local/sweet-nodeferopen`; upload reuse only: `touch /var/local/sweet-nobufpool` (both read at process start).
+- Next for games (not started): profile minecraftpe's render thread to see whether settle_ended is gone and what leads now
+  (the lowering thread, per the earlier estimate).
+
+## Codex: build and test
+1. Unit tests: `cd work/UniXNU/.cache/gpu-reference/metal2vulkan && cargo test -p metal2vulkan-runtime --lib -- --test-threads=1`
+2. On a Mac with a working MoltenVK physical device, run device tests:
+   `VULKAN_SDK=/path/to/vulkan-sdk RUSTFLAGS="--cfg m2v_gpu" cargo test -p metal2vulkan-runtime --lib tests::deferred_calls`
+   All of deferred_calls must pass (old ones cover end/commit-in-flight ordering, which ends_unlowered changed).
+3. Bridge + plugin: `python3 scripts/build-adreno-metal-bridge.py --target ios27`, then
+   `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`;
+   copy the executable to `outputs/NativeAdrenoMetal-deferopen`, record its SHA-256 here.
+## Phone test plan (after 1-3 pass)
+- Install NativeAdrenoMetal-deferopen; boot the current xfrot-nodiag image (diag=1 image for the log line). Minecraft: fps as in
+  mc-fps8 (baseline 17-21), plus the "opens" line (out-of-order and refused must be 0). Watch for: wrong or flickering frames, a
+  black pass, GPU hang/reset, freeze. Any of those: `touch /var/local/sweet-nodeferopen`, relaunch the app, retest (isolates 0044);
+  then the same with `/var/local/sweet-nobufpool` for the upload reuse.
+- Also check the UI (SpringBoard scrolling 37-39 fps) and Subway Surfers for regressions.
+
+# Landscape games black: CA's rotated framebuffer (2026-11-19, Claude) -- fixed: Minecraft runs (low fps)
+- Summary: landscape now works through the system (backboardd's rotated framebuffer, apps' rotated drawables, the
+  kernel scaler's rotation); diffs in xnu/ios27/ (adrenometal-landscape, adrenometal-vertex-absent = bridge 0043,
+  adrenometal-vattr-dumpfile, xnu12377-scaler-rotate). Minecraft still black (test 14, outputs/land17/): its descriptors
+  are filled and it draws, but every vertex buffer it binds reads all zero at the bound offset on the CPU (title cube
+  at offset 0 of a 4 MB buffer included), and its frame reads back black. Next: how Minecraft fills its vertex buffers
+  (private storage + blit? a buffer we answer contents for wrongly?).
+- FOUND (tests 15-26, outputs/land18-26, outputs/minecraftpe.bin): Minecraft's vertex (4 MiB) and index (1 MiB) buffers
+  are made with newBufferWithLength, never mapped (contents asked 0 until our dump), never copied into as far as the
+  driver saw; the binary uses newBufferWithBytes + blitCommandEncoderWithDescriptor: + copyFromBuffer:toBuffer:.
+  NBCommandBuffer had no blitCommandEncoderWithDescriptor: -> nil encoder -> every upload copy was a message to nil.
+  Added blitCommandEncoderWithDescriptor: and computeCommandEncoderWithDescriptor: (descriptors' sample buffer
+  attachments ignored). Diagnostics kept (dump-cb only): per-buffer made-by/contents/gpuAddress counts, buffer watch,
+  buffer uses by caller offset, copy log, missing selectors to stderr. Codex: rebuild, outputs/NativeAdrenoMetal-blitdesc.
+- Test 27 (blitdesc): Minecraft launches and renders, at a very low frame rate.
+- Frame rate (outputs/mc-fps1.txt, mc-fps2-samples.txt): 10.5 fps; GPU busy 13%; scaler idle; minecraftpe 193% CPU,
+  its render thread 91% of a core (the m2v lowering thread mostly waits). About a quarter of the render thread's samples
+  are -[NBBuffer contents] (Rust guard, purge-cell lock, pin) from minecraftpe+0x19e04c4, before every uniform update,
+  plus today's counters. Now -contents answers from a cached pointer after the first non-null answer (the bridge pins it
+  then, so it never moves), and the counters/watch run only with dump-cb on. Codex: rebuild, outputs/NativeAdrenoMetal-fastcontents.
+- Test 15 setup (outputs/NativeAdrenoMetal-bufdiag): the dump now prints, for each bound buffer, how it was made
+  (options, heap offset, no-copy), its contents pointer and where in the whole buffer the CPU sees nonzero words; and
+  with dump-cb on, the first 24 copyFromBuffer:toBuffer: calls go to the dump file (sizes, options, offsets).
+  Backup: research/ios27.2/metal/NativeBridgeMetalFrontend.mm.before-bufdiag.
+- Test 15 plugin built for iOS 27 with `--no-replay`; no bridge source changes. The successful plugin link reused the
+  current bridge archive. Fixed two ARC compile errors in the buffer diagnostic by using non-owning `__bridge void *`
+  casts for the source and destination `MTLBuffer` pointers. Bundle signature verification passed. Executable copied
+  byte-for-byte to `outputs/NativeAdrenoMetal-bufdiag`, SHA-256
+  `64673d82e77953e1d90d338532aceae16b3725da3a049067044dc2fc55bba39f`. Not installed on the phone.
+- Test 15 plugin rebuilt again for iOS 27 with the existing bridge archive and `--no-replay`; signature verification passed.
+  Executable copied byte-for-byte to `outputs/NativeAdrenoMetal-bufdiag2`, SHA-256
+  `0d9189764f8d1de7d4e228d95749247acd2919a31227a2f34240e5f2c28047fb`. Not installed on the phone.
+- Test 15 plugin rebuilt once more for iOS 27 against the existing bridge archive; signature verification passed.
+  Executable copied byte-for-byte to `outputs/NativeAdrenoMetal-bufdiag3`, SHA-256
+  `af15975ea6a3c97bb2e25d9fc779f43f5e600bc83e071fdc6f406b8b99e24174`. Not installed on the phone.
+- Test 15 plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed. Added two
+  non-owning `__bridge void *` casts to the new buffer-dump log calls to satisfy ARC. Executable copied byte-for-byte
+  to `outputs/NativeAdrenoMetal-bufdiag4`, SHA-256
+  `47611f240fe6ab774688a86e6aa3ad569346adf19bf4ec674cffb35cafb5ca8d`. Not installed on the phone.
+- Test 15 plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed. Added one
+  non-owning `__bridge void *` cast to the buffer-watch diagnostic log to satisfy ARC. Executable copied byte-for-byte
+  to `outputs/NativeAdrenoMetal-bufdiag5`, SHA-256
+  `ed8d3cb15fd3a90c091148b780404e5ad4245a42e3cb9fd93f798c2808d2fc43`. Not installed on the phone.
+- Missing-buffer diagnostic plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed.
+  Executable copied byte-for-byte to `outputs/NativeAdrenoMetal-missing`, SHA-256
+  `a4d24a93c2250c8f4a22814bb619f37b66d1221b2bd367cdbc7fc54f11f45e42`. Not installed on the phone.
+- Buffer-use trace plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed. The
+  plugin compile suppresses only `-Wframe-address` for the requested parent-frame return-address trace, and the logged
+  Objective-C resource uses a non-owning `__bridge void *` cast. The dSYM is retained at
+  `work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.dSYM` (DWARF binary present). Executable copied
+  byte-for-byte to `outputs/NativeAdrenoMetal-uses`, SHA-256
+  `5faf2d959ccd2089dd13fda0f871ebbfb99cb2cb9e7f4975d5b920d4de36bc68`. Not installed on the phone.
+- Blit descriptor diagnostic plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed.
+  dSYM remains in `work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.dSYM`. Executable copied byte-for-byte to
+  `outputs/NativeAdrenoMetal-blitdesc`, SHA-256
+  `a46b676e9cd612f2b3da5bbb78b8b5f30aed64708231a027ff4017da36cf57fb`. Not installed on the phone.
+- Fast-contents diagnostic plugin rebuilt for iOS 27 against the existing bridge archive; signature verification passed.
+  dSYM remains in `work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.dSYM`. Executable copied byte-for-byte to
+  `outputs/NativeAdrenoMetal-fastcontents`, SHA-256
+- fastcontents: 12.3 fps (outputs/mc-fps3.txt). Render thread profile (mc-fps5.txt thread 18, 60 samples): binds
+  ~40% (buffer:offset:index:stage: 20%, texture 17%, sampler 7%: TracedEncodeCall, own:/purgeHold, bridge),
+  renderCommandEncoderWithDescriptor: 12% (CommandBuffer::settle_ended, waiting for the lowering thread #39 at 43%),
+  Minecraft's own uniform loop (minecraftpe+0x19e04c4) 13%, objc_msgSend ~13%. Next: a slimmer bind path and no
+  blocking hand-off between passes. The diagnostic-free triple image is built below.
+- Bind path: NBEncoder skips a bind that changes nothing (same buffer and offset, texture or sampler already in that
+  slot, first 32 slots of stages 0-3; setBytes forgets the slot's buffer; setBufferOffset skips an unchanged offset).
+  Counters gBindsMade/gBindsSkipped go to the dump file every 500 commits while dump-cb is on. The ENCODE closures'
+  TracedEncodeCall wrapper (four clock reads per call) only exists with diag=1: the nodiag image removes it.
+  Backup: research/ios27.2/metal/NativeBridgeMetalFrontend.mm.before-bindcache. Built for iOS 27 against the existing
+  bridge archive (no bridge rebuild); signature verification passed. Executable copied byte-for-byte to
+  `outputs/NativeAdrenoMetal-bindcache`, SHA-256 `2068c804e060a1ca355466196ec1dd9a1467e838ac1ccc6d1f48ad45063bb326`.
+  Not installed on the phone.
+- Results: bindcache on the xfrot image (diag=1): 21.7 fps steady (outputs/mc-fps6.txt), rendering looks right (user).
+  xfrot-nodiag image + bindcache at ~7 min uptime (mc-fps8.txt, backboardd back to 10%): 17-21 fps, minecraftpe 268%:
+  no measurable gain from dropping diag=1 (scene-to-scene variation is larger). The phone runs the nodiag image now.
+- Profile after bindcache (outputs/mc-fps9.txt; render thread #14 80%, lowering thread #36 ~48%): opening a render
+  encoder settles the previous end on the program's thread (CommandBuffer::settle_ended -> EndInFlight::finish): 22% of
+  the render thread (Batch::lower on the program's thread 8%, the rest waiting for the batch the lowering thread is on).
+  Binds and draws ~12%, Minecraft's own code 13%, newBufferWithBytes 5% (allocation; zeroing only for pooled memory).
+  Structural: a pass is recorded after the previous one, and the opening runs at its call, so with Minecraft's
+  back-to-back passes (5-6 a frame) the lowering thread never gets ahead at a boundary. Fix = defer the opening too:
+  log "open with this descriptor" and let the lowering thread open passes in order (render/deferral.rs,
+  command_buffer settle_*, residency inheritance, carried draws, shadows, queued commits). Needs the runtime's own test
+  suite (cargo test -p metal2vulkan-runtime on the Mac) before a phone test. Not started.
+- Built `outputs/guacamole-ios27a-xfrot-nodiag-triple.img` with the xfrot kernel and ADT; preserved the iOS 16
+  payload and selector shim. Removed only `diag=1`, refreshed `sweettime` to `1795138076` (589-character boot args).
+  Sidecar: `outputs/guacamole-ios27a-xfrot-nodiag-triple-boot-args.txt`. SHA-256
+  `eba2b0252ee6e4bb4ea51bf3e817e244cd9b832740dae2536e4d5e42d1bc7697`. Not flashed.
+  Flash command if requested: `fastboot flash boot_b outputs/guacamole-ios27a-xfrot-nodiag-triple.img`.
+- Minecraft in landscape: black screen. backboardd's QuartzCore logs "Failed to allocate [1792 x 828] BGRA framebuffer
+  MTLPixelFormatBGRA8Unorm" every frame (outputs/land1-oslog.txt, 105 times in 8 s); the kernel sees layer 0 surface 3
+  828x1792 all black (SWEET FB black at display). CA asks for its portrait framebuffer surface as a landscape texture
+  (descriptor rotation SPI); the iOS 27 frontend refused it (textureOnBuffer: rows too short). iOS 16's frontend had the
+  fix (0196, userland/metal2): ported to work/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+  (rotatedSurfaceTexture, rotationPipeline, NBCommandBuffer.rotatedShadows, a turning pass at -commit).
+  Backup: research/ios27.2/metal/NativeBridgeMetalFrontend.mm.before-rotate.
+- Direction: descriptor rotation 3 -> clockwise, else counter-clockwise; /var/local/sweet-rotate-flip inverts both,
+  /var/local/sweet-norotate turns it off. Read when a shadow is made (respring). Logs: "native-metal: rotated
+  framebuffer: surface ... (descriptor rotation N)" and "rotated framebuffer: turn N into surface".
+- Codex: rebuild the ios27 plugin (scripts/build-adreno-metal-plugin.py --target ios27, same as the roomstall build;
+  the source also still has bridge patch 0042) and copy the executable to outputs/NativeAdrenoMetal-rotate.
+- Built with `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`; optional host replay generation was skipped after its shim failed to link. Fixed four Objective-C++ protocol-pointer type errors with explicit `id<MTLTexture>` casts only. Bundle codesign verification passed; executable copied byte-for-byte to `outputs/NativeAdrenoMetal-rotate`, SHA-256 `7a1e7c4a89e3896ad6897cbc0c31e895fae4a01a900a6c3f5cbf9e1ca0a4de3d`.
+- Test 1 (land2-oslog.txt, NativeAdrenoMetal-rotate installed): still black, "Failed to allocate [1792 x 828]" 156
+  times, and no rotation lines: NBLOG only reaches the log with SHENG_LOG_GPU set. QuartzCore (dsc 0x18434f3d8..):
+  texture2DDescriptorWithPixelFormat:width:height:mipmapped: landscape size, setFramebufferOnly:YES, setRotation:3,
+  setUsage:5 (or 0x11), then newTextureWithDescriptor:iosurface:plane:0; a nil texture logs "Failed to allocate".
+  So our path is the one called. Added always-on logs (RLOG, first 40 lines; refuseSurface logs landscape-shaped
+  refusals with their step). Codex: rebuild as before, executable to outputs/NativeAdrenoMetal-rotate2.
+- Test 2 (land3-oslog.txt): turning pipeline compiled, portrait texture over the surface made; the shadow failed: "no
+  1792x828 texture of our own". It was a copy of CA's descriptor (framebufferOnly YES, rotation 3). Now a plain
+  texture2DDescriptor (private, RenderTarget|ShaderRead); the failure line carries lastError(). Codex: rebuild,
+  executable to outputs/NativeAdrenoMetal-rotate3.
+- Test 3 (rotate3, land4-oslog.txt): framebuffer fixed: "a landscape texture of ours, turned counter-clockwise",
+  1200 turns in 35 s, no "Failed to allocate" left. Mojang logo shows for a second, then black: backboardd logs
+  "IOSurfaceAcceleratorTransformSurface returned: 0xe00002c7" every frame (1456x). QuartzCore 0x1844b7460 is
+  copy_iosurface ("msr-src"/"msr-dst", Left/Right/Top/Bottom clear): a scaler copy with letterbox clears, which our
+  CPU AppleM2ScalerCSCDriver stand-in refuses (nonzero rectangles). Its 32-line log was spent/rolled (dmesg empty).
+  SweetM2Scaler.cpp now logs refused requests (first 6 with the 0x170-byte request in hex, then every 1000th) and
+  bad-argument calls. Backup: research/ios27.2/kernel-backup/SweetM2Scaler.cpp.before-xflog.
+  Built `work/xnu-12377` as `DEVELOPMENT_ARM64_SWEET`; only `iokit/Kernel/arm/SweetM2Scaler.cpp` changed since
+  the cell5 kernel. Build succeeded without source fixes; log: `xnu12377-xflog-build.log`. Kernel SHA-256:
+  `bd2c99cb73d6210f7b8c1dc86415fdd112e7746b3d215c979ab0535004a7370d`.
+- The phone was confirmed to run cell5-diag, so this image uses those boot arguments with fresh
+  `sweettime=1795123307`; `diag=1` remains, `ufslogsecs=1` is absent. Arguments are 596 characters. ADT is unchanged:
+  `work/guacamole-ios27a-yuv.adt`.
+- Built `outputs/guacamole-ios27a-xflog-triple.img`. Its iOS 16 payload, selector shim and ADT are preserved from
+  cell5-diag-triple; only the iOS 27 payload at `0x103a000` was replaced. Boot arguments are recorded in
+  `outputs/guacamole-ios27a-xflog-triple-boot-args.txt`. SHA-256:
+  `9fcbdb2b663c44011b8068580c6ee6a6623a0a8a32e262edddd090f427bd7503`.
+- Not flashed. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-xflog-triple.img`.
+- Test 4 (xflog kernel flashed, land7-scaler.txt, dmesg polled every second): backboardd's refused requests are
+  src 828x1792 BGRA rows 3328 -> dst 1792x828 BGRA rows 7168 (dst cycles over 3 surfaces), about 65 a second from
+  Minecraft's landscape start; the 6 full dumps had rolled out of dmesg already (Minecraft's necp lines fill the
+  128 KB ring in ~30 s). Next kernel ("xfrot"): SweetM2Scaler turns such requests (W x H -> H x W, 32-bit) in 32x32
+  tiles, rectangles still ignored; new bsd/dev/sweet_scaler.c (in bsd/conf/files): kern.sweet_scaler_rot (rw, 0 refuse,
+  1 clockwise = default, 2 counter-clockwise), kern.sweet_scaler_last (the latest refused/rotated request in hex),
+  kern.sweet_scaler_stats (counts, average time per request).
+  Built `work/xnu-12377` as `DEVELOPMENT_ARM64_SWEET` with `SweetM2Scaler.cpp`, new `bsd/dev/sweet_scaler.c`, and
+  `bsd/conf/files` changes. Build succeeded without source fixes; compiler log: `xnu12377-xfrot-build.log.gz`.
+  Kernel SHA-256: `5a40536b913b83150b92a17baab7e219e6d05e2a95974e9c5170df2d810e0495`.
+- Reused `work/guacamole-ios27a-yuv.adt`; refreshed the xflog boot arguments' `sweettime` to `1795124499` and
+  kept all other arguments, including `diag=1`. Command line length: 596 characters. Arguments:
+  `outputs/guacamole-ios27a-xfrot-triple-boot-args.txt`.
+- Built `outputs/guacamole-ios27a-xfrot-triple.img`; iOS 16 payload, selector shim and ADT preserved from
+  `guacamole-ios27a-xflog-triple`; replaced iOS 27 payload at `0x103a000`. SHA-256: `784a1f3944ca578a60e350a095735c1779c4cae3c7b63a7fbdf80f64db8dc8af`.
+- Not flashed. Flash command when ready: `fastboot flash boot_b outputs/guacamole-ios27a-xfrot-triple.img`.
+- Test 5 (xfrot kernel + rotate3 plugin, land8-*.txt): still black. Scaler: rotated 4 (4.6 ms each), refused 142,
+  then no requests at all (stats unchanged over 5 s, no TransformSurface errors). The rotated-framebuffer path now
+  also runs in minecraftpe (its CAMetalLayer drawables: "turn 2400 into surface 0x170"). Likely cause: backboardd
+  samples the app's rotated drawable through a rotated *read* view; rotatedSurfaceTexture gave it an empty private
+  shadow (nothing turns the surface into it), so CA stopped using the scaler and drew an empty layer. Fix: only views
+  with RenderTarget usage get a shadow; sampled-only views are refused again, so CA goes back to copy_iosurface through
+  the kernel scaler, which now turns them (kern.sweet_scaler_rot). Rebuilt the iOS 27 plugin with
+  `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 work/UniXNU/scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`
+  and copied the executable byte-for-byte to `outputs/NativeAdrenoMetal-rotate4`; SHA-256
+  `74fe5ef1d9c56f05e741e90a0ad926664281995ea3cdd7b72a6ad128f48d7b67`. Kernel/image unchanged (xfrot).
+- Test 6 (rotate4, land10-*.txt): still black. backboardd no longer reads Minecraft's frames on the GPU (ROT imports
+  only its 2 framebuffers); the display gets Minecraft's drawable directly: SWEET FB layer 0 surface 678 (= 0x2a6,
+  minecraftpe's drawable, which its own rotated-framebuffer path turns into: rotation 1, usage 4) 828x1792 xform 0,
+  64/64 samples black. Scaler idle (6 rotations in all, 9-19 ms each: too slow anyway). Either the turn's output is
+  lost or Minecraft draws black. Test switch: /var/local/sweet-rotate-tint makes the turn add a red tint (read when a
+  shadow is made). /var/local/sweet-rotate-flip appears to be present on the phone (backboardd's rotation 3 logs
+  counter-clockwise). Rebuilt the iOS 27 plugin using the same `--target ios27 --no-replay` build, and copied the
+  executable byte-for-byte to `outputs/NativeAdrenoMetal-rotate5`; SHA-256
+  `e3a3848424474014454c4592df086109886e974c3f98ee863f03d8e8c4b5eb33`. Kernel/image unchanged (xfrot).
+- Test 7 (rotate5 + /var/local/sweet-rotate-tint): Minecraft's screen turns red, so the turn reaches the display and
+  the stand-in it reads is black: Minecraft's frame reaches the drawable another way than as a render target (a blit
+  or a shader write), so the turn ran without it. Now a stand-in is also turned when it is a blit's texture, a texture
+  bound with ShaderWrite usage, or the texture of a drawable the command buffer presents (turnPresented, in
+  presentDrawable:). Rebuilt the iOS 27 plugin with `--target ios27 --no-replay`; copied the executable byte-for-byte
+  to `outputs/NativeAdrenoMetal-rotate6`. SHA-256: `e40e0585fe8412f6e911e9b2ee33e69f481c97db0803bbdddcd0f55e1f60a2ca`.
+  Kernel/image unchanged (xfrot).
+- Test 8 (rotate6, land11-oslog.txt): still black (tint off, flip on). Turns as before (~43/s): turning at present
+  time changed nothing, so the stand-in really holds black when it is turned. Next: dump Minecraft's command buffers.
+  NativeAdrenoMetalPlugin.mm now also takes dump-cb from the file /var/local/dump-cb (NAME:FIRST[:COUNT]) besides the
+  boot-arg (the boot-arg line is at its limit). Backup: research/ios27.2/metal/NativeAdrenoMetalPlugin.mm.before-dumpfile.
+  Rebuilt the iOS 27 plugin with `--target ios27 --no-replay` and copied the executable byte-for-byte to
+  `outputs/NativeAdrenoMetal-rotate7`; SHA-256: `94f4a908dfe60632486782ec0b920e680a05d3832ee555c45487aa07a241bf51`.
+  Kernel/image unchanged (xfrot).
+  Codex: rebuild the plugin, executable to outputs/NativeAdrenoMetal-rotate7.
+- Test 9 (rotate7, dump-cb from /var/local/dump-cb = minecraftpe:600:3, outputs/land12/): Minecraft's command
+  buffers 600-602 each have 5 passes into its drawable (1792x828, our stand-in) with ZERO draws (clears, viewports,
+  scissors only), then our turn pass. Readback: the stand-in is all 0 (black, alpha 1). So the landscape path is fine
+  and Minecraft itself draws nothing; Minecraft logs "[Graphics] The graphics context was lost" at launch ("gained"
+  only after a background/foreground). Separate problem from landscape (likely async pipeline/library creation
+  never completing, or a capability check failing). dump-cb now also sets NMB_LOG_STDERR so the driver's refusals land
+  in the same file. Rebuilt the iOS 27 plugin with `--target ios27 --no-replay`; copied the executable byte-for-byte
+  to `outputs/NativeAdrenoMetal-rotate8`. SHA-256: `30b2a670347115bd5097ae5c07a7a01ee66c6b3755fc371f7e7d5b3f93de8e7a`.
+  Kernel/image unchanged (xfrot).
+- Test 10 (rotate8, dump-cb minecraftpe:2000:2, outputs/land13/): the driver refuses 64 of Minecraft's render pipelines:
+  "render pipeline refused: Compile(InvalidDescriptor(VertexAttribute { attribute: 0 }))" (metal2vulkan
+  pipeline/link/vertex.rs: an attribute the vertex stage reads missing from the descriptor, or a stage compiled under
+  another vertex-input projection, or an instanced attribute stepped per vertex). Their draws are skipped: black.
+  Reopening the app shows a frame for a split second. Also 7 "texture over buffer refused" (new_texture_with_iosurface_
+  plane, RowPitch). dump-cb now also sets SHENG_LOG_GPU (pipeline journal pipelines-PID.log with each refused pipeline's
+  vertex layout) and NBLOG's stderr lines keep 600 characters (were 140). Rebuilt the iOS 27 plugin with
+  `--target ios27 --no-replay`; copied the executable byte-for-byte to `outputs/NativeAdrenoMetal-rotate9`.
+  SHA-256: `c155b2f8eb942ecae5646eee2c17637023e1c62bcc6aa31b26c1d13ad2e5e202`. Kernel/image unchanged (xfrot).
+- Test 11 (rotate9, outputs/land14/): same 64 refusals; no pipeline journal found on the phone. The refusal line itself
+  now carries the descriptor (renderDumpInfo: functions, colour formats, a<N>=format@offset/b<buffer>=stride/step/rate,
+  or "(no vertex descriptor)"). The 5 "texture over buffer refused" in minecraftpe are sampled-only rotated views
+  (RowPitch 3328 < 7168), refused on purpose. Rebuilt the iOS 27 plugin with `--target ios27 --no-replay`; copied
+  the executable byte-for-byte to `outputs/NativeAdrenoMetal-rotate10`. SHA-256:
+  `a76aea2c8e15b076057656903e54fb2adafa5619da1a3b14aa053a8a4b755e7a`. Kernel/image unchanged (xfrot).
+- Test 12 (rotate10, outputs/land15/): every refused pipeline is Minecraft's own (v=xlatMtlMain f=xlatMtlMain, colour
+  f80 blended, depth/stencil f260) with NO vertex attributes in its descriptor, while metal2vulkan finds attribute 0
+  read (declared_attributes keeps only used inputs). Apple's driver makes such a pipeline (undefined values without
+  validation). Bridge patch 0043 (work/UniXNU/drivers/AdrenoMetal/bridge/patches/0043-vertex-attributes-absent-from-
+  the-descriptor.patch, copy in research/ios27.2/metal/, listed in scripts/build-adreno-metal-bridge.py): resolve()
+  leaves an attribute the descriptor lacks out of the projection, fixed_function_notes skips it, vertex_input_state
+  accepts it as an unfetched fixed-function input. Backup: research/ios27.2/metal/vertex.rs.before-absent.
+  The runtime id changes, so shader priming runs again once. Rebuilt bridge and plugin for ios27; the bridge archive
+  is 253341336 bytes, and the plugin was 4K-signed. Copied its executable byte-for-byte to
+  `outputs/NativeAdrenoMetal-absent`; SHA-256: `55b83a100875e12b8af0d3a4764ebb38eb7eedff40990cd14e9228c6e744f31f`.
+- Test 13 (absent = 0043, outputs/land16/): no pipeline refused now, and Minecraft draws (a 36-index cube, 11 UI
+  draws), but its frame is still all black: the descriptors are still empty, so the vertex stage reads nothing.
+  Cause: bgfx (Renderdragon) builds each vertex descriptor from -[MTLFunction vertexAttributes], which NBFunction did
+  not answer (nil). Added nmb_function_attribute_count/_at (bridge/NativeMetalObjects.rs/.h, from metal2vulkan's
+  Function::vertex_attributes / stage_input_attributes) and NBFunction -vertexAttributes / -stageInputAttributes
+  (NBAttribute: name, attributeIndex, attributeType, isActive, isPatchData, isPatchControlPointData). 0043 stays (Apple
+  accepts such pipelines too). Backups: research/ios27.2/metal/*.before-vattr. Rebuilt the iOS 27 bridge and plugin;
+  the bridge archive is 253388344 bytes and the plugin was 4K-signed. Copied the executable byte-for-byte to
+  `outputs/NativeAdrenoMetal-vattr`; SHA-256: `0a8e9003ccbcd60eca84e9a7970777b1c33bcfb825f722926138ed5f722a8548`.
+
 # Metal / UI performance work (2026-11-19, Claude)
 - UI scrolling runs at 37-39 fps on the 88 Hz panel (SWEET FB 5 s lines, measured after 8+ min uptime; earlier is
   shader priming). GPU time is about 16-17 ms a frame, so the CPU side is not the limit; games feel fine.
@@ -7220,3 +8372,15 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   and length of the packed buffer (0x23fea9b80: u32 count, items u32 len + data padded to 4), with_acm flag.
 - passcode19 (SOURCE, NOT BUILT): pc_verify_packed takes the by-address form via sweet_pc_verify_packed_user()
   (copyin, item 0, ACM-context resolution, check). Staged as outputs/pc19-*.
+
+### macOS 27: WindowServer past TimeSync, then IOSurface (2026-11-20)
+
+- With com.apple.clocksyncd booted out, WindowServer's `com.apple.timesync.expositor` lookup fails at once ("TSSyncEntityManager not available") and CAWindowServer init goes on: IOMobileFramebuffer finds and opens `primary`, IOHIDSystem gets connect type 0 + selector 0 (createShmem, version 4). clocksyncd is now disabled in launchd's override database by `tools/macos27-extras.sh`.
+- Next hang (sample): `-[CAWindowServer _detectDisplays]` -> `AppleDisplay::AppleDisplay` -> `kern_CopyLayerDisplayedSurface` -> `-[IOSurface initWithMachPort:]` -> `_ioSurfaceConnectInternal`, which sleeps in a retry loop around `IOServiceGetMatchingServices`. macOS's IOSurface.framework matches the name `IOSurfaceRoot` (the cache has no `IOCoreSurfaceRoot` string); iOS's matches `IOCoreSurfaceRoot`. `xnu/macos27/0007-iosurfaceroot-name-on-macos.patch`: on macOS the same service is named `IOSurfaceRoot`.
+- Then (IOSurface found): WindowServer set up the display (IOMFB selectors, IOSurface 13/34), its HID event system (touch, buttons, proximity) and session 257, and deadlocked in createSessionWithOwner -> CGSMouseStateCreate -> NXClickTime -> IOHIDCopyCFTypeParameter -> IOHIDCopyHIDParameterFromEventSystem -> io_hideventsystem_open: a synchronous message to com.apple.iohideventsystem, WindowServer's own service, which it checks in only later (launchd: active = 0). Codex's disassembly of IOKit (26B123): IOHIDCopyCFTypeParameter (0x184e74728) first reads the IOHIDSystem service's HIDParameters dictionary, then the key as a property of the service, and asks the event system only when both miss. `xnu/macos27/0008-iohidsystem-hidparameters.patch`: the stand-in publishes the classic HID parameters (HIDClickTime 500 ms in ns, key repeat, accelerations, HIDClickSpace 4x4, ...) in HIDParameters and as properties of their own.
+- First 0008 build: the properties were in the registry (ioreg) but the stack was unchanged. IOHIDCopyCFTypeParameter+76 calls the event system when IOConnectGetService fails, and XNU's IOUserClient::getService() returns NULL (kIOReturnUnsupported). 0008 now also overrides SweetHIDSystemUserClient::getService() to return the IOHIDSystem.
+- With 0008 complete WindowServer initializes (display LCD 828x1792 @ 90 Hz, modes, digitizer, iohideventsystem active) and then aborts every 30 s: "(IOGPU) Failed to create an IOGPUDevice... IOServiceOpen returned 0xE00002C2", "Metal device initially absent", "No suitable Metal devices present after 30 seconds" -> abort(). Codex (26B123): IOGPUDeviceCreate (0x193f393b0) opens the accelerator with type 5 (IOGPUDeviceUserClient protocol: selectors 2/0/5, shmem 14), which SweetAccelerator refuses (only 0x4147 / 2) -- fine, as UniXNU's NativeAdrenoPublish refuses IOGPU's open. +[IOGPUMetalDevice registerAcceleratorService:] (0x193f26630) matches IOAccelerator and reads MetalPluginName / MetalPluginClassName; the class must subclass IOGPUMetalDevice (UniXNU's macOS NativeAdrenoMetalDevice does, IOGPUMetalDeviceShim.h). Our accelerator was an IOAcceleratorES only. `xnu/macos27/0009-ioaccelerator-base-on-macos.patch`: on macOS IOAcceleratorES derives from an IOAccelerator. Userland: UniXNU build-turnip-darwin.py / build-adreno-metal-plugin.py --target macos27; tools/macos27-extras.sh installs the bundle + .publish. Per IOGPUMetalDeviceShim.h, SkyLight composites in software (CompositorSW) when the device has no accelerator port, Metal (WSGetDefaultMetalAccelerator) when it has one.
+- First macOS Metal boot (0009 + UniXNU macos27 bundle via box): "Metal compositor activated", WindowServer stays up, swaps/page flips 828x1792. Screen showed garbage, then black: every CoreAnimation pipeline fails "BinaryArchiveMiss ... compiler untried" (attachment_clear_frag_lph, fixed_frag_lph_cpf). WindowServer's home is /var/empty: the plugin's cache needs /private/var/tmp/NativeAdrenoMetal.cache (owner 88, 0755; UniXNU's kernel makes it at boot), now made by tools/macos27-extras.sh. With it the plugin writes ir3/, v1/, pipeline-records-WindowServer.bin, but no prime.log after 150 s and still no compile on a miss: handed to Codex (quartzcore_cache.mm / PrimeShaders.h).
+- '&BGA' framebuffer: Codex's QuartzCore patch (tools/patch-macos27-framebuffer-format.py, after UniXNU-sheng board.toml's 26C5035r NOP; here subcache .03 offset 0x5ca42b0, the TBNZ after CADeviceIsVirtualized in framebuffer_pixel_format) is installed on the phone (both cache paths, .orig kept) but WindowServer still uses &BGA: that branch is not the choice of compression on 26B123. screencapture over SSH: "Could not create image from display". SweetFramebuffer's GPU blit accepted only 'BGRA' (gpu_skip[3]), so &BGA frames went through the CPU copy. `xnu/macos27/0010-fb-accept-lossless-bgra-name.patch`: on macOS the GPU blit also takes 0x26424741 (the surface is 4 bytes a pixel, rows 3328, linear as created by our IOSurface). Test: does the panel show WindowServer's frame?
+- 0010 (GPU blit takes '&BGA'): WindowServer's frames reach the panel through the GPU blit, sampled black: nothing to draw. loginwindow is never started by WindowServer (runs = 0; WindowServer logged "PKGInitializeAppearanceTransitions running on installer"); `launchctl kickstart -p system/com.apple.loginwindow` starts it: session 257, first boot -> Language Chooser. The Language Chooser's main thread waited forever in +[IOBluetoothHostController defaultController] -> -[IOBluetoothCoreBluetoothCoordinator init] (semaphore; macOS bluetoothd never answers). `launchctl bootout system/com.apple.bluetoothd` + restarting the session: the panel turns white (Language Chooser's background), ~30 frames/s, samples not black. bluetoothd now disabled by tools/macos27-extras.sh. MenuBarAgent dies in _libsecinit_appsandbox (App Sandbox) every 10 s.
+- Login without Setup Assistant: account made with dscl (sysadminctl segfaults: no com.apple.systemadministration.writeconfig), password written as SALTED-SHA512-PBKDF2 ShadowHashData by tools/macos27-user-password.py (+ /etc/kcpassword, autoLoginUser, /var/db/.AppleSetupDone, AppleLanguages en-US). Every password check crashed opendirectoryd: securetoken_helpers_list_unlockrecords locks a NULL SecureToken context (no SEP, no APFS Preboot: "failed to get token path"); ;DisabledTags;SecureToken does not avoid it. corecrypto PBKDF2/SHA-512 on the phone match the Mac (tools/macos-pbkdf2-test.c). Codex's tools/patch-macos27-plistfile.py: CBZ x0 to the epilogue at the list wrapper's frame setup (both arm64e slices). NOTE: Codex patched the original from os-root.tar; the phone runs the PAC-lowered PlistFile from overlay/os-root-lowered.tar (8756 bytes differ), so the patch must be applied to the lowered file (the script does so cleanly: outputs/PlistFile.lowered-patched).

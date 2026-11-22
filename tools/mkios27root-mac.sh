@@ -80,6 +80,12 @@ fi
 sudo python3 "$TOOLS/launchd-fips-noverify.py" "$R/sbin/launchd" /tmp/ios27-launchd.new --no-reboot-task sysstatuscheck
 sudo sh -c 'cat /tmp/ios27-launchd.new > "$1"' _ "$R/sbin/launchd"	# keeps owner, mode, hard links
 sudo rm -f /tmp/ios27-launchd.new
+# BlueTool: alias the BCM4357B1/USI legacy row (whose HCD is built into BlueTool) to D73's ProductHash, so the
+# btbridge-emulated BCM4357B1 finds a row. Without it: "HCD file corrupt!", then "no firmware for this platform",
+# and Bluetooth restarts forever. Page hashes are refreshed by the script; the signature and entitlements stay.
+sudo python3 "$TOOLS/patch-bluetool27-profile.py" "$R/usr/sbin/BlueTool" /tmp/ios27-BlueTool.new
+sudo sh -c 'cat /tmp/ios27-BlueTool.new > "$1"' _ "$R/usr/sbin/BlueTool"	# keeps owner, mode, hard links
+sudo rm -f /tmp/ios27-BlueTool.new
 # launchd.plist: no FairPlay here; com.apple.fairplayd.H2 exits -42306 and KeepAlive restarts it forever.
 # 2026-11-19: com.apple.cameracaptured goes too: the synthetic camera kept restarting it (about 400 MB of GPU pool,
 # then a jetsam kill, every few seconds), which resprung SpringBoard when leaving a game. backboardd gets
@@ -88,7 +94,9 @@ sudo python3 - "$R/System/Library/xpc/launchd.plist" <<'PYEOF'
 import plistlib, sys
 p = sys.argv[1]
 d = plistlib.load(open(p, 'rb'))
-gone = [k for k, j in d['LaunchDaemons'].items() if j.get('Label') in ('com.apple.fairplayd.H2', 'com.apple.cameracaptured')]
+# 2026-11-20: com.apple.PerfPowerServices too: it loops forever over SMC keys (no AppleSMC here), a core at 100 %.
+gone = [k for k, j in d['LaunchDaemons'].items() if j.get('Label') in ('com.apple.fairplayd.H2', 'com.apple.cameracaptured',
+                                                                   'com.apple.PerfPowerServices')]
 for k in gone:
     del d['LaunchDaemons'][k]
 for j in d['LaunchDaemons'].values():
@@ -101,9 +109,32 @@ with open(p, 'r+b') as f:	# rewrite in place: owner and mode stay
 print('launchd.plist: removed', gone)
 PYEOF
 
+# 2026-11-20: files the old phone root was given by hand (boxes, SSH), all kept in tools/ios27root/:
+#  - no Setup: purplebuddy + purplebuddy.notbackedup (SetupDone, SetupFinishedAllSteps, ForceNoBuddy, UserChoseLanguage,
+#    SetupVersion/TVSetupVersion 99, every "<Pane>Presented" key in 27.2's Setup binary);
+#  - CoreAnimation: no deep / compressed framebuffers (else backboardd makes '&BGA' surfaces and colours go wrong,
+#    NOTES 2026-11-14 18:15): com.apple.backboardd (backboardd runs as mobile) and .GlobalPreferences, + en-US;
+#  - Wi-Fi: SystemConfiguration preferences.plist with a Wi-Fi service on en0 in set "Automatic" (27.2 does not create
+#    one; without it configd never configures en0 and there is no IP, NOTES 2026-11-14 20:45);
+#  - GPU: NativeAdrenoMetal.primelist (the 310 .metallibs to prime; else backboardd walks the whole disk, 2026-11-17).
+F="$TOOLS/ios27root"
+pref="$R/private/var/mobile/Library/Preferences"
+sudo install -d -o 501 -g 501 -m 0755 "$pref"
+for f in com.apple.purplebuddy.plist com.apple.purplebuddy.notbackedup.plist com.apple.backboardd.plist .GlobalPreferences.plist; do
+	sudo install -o 501 -g 501 -m 0600 "$F/$f" "$pref/$f"
+done
+echo "Setup skipped: purplebuddy prefs installed; CoreAnimation framebuffer prefs installed"
+sc="$R/private/var/preferences/SystemConfiguration"
+sudo install -d -o 0 -g 0 -m 0755 "$sc"
+sudo install -o 0 -g 0 -m 0644 "$F/preferences.plist" "$sc/preferences.plist"
+echo "Wi-Fi: network service for en0 installed"
+sudo install -o 0 -g 0 -m 0644 "$F/NativeAdrenoMetal.primelist" "$R/System/Library/Extensions/NativeAdrenoMetal.primelist"
+echo "GPU: shader priming list installed"
+
 # Network extras (all optional; local files only, never in git: research/ is ignored).
 #   research/ios27.2/extras/bootstrap-ssh-iphoneos-arm64.tar.zst   Procursus rootless bootstrap with OpenSSH
 #       (https://apt.procurs.us/bootstraps/1900/) -> /var/jb; host keys made here; launchd job com.sweet.sshd
+#   research/ios27.2/extras/ssh_host_keys/                         sshd host keys, reused by every root (made on first build)
 #   research/ios27.2/extras/authorized_keys                         -> /var/root/.ssh and /var/mobile/.ssh
 #   research/ios27.2/extras/fw/{modem,rmtfs}/...                    -> /var/local/fw (userland/wland/README.md)
 #   research/ios27.2/extras/wlan.conf (ssid=, psk=)                 -> /var/local/wlan.conf (0600)
@@ -132,7 +163,23 @@ if [ -f "$bs" ]; then
 	sudo tar -xpf "$bs" -C "$R" -s '#^\./var/#./private/var/#' -s '#^var/#private/var/#' --exclude '._*'
 	sudo test -x "$R/private/var/jb/usr/sbin/sshd" || { echo "bootstrap: no /var/jb/usr/sbin/sshd" >&2; exit 1; }
 	sudo mkdir -p "$R/private/var/jb/etc/ssh"
-	sudo ssh-keygen -A -f "$R/private/var/jb"
+	# 2026-11-20: the same host keys in every root (kept in the git-ignored research/ios27.2/extras/ssh_host_keys/),
+	# so a reflash no longer trips "REMOTE HOST IDENTIFICATION HAS CHANGED" on the Mac. Made once, then reused.
+	hk="$X/ssh_host_keys"
+	if ls "$hk"/ssh_host_*_key >/dev/null 2>&1; then
+		sudo cp "$hk"/ssh_host_* "$R/private/var/jb/etc/ssh/"
+		echo "ssh host keys: reused from $hk"
+	else
+		sudo ssh-keygen -A -f "$R/private/var/jb"
+		mkdir -p "$hk"
+		sudo cp "$R/private/var/jb/etc/ssh/"ssh_host_* "$hk/"
+		sudo chown "$(id -u):$(id -g)" "$hk"/ssh_host_*
+		chmod 0600 "$hk"/ssh_host_*_key
+		echo "ssh host keys: made and saved to $hk"
+	fi
+	sudo chown 0:0 "$R/private/var/jb/etc/ssh/"ssh_host_*
+	sudo chmod 0600 "$R/private/var/jb/etc/ssh/"ssh_host_*_key
+	sudo chmod 0644 "$R/private/var/jb/etc/ssh/"ssh_host_*.pub
 	# Procursus ships root locked ("!"); give root the same password as mobile ("alpine") so ssh root@ works.
 	mp="$R/private/var/jb/etc/master.passwd"
 	mh=$(sudo awk -F: '$1=="mobile"{print $2}' "$mp")
@@ -226,6 +273,51 @@ if [ -f "$U/adspd" ] && [ -f "$U/tfa" ] && [ -f "$X/fw/modem-all/adsp.mdt" ]; th
 		echo "ADSP speaker stack: binaries/firmware staged; no boot job (extras/fw/tfa98xx.cnt missing)"
 	fi
 fi
+# 2026-11-20: everything the old phone root had by hand goes into the image (a fresh 80g root came up without the
+# GPU driver, Bluetooth, the switch files and the debugging tools).
+# GPU: the NativeAdrenoMetal bundle (newest build: METAL_BUNDLE, default the iOS 27 plugin build folder) + .publish.
+MB=${METAL_BUNDLE:-$TOOLS/../work/UniXNU/build/adreno-metal-plugin27/NativeAdrenoMetal.bundle}
+if [ -f "$MB/NativeAdrenoMetal" ] && [ -f "$MB/libvulkan_freedreno.dylib" ]; then
+	ext="$R/System/Library/Extensions"
+	sudo rm -rf "$ext/NativeAdrenoMetal.bundle"
+	sudo cp -R "$MB" "$ext/NativeAdrenoMetal.bundle"
+	sudo chown -R 0:0 "$ext/NativeAdrenoMetal.bundle"
+	sudo find "$ext/NativeAdrenoMetal.bundle" -type d -exec chmod 0755 {} \;
+	sudo find "$ext/NativeAdrenoMetal.bundle" -type f -exec chmod 0644 {} \;
+	sudo chmod 0755 "$ext/NativeAdrenoMetal.bundle/NativeAdrenoMetal" "$ext/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib"
+	sudo install -o 0 -g 0 -m 0644 /dev/null "$ext/NativeAdrenoMetal.publish"
+	echo "GPU: NativeAdrenoMetal.bundle from $MB ($(shasum -a 256 "$MB/NativeAdrenoMetal" | cut -c1-16))"
+else
+	echo "ERROR: no NativeAdrenoMetal bundle at $MB (set METAL_BUNDLE): the root would have no GPU" >&2; exit 1
+fi
+# Switch files the phone had (read at process start): rs-atcall = backboardd encodes at the call (kept 2026-11-20),
+# rotate-flip = landscape framebuffer orientation (2026-11-19).
+sudo install -d -m 0755 "$R/private/var/local"
+for f in sweet-rs-atcall sweet-rotate-flip; do sudo install -o 0 -g 0 -m 0644 /dev/null "$R/private/var/local/$f"; done
+# Bluetooth: btbridge (UART <-> bluetoothd), started at boot, retried until wland has the rails up.
+if [ -f "$U/btbridge" ]; then
+	sudo install -d -m 0755 "$R/private/var/local/bin"
+	sudo install -m 0755 "$U/btbridge" "$R/private/var/local/bin/btbridge"
+	jobs+=(btbridge)
+	echo "btbridge: installed; boot job enabled"
+else
+	echo "ERROR: no userland/out/btbridge (sh userland/build.sh): the root would have no Bluetooth" >&2; exit 1
+fi
+# Tools and helper jobs: spinwatch (restarts locationd when it spins a core), bootlog (first 4 min of oslog per boot),
+# tsample / ptop / oslog for debugging.
+sudo install -d -m 0755 "$R/private/var/local/bin"
+for t in spinwatch tsample ptop oslog mgtool; do
+	[ -f "$U/$t" ] && sudo install -m 0755 "$U/$t" "$R/private/var/local/bin/$t" && echo "tool: $t"
+done
+[ -f "$U/spinwatch" ] && jobs+=(spinwatch)
+# MobileGestalt answers (Bluetooth's WifiVendor, cellular, haptics, @2x layout): the cache only exists after the first
+# boot, so a boot job applies them whenever the cache is new (userland/jb/sweet-mgfix.sh).
+[ -f "$U/mgtool" ] || { echo "ERROR: no userland/out/mgtool: Bluetooth and cellular need it" >&2; exit 1; }
+sudo install -m 0755 "$TOOLS/../userland/jb/sweet-mgfix.sh" "$R/private/var/local/bin/sweet-mgfix"
+jobs+=(mgfix)
+# GPS through the modem (userland/wland/gnss.c): on, with the engine lock lifted for our client.
+echo unlock=all | sudo tee "$R/private/var/local/gnss.on" >/dev/null
+[ -f "$U/oslog" ] && jobs+=(bootlog)
 if [ ${#jobs[@]} -gt 0 ]; then
 sudo python3 - "$R/System/Library/xpc/launchd.plist" "${jobs[@]}" <<'PYEOF'
 import plistlib, sys
@@ -236,7 +328,7 @@ J = {
         'POSIXSpawnType': 'Interactive', 'StandardOutPath': '/var/local/wland.out',
         'StandardErrorPath': '/var/local/wland.out'}),
     'sshd': ('/System/Library/LaunchDaemons/com.sweet.sshd.plist', {
-        'Label': 'com.sweet.sshd', 'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-e', '-o', 'LogLevel=DEBUG3'], 'RunAtLoad': True,
+        'Label': 'com.sweet.sshd', 'ProgramArguments': ['/var/jb/usr/sbin/sshd', '-D', '-e'], 'RunAtLoad': True,
         'KeepAlive': True, 'POSIXSpawnType': 'Interactive', 'StandardErrorPath': '/var/local/sshd.out'}),
 }
 J['pwdmkdb'] = ('/System/Library/LaunchDaemons/com.sweet.pwdmkdb.plist', {
@@ -263,6 +355,23 @@ J['adspd'] = ('/System/Library/LaunchDaemons/com.sweet.adspd.plist', {
     'Label': 'com.sweet.adspd', 'ProgramArguments': ['/var/local/bin/adspd', 'serve'], 'RunAtLoad': True,
     'KeepAlive': True, 'EnvironmentVariables': {'ADSPD_BOOT': '30'}, 'POSIXSpawnType': 'Interactive',
     'StandardOutPath': '/var/local/adspd.out', 'StandardErrorPath': '/var/local/adspd.out'})
+J['btbridge'] = ('/System/Library/LaunchDaemons/com.sweet.btbridge.plist', {
+    'Label': 'com.sweet.btbridge', 'ProgramArguments': ['/var/local/bin/btbridge', '-q'], 'RunAtLoad': True,
+    'KeepAlive': True, 'ThrottleInterval': 10, 'POSIXSpawnType': 'Interactive',
+    'StandardOutPath': '/var/local/btbridge.out', 'StandardErrorPath': '/var/local/btbridge.out'})
+J['spinwatch'] = ('/System/Library/LaunchDaemons/com.sweet.spinwatch.plist', {
+    'Label': 'com.sweet.spinwatch', 'ProgramArguments': ['/var/local/bin/spinwatch', 'locationd'], 'RunAtLoad': True,
+    'KeepAlive': True, 'ProcessType': 'Background',
+    'StandardOutPath': '/var/local/spinwatch.log', 'StandardErrorPath': '/var/local/spinwatch.log'})
+J['mgfix'] = ('/System/Library/LaunchDaemons/com.sweet.mgfix.plist', {
+    'Label': 'com.sweet.mgfix', 'ProgramArguments': ['/var/local/bin/sweet-mgfix'], 'RunAtLoad': True,
+    'KeepAlive': False, 'POSIXSpawnType': 'Interactive',
+    'StandardOutPath': '/var/local/mgfix.out', 'StandardErrorPath': '/var/local/mgfix.out'})
+J['bootlog'] = ('/System/Library/LaunchDaemons/com.sweet.bootlog.plist', {
+    'Label': 'com.sweet.bootlog', 'RunAtLoad': True, 'KeepAlive': False, 'POSIXSpawnType': 'Interactive',
+    'ProgramArguments': ['/bin/zsh', '-c', 'exec > /var/local/boot-oslog.txt 2>&1; '
+                         'for p in /usr/local/bin/oslog /var/local/bin/oslog; do '
+                         '[ -x $p ] && exec $p -t 240; done; echo no oslog']})
 d = plistlib.load(open(p, 'rb'))
 for w in want:
     k, j = J[w]
@@ -297,3 +406,6 @@ trap - EXIT
 hdiutil convert ios27-root.sparseimage -format UDTO -o ios27-root
 ls -l ios27-root.cdr
 shasum -a 256 ios27-root.cdr
+# Sparse image for fastboot: ONLY with tools/hfs2simg.py. A generic converter drops all-zero blocks that HFS uses
+# (2026-11-20: corrupted dyld and the cache on the phone, launchd crashed).
+python3 "$TOOLS/hfs2simg.py" ios27-root.cdr ios27-root.simg

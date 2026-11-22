@@ -130,3 +130,41 @@ uint64_t mmu_probe(uintptr_t va)
 	__asm__ volatile("at s1e1r, %0; isb" : : "r"(va) : "memory");
 	return rsr("par_el1");
 }
+
+/*
+ * 2026-11-20 (boot menu): the menu runs with the MMU on (image cacheable, framebuffer write-combining:
+ * the pictures draw ~30x faster) and this turns it off before the UFS write, Android and the iOS loader,
+ * which all expect it off. One asm block, so nothing touches memory between the clean and SCTLR:
+ * clean+invalidate the image, caches and MMU off, clean+invalidate again, drop the TLB and I-cache.
+ */
+void mmu_disable(void)
+{
+	uintptr_t lo = (uintptr_t)_head & ~(PG_SIZE - 1);
+	uintptr_t hi = ((uintptr_t)_end + PG_SIZE - 1) & ~(PG_SIZE - 1);
+	uint64_t line = 4UL << ((rsr("ctr_el0") >> 16) & 0xf);
+	uint64_t mask = SCTLR_M | SCTLR_C | SCTLR_I;
+
+	__asm__ volatile(
+		"dsb sy\n"
+		"mov x9, %0\n"
+		"1: dc civac, x9\n"
+		"add x9, x9, %2\n"
+		"cmp x9, %1\n"
+		"b.lo 1b\n"
+		"dsb sy\n"
+		"mrs x10, sctlr_el1\n"
+		"bic x10, x10, %3\n"
+		"msr sctlr_el1, x10\n"
+		"isb\n"
+		"mov x9, %0\n"
+		"2: dc civac, x9\n"
+		"add x9, x9, %2\n"
+		"cmp x9, %1\n"
+		"b.lo 2b\n"
+		"dsb sy\n"
+		"ic iallu\n"
+		"tlbi vmalle1\n"
+		"dsb sy\n"
+		"isb\n"
+		: : "r"(lo), "r"(hi), "r"(line), "r"(mask) : "x9", "x10", "memory", "cc");
+}

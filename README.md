@@ -34,6 +34,10 @@ Status snapshot: **2026-11-18**. For detailed evidence, caveats, and engineering
 ### Partial or unreliable
 
 - **Metal/GPU:** NativeAdrenoMetal and Turnip render the UI, at roughly 30-40 fps while scrolling (Turnip concurrent binning on: `tu-cb=1`). The display controller scales frames to the panel in hardware (QSEED3) instead of a GPU blit. Stutters are shorter (about 100 ms at worst while scrolling) but not gone; textures still use a linear layout. Unity games render since late store actions were added (Subway Surfers plays; `xnu/ios27/adrenometal-late-store.diff`, boot-arg `thid_should_crash=0`), but other apps and games are untested.
+- **Landscape apps:** working (the rotated framebuffer, apps' rotated drawables, the scaler's rotation;
+  `xnu/ios27/adrenometal-landscape.diff`, `xnu12377-scaler-rotate.diff`). Minecraft renders and plays, at a low frame
+  rate (about 20 fps), after the Metal fixes for vertex attributes and `blitCommandEncoderWithDescriptor:`
+  (`adrenometal-blitdesc.diff`) and skipping unchanged binds (`adrenometal-bindcache.diff`).
 - **Performance:** better after removing the spinning `PerfPowerServices` job and preferring the big CPU cores, but `locationd` can spin on a full core after boot (killing it works around it) and `wland` polls Wi-Fi every millisecond (about 12% of a core).
 - **Video playback:** plays in Safari (YouTube) and from local files since the YUV video layer fix (`xnu/ios27/xnu12377-fb-yuv.diff`); the player controls over the video are fixed in source but not yet confirmed on a build.
 - **Camera limits:** the rear camera takes about 2 s to start, because the sensor setup and lens program are sent over a slow 100 kHz I2C bus. The preview is processed on the CPU from full 4000x3000 frames, so it is not smooth. The pop-up is moved on a timer like Android's, but its position sensors and drop detection are not used yet. The ultra-wide and telephoto cameras are not supported, and photos come out as single frames (no multi-frame processing).
@@ -48,7 +52,7 @@ Status snapshot: **2026-11-18**. For detailed evidence, caveats, and engineering
 
 ## Booting
 
-Use the combined triple-boot image and select iOS 27 from the shim menu. The Alert Slider picks the default in the menu's order: top iOS 27, middle iOS 16, bottom Android. **Do not assume a standalone iOS wrapper image will boot**; this setup requires the selector/triple-boot path.
+Use the combined menu boot image and select iOS 27 from the shim menu (iOS 27 / macOS 27 / Android; the last choice is the default). **Do not assume a standalone iOS wrapper image will boot**; this setup requires the selector/triple-boot path.
 
 The existing data partition is named `ios26`, so iOS 27 boot arguments commonly contain `ufsroot=ios26`. That is the partition label, not the OS version. See [`docs/dualboot.md`](docs/dualboot.md) for the image layout and selector workflow. The phone's Android installation and partition backups should be preserved when building or booting test images.
 
@@ -58,7 +62,7 @@ The existing data partition is named `ios26`, so iOS 27 boot arguments commonly 
 - **Metal plugin:** source/build work is in the separate Git repository at `work/UniXNU`; it is not included in commits to this repository.
 - **Root filesystem:** `tools/mkios27root-mac.sh` builds the iOS 27.2 root image on macOS from the prepared IPSW contents.
 - **Device tree and payload:** `tools/mkadt.py`, `tools/mkpayload.py`, and the shim build create the ADT and kernel payload used by the boot image.
-- **Triple-boot image:** `tools/mktripleboot.py` combines the stock boot image, selector shim, iOS 16 payload, and iOS 27 payload. See `docs/dualboot.md` for required inputs.
+- **Menu boot image:** `tools/mkmenuboot.py` combines the stock boot image, selector shim, the iOS 27 payload and (later) a macOS 27 payload. See `docs/dualboot.md` for required inputs.
 - **Userland tools and drivers:** `userland/` contains Wi-Fi, Bluetooth, audio, display, haptics, GPU and diagnostic code, including the phone-side diagnostics `ptop` (CPU, memory and process churn), `tsample` (sampling profiler), `tprobe` (clocks, timed waits, thread policies) and `rebootbl` (reboot to fastboot) in `userland/jb/`.
 - **launchd jobs:** `tools/launchd-add-job.py` and `tools/launchd-drop-job.py` add and remove jobs in iOS's launchd plist (the `adspd` boot job, the removed `PerfPowerServices`).
 - **Detailed status:** [`docs/ios27.md`](docs/ios27.md) tracks the current feature state; [`NOTES.md`](NOTES.md) records experiments, build artifacts, crashes and decisions. A source change or successful build does not by itself establish that a feature works at runtime.

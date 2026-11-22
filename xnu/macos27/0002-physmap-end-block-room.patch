@@ -1,0 +1,23 @@
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1914,9 +1914,20 @@
+ #else
+ #if defined(ARM_LARGE_MEMORY)
+ 	/* For large memory systems with no PPL such as virtual machines */
+ 	static_memory_end = phystokv(args->topOfKernelData);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET (macOS 27 on the OnePlus 7 Pro): ARM_LARGE_MEMORY without PPL. arm_vm_physmap_init (non-PPL) maps with
++	 * ARM64_GRANULE_ALLOW_BLOCK, which moves each region's VA up to a twig so its offset matches the PA's; on a VM the
++	 * offsets already agree, here they do not, and the remainder of memory ended past physmap_end (assertion at
++	 * arm_vm_init.c:1643). Leave the same worst-case room as the !ARM_LARGE_MEMORY case; physmap_base sits at least one
++	 * L1 entry below VM_MIN_KERNEL_ADDRESS, far more than PTOV_TABLE_SIZE twigs.
++	 */
++	physmap_end = physmap_base + real_phys_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE);
++#else
+ 	physmap_end = physmap_base + real_phys_size;
++#endif
+ #else
+ 	static_memory_end = physmap_base + mem_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE); // worst possible case for block alignment
+ 	physmap_end = physmap_base + real_phys_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE);
+ #endif // ARM_LARGE_MEMORY

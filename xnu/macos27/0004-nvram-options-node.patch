@@ -1,0 +1,123 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <libkern/libkern.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -46,6 +47,85 @@
+ 	return "('chosen', 'defaults', 'cpus', 'options')";
+ }
+ 
++#if XNU_TARGET_OS_OSX
++/*
++ * IODTNVRAM reads its image from /chosen, as iBoot leaves it: nvram-bank-size/-count/-current-bank and
++ * nvram-proxy-data (2026-11-20: without them "IONVRAMCHRPHandler creation failed" panics; the CHRP handler also needs a
++ * valid image, it reads the partitions from it). One 64 KiB v1 bank, empty: the Apple "nvram" header, a "common"
++ * partition up to 32 KiB and a "system" partition of 32 KiB, adler32 as IONVRAMCHRPHandler.cpp checks it.
++ */
++#define SWEET_NVRAM_BANK 0x10000u
++
++static uint8_t
++sweet_chrp_cksum(const uint8_t *hdr)
++{
++	uint16_t sum = hdr[0];
++	for (int i = 2; i < 16; i++) {
++		sum += hdr[i];
++	}
++	while (sum > 0xff) {
++		sum = (sum & 0xff) + (sum >> 8);
++	}
++	return (uint8_t)sum;
++}
++
++static void
++sweet_chrp_part(uint8_t *at, uint8_t sig, uint32_t bytes, const char *name)
++{
++	uint16_t len = (uint16_t)(bytes / 16);
++	at[0] = sig;
++	memcpy(at + 2, &len, sizeof(len));
++	strlcpy((char *)at + 4, name, 12);
++	at[1] = sweet_chrp_cksum(at);
++}
++
++static void
++sweet_nvram_chosen(IORegistryEntry *rootEntry)
++{
++	IORegistryEntry *chosen = rootEntry->childFromPath("chosen", gIODTPlane);
++	if (chosen == NULL) {
++		return;
++	}
++	OSObject *have = chosen->copyProperty("nvram-proxy-data");
++	if (have != NULL) {
++		have->release();
++		chosen->release();
++		return;
++	}
++	uint8_t *img = (uint8_t *)IOMallocZeroData(SWEET_NVRAM_BANK);
++	if (img != NULL) {
++		sweet_chrp_part(img, 0x5a, 0x20, "nvram");                       /* Apple header: 16 + adler + generation */
++		uint32_t generation = 1;
++		memcpy(img + 20, &generation, sizeof(generation));
++		sweet_chrp_part(img + 0x20, 0x70, 0x8000 - 0x20, "common");
++		sweet_chrp_part(img + 0x8000, 0x70, 0x8000, "system");
++		uint32_t lo = 1, hi = 0;
++		for (uint32_t i = 20; i < SWEET_NVRAM_BANK; i++) {              /* adler32 from the generation field on */
++			lo = (lo + img[i]) % 65521u;
++			hi = (hi + lo) % 65521u;
++		}
++		uint32_t adler = (hi << 16) | lo;
++		memcpy(img + 16, &adler, sizeof(adler));
++		OSData *d = OSData::withBytes(img, SWEET_NVRAM_BANK);
++		if (d != NULL) {
++			chosen->setProperty("nvram-proxy-data", d);
++			d->release();
++		}
++		IOFreeData(img, SWEET_NVRAM_BANK);
++	}
++	uint32_t v[3] = { SWEET_NVRAM_BANK, 1, 0 };
++	const char *keys[3] = { "nvram-bank-size", "nvram-bank-count", "nvram-current-bank" };
++	for (int i = 0; i < 3; i++) {
++		OSData *d = OSData::withBytes(&v[i], sizeof(v[i]));
++		if (d != NULL) {
++			chosen->setProperty(keys[i], d);
++			d->release();
++		}
++	}
++	chosen->release();
++}
++#endif /* XNU_TARGET_OS_OSX */
++
+ void
+ SweetPlatformExpert::processTopLevel(IORegistryEntry *rootEntry)
+ {
+@@ -54,6 +134,26 @@
+ 	 * SWEET has no NVRAM controller; publish real CPU/device nodes without
+ 	 * inventing one. createNubs adds the topology's logical CPU/cluster IDs.
+ 	 */
++#if XNU_TARGET_OS_OSX
++	/*
++	 * 2026-11-20, macOS 27: kernelmanagerd and kmutil stop at once with "NVRAM.swift:123: Fatal error: NVRAM isn't
++	 * supported on this system" when IODeviceTree:/options is missing. Give macOS the stock NVRAM object on an empty
++	 * /options node: publishNVRAM -> IOPlatformExpertDevice::createNVRAM -> IODTNVRAM. There is no NVRAM controller,
++	 * so variables live in memory only and are gone at the next boot. iOS keeps running without /options.
++	 */
++	sweet_nvram_chosen(rootEntry);
++	if (IORegistryEntry *existing = rootEntry->childFromPath("options", gIODTPlane)) {
++		existing->release();
++	} else {
++		IORegistryEntry *options = new IORegistryEntry;
++		if (options != NULL && options->init()) {
++			options->setName("options");
++			options->attachToParent(rootEntry, gIODTPlane);
++		}
++		OSSafeReleaseNULL(options);
++	}
++	publishNVRAM();	/* IODTPlatformExpert's own dtNVRAM is private and stays NULL: its readNVRAM* helpers say unsupported */
++#endif /* XNU_TARGET_OS_OSX */
+ 	IORegistryEntry *cpus = rootEntry->childFromPath("cpus", gIODTPlane);
+ 	if (cpus != NULL) {
+ 		createNubs(this, IODTFindMatchingEntries(cpus, kIODTExclusive, NULL));

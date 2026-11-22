@@ -1,0 +1,35 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -383,6 +383,23 @@
+ #define SWEET_FB_LOGICAL_H              sweet_fb_logical_h
+ static uint32_t sweet_fb_logical_w = 1125, sweet_fb_logical_h = 2436;
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++/*
++ * macOS 27: WindowServer's framebuffer surface is '&BGA' (0x26424741, CoreVideo's lossless-compressed BGRA name),
++ * 828x1792, 4 bytes a pixel, rows of 3328 bytes: a linear layout. Our IOSurface and the Metal plugin implement no
++ * Apple compression, so what Turnip renders into it is plain BGRA. Only the GPU blit (which waits for the frame's GPU
++ * work) accepted 'BGRA'; '&BGA' fell back to the CPU copy and the panel showed blocky garbage (2026-11-21; whether the
++ * CPU copy read it before the GPU's writes or the contents are not linear is what this test tells). On macOS the GPU
++ * path takes both.
++ */
++static inline bool
++sweet_fb_gpu_bgra(uint32_t format)
++{
++#if XNU_TARGET_OS_OSX
++	return format == SWEET_FB_FORMAT_BGRA || format == 0x26424741u;
++#else
++	return format == SWEET_FB_FORMAT_BGRA;
++#endif
++}
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -2258,7 +2275,7 @@
+ 	for (uint32_t i = 0; i < layers; i++) {
+ 		uint32_t l = order[i];
+ 		SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * l));
+-		if (s == NULL || s == fSurface || s->memory == NULL || s->pixelFormat != 0x42475241u ||
++		if (s == NULL || s == fSurface || s->memory == NULL || !sweet_fb_gpu_bgra(s->pixelFormat) ||
+ 		    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 || (s->bytesPerRow & 63) ||
+ 		    (s->offset & 63)) {
+ 			OSSafeReleaseNULL(s);

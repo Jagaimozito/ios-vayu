@@ -1,0 +1,82 @@
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -391,6 +391,10 @@
+         // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. tu-cb=1 turns it on.
+         // It stays at Mesa's default, off: what it gains here was never measured.
+         if (bootArgSet("tu-cb=1")) setenv("tu_allow_concurrent_binning", "true", 0);
++        // 2026-11-19 (bridge patch 0044): a render pass after another whose end is still being lowered opens on the runtime's
++        // lowering thread, so the app's render thread does not wait at pass boundaries. /var/local/sweet-nodeferopen turns it off
++        // (every pass opens at its call, as before), read as each process starts.
++        if (access("/var/local/sweet-nodeferopen", F_OK) == 0) setenv("M2V_DEFERRED_OPEN", "0", 1);
+         // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
+         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
+         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -103,6 +103,10 @@
+ uint64_t nmb_device_purge_pending(const NmbDevice *);
+ uint64_t nmb_purge_age_ms(void);
+ bool nmb_device_purge_counts(const NmbDevice *, uint64_t out[16]);
++/* The runtime's render pass openings left to its lowering thread (bridge patch 0044): left at their calls, run by the thread, run on
++ * the program's thread, run out of the order the program asked (always 0 unless the hand-off is wrong), refused as they ran.
++ * M2V_DEFERRED_OPEN=0 in the environment opens every pass at its call. */
++bool nmb_deferred_open_counts(uint64_t out[5]);
+ // Call stacks that allocated device memory of 4 MiB or more, most bytes first: records of twelve words (bytes, allocations, ten return
+ // addresses); returns how many were written, at most max.
+ size_t nmb_allocation_sites(uint64_t *out, size_t max);
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -745,6 +745,20 @@
+     })
+ }
+ 
++/// The runtime's deferred render pass openings (ios-sweet bridge patch 0044, `render/deferral.rs`), into the caller's five words:
++/// left to the lowering thread at their calls, run by that thread, run on the program's thread, run out of the order the program
++/// asked (the ordering check: always 0 unless the hand-off is wrong), refused as they ran.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_deferred_open_counts(out: *mut u64) -> bool {
++    if out.is_null() {
++        return false;
++    }
++    let counts = metal2vulkan_runtime::deferred_open_counts();
++    // SAFETY: the header's five words.
++    unsafe { std::ptr::copy_nonoverlapping(counts.as_ptr(), out, counts.len()) };
++    true
++}
++
+ /// A command buffer names the buffer from now until `nmb_buffer_unhold`: it is not discarded meanwhile. Called before the command
+ /// that names it is encoded. True where the buffer is discarded now: its caller names it without having set it NonVolatile first.
+ #[unsafe(no_mangle)]
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -3444,6 +3444,22 @@
+  return (id<MTLTexture>)(id)shadow;
+ }
+ 
++// 2026-11-19 (bridge patch 0044 and the upload reuse): every 1000th commit, one line with the deferred render pass openings and the
++// upload buffers reused; with diag=1 always, otherwise only when an opening ran out of order or was refused since the last line (the
++// ordering check: those two stay 0 unless the hand-off is wrong).
++static void noteCommitCounters() {
++ static std::atomic<uint64_t> commits{0},seenBad{0};
++ const uint64_t n=++commits;
++ if(n%1000)return;
++ uint64_t d[5]={};
++ if(!nmb_deferred_open_counts(d))return;
++ const uint64_t bad=d[3]+d[4];
++ if(seenBad.exchange(bad)==bad && !diagOn())return;
++ os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal opens: commit %llu | deferred %llu (thread %llu, program %llu) out-of-order %llu refused %llu | "
++  "uploads reused %llu made %llu kept %llu dropped %llu",(unsigned long long)n,(unsigned long long)d[0],(unsigned long long)d[1],
++  (unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)d[4],(unsigned long long)gUploadReused.load(),
++  (unsigned long long)gUploadMade.load(),(unsigned long long)gUploadKept.load(),(unsigned long long)gUploadDropped.load());
++}
+ static void watchBuffersAtCommit(uint64_t commit) {
+  if(commit%500==0)fprintf(stderr,"native-metal binds: commit %llu made %llu skipped %llu (unchanged slots)\n",(unsigned long long)commit,
+                           (unsigned long long)gBindsMade.load(),(unsigned long long)gBindsSkipped.load());
+@@ -3847,6 +3863,7 @@
+ }
+ - (void)commit {
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
++ noteCommitCounters();
+  if(gWatchedBuffers){static std::atomic<uint64_t> commits{0};const uint64_t n=++commits;if(n%50==0)watchBuffersAtCommit(n);}
+  if(_dumpBuffers.count) {   // 2026-11-19: are the bound buffers' bytes there by commit time, and by completion (written after encoding)?
+   for(NBBuffer *b in _dumpBuffers) {

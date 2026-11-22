@@ -1,0 +1,92 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -56,6 +56,13 @@
+  */
+ static bool sweet_fb_sync = true;
+ /*
++ * 2026-11-19: what SwapWait waits for, switchable at run time (no boot-arg room): sysctl kern.sweet_fb_swapwait=
++ * 1 (default, as 0169): until the named swap is on the panel; 2: the same, except a wait on the newest swap returns at
++ * once (the frame just handed over is not waited for, earlier ones still are); 0: never waits. The 5 s statistics
++ * count which swap the calls name and how long they blocked, whatever the mode.
++ */
++static int sweet_fb_swapwait_mode = 1;
++/*
+  * 0170: frames of more than one layer (Subway Surfers: the game's Metal layer plus another, every few frames)
+  * took present(): each layer pasted opaque in turn straight into the scanned panel memory, its alpha and its
+  * source size (rect a) ignored, while a GPU blit of the previous one-layer frame could still land on top
+@@ -117,6 +124,13 @@
+ 	 * swapwait / swapwait_to: SwapWait calls, and those that ran out.
+ 	 */
+ 	uint32_t nowork, late, forced, reswap, cpu_metal, gpu_skip[6], swapwait, swapwait_to;
++	/*
++	 * 2026-11-19 (UI at ~29 fps with no stage saturated): which swap each SwapWait names, against the newest swap at
++	 * the call (newest = the one just swapped, previous = one before, older, never begun / not waited), and the time
++	 * the calls blocked in all (absolute time).
++	 */
++	uint32_t sw_newest, sw_previous, sw_older, sw_nowait;
++	uint64_t sw_blocked;
+ 	/* 0170: composed frames, their layers drawn opaque / blended, GPU blits still running before one, its cost */
+ 	uint32_t composed, comp_opaque, comp_blend, comp_skipped, comp_gpu_wait;
+ 	uint32_t top_only;                      /* 0171: multi-layer frames shown as their opaque top layer, on the GPU */
+@@ -145,6 +159,10 @@
+ #include <kern/clock.h>
+ #include <kern/kern_types.h>   /* 0169: THREAD_UNINT, THREAD_TIMED_OUT */
+ #include <sys/proc.h>
++#include <sys/sysctl.h>    /* 2026-11-19: kern.sweet_fb_swapwait */
++/* 2026-11-19: the SwapWait mode above, at run time */
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_swapwait, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_swapwait_mode, 0,
++    "SweetFramebuffer SwapWait: 1 until shown (default), 2 not on the newest swap, 0 never");
+ 
+ #define SWEET_FB_OFF_CLEARS 30u        /* 0259: vsyncs the panel is cleared again after display off */
+ 
+@@ -1068,6 +1086,15 @@
+ 			    sweet_fb_stats.cpu_metal, sweet_fb_stats.gpu_skip[0], sweet_fb_stats.gpu_skip[1], sweet_fb_stats.gpu_skip[2],
+ 			    sweet_fb_stats.gpu_skip[3], sweet_fb_stats.gpu_skip[4], sweet_fb_stats.gpu_skip[5], sweet_fb_stats.swapwait,
+ 			    sweet_fb_stats.swapwait_to);
++			{
++				uint64_t blocked_us = 0;
++				absolutetime_to_nanoseconds(sweet_fb_stats.sw_blocked, &blocked_us);
++				blocked_us /= 1000;
++				IOLog("SWEET FB: 5s: SwapWait mode %d: on the newest swap %u, the previous %u, older %u, not waited %u; "
++				    "blocked %llu ms in all (%llu us a call)\n", sweet_fb_swapwait_mode, sweet_fb_stats.sw_newest,
++				    sweet_fb_stats.sw_previous, sweet_fb_stats.sw_older, sweet_fb_stats.sw_nowait, blocked_us / 1000,
++				    sweet_fb_stats.swapwait ? blocked_us / sweet_fb_stats.swapwait : 0);
++			}
+ 			if (sweet_fb_stats.composed != 0) {
+ 				uint64_t us = 0;
+ 				absolutetime_to_nanoseconds(sweet_fb_stats.comp_time, &us);
+@@ -3084,8 +3111,25 @@
+ 			AbsoluteTime deadline;          /* a UInt64 on arm64; filled through its address either way */
+ 			clock_interval_to_deadline(50, NSEC_PER_MSEC, (uint64_t *)&deadline);
+ 			sweet_fb_stats.swapwait++;
++			const uint64_t began = mach_absolute_time();
++			const int mode = sweet_fb_swapwait_mode;
+ 			IOLockLock(fFB->fLock);
+-			while (want != 0 && (int32_t)(fFB->fSwapID - want) >= 0 && !fFB->fPowerOff &&
++			/* 2026-11-19: which swap the call names (fSwapID: the newest swap begun) */
++			const int32_t behind = (int32_t)(fFB->fSwapID - want);
++			bool waits = want != 0 && behind >= 0 && (int32_t)(fFB->fShownSwapID - want) < 0;
++			if (!waits) {
++				sweet_fb_stats.sw_nowait++;
++			} else if (behind == 0) {
++				sweet_fb_stats.sw_newest++;
++			} else if (behind == 1) {
++				sweet_fb_stats.sw_previous++;
++			} else {
++				sweet_fb_stats.sw_older++;
++			}
++			if (mode == 0 || (mode == 2 && behind == 0)) {
++				waits = false;
++			}
++			while (waits && (int32_t)(fFB->fSwapID - want) >= 0 && !fFB->fPowerOff &&
+ 			    (int32_t)(fFB->fShownSwapID - want) < 0) {
+ 				if (IOLockSleepDeadline(fFB->fLock, &fFB->fShownSwapID, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
+ 					sweet_fb_stats.swapwait_to++;
+@@ -3093,6 +3137,7 @@
+ 				}
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			sweet_fb_stats.sw_blocked += mach_absolute_time() - began;
+ 		}
+ 		break;
+ 	default:

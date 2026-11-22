@@ -1,0 +1,16 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -628,6 +628,16 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
++#if XNU_TARGET_OS_OSX
++	/* Some macOS startup paths never call our synthetic IOMobileFramebuffer swap methods.
++	 * Allow an explicit boot-arg to mute and clear the boot console as soon as scanout is ready,
++	 * so kernel text cannot cover WindowServer while that handoff is being debugged. */
++	uint32_t noConsole = 0;
++	if (PE_parse_boot_argn("sweetfb_noconsole", &noConsole, sizeof(noConsole)) && noConsole != 0) {
++		pauseConsole();
++	}
++#endif
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);

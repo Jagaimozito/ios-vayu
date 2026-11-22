@@ -1,0 +1,857 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 0554aa8..c65cbc5 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -32,9 +32,13 @@
+ #include <arm/misc_protos.h>
+ #include <arm/thread.h>
+ #include <arm/rtclock.h>
++#include <arm/machine_cpu.h>
+ #include <arm/trap_internal.h> /* for IS_ARM_GDB_TRAP() et al */
+ #include <arm64/proc_reg.h>
+ #include <arm64/machine_machdep.h>
++#if defined(SWEET)
++extern uint32_t sweet_vtimer_intid;
++#endif
+ #include <kern/cpc.h>
+ #include <arm64/instructions.h>
+ 
+@@ -167,7 +171,7 @@ static inline uint64_t fault_addr_bitmask(unsigned int bit_from, unsigned int bi
+ static void handle_bti_fail(arm_saved_state_t *state, uint64_t esr);
+ extern kern_return_t arm_fast_fault(pmap_t, vm_map_address_t, vm_prot_t, bool, bool);
+ 
+-static void handle_uncategorized(arm_saved_state_t *);
++static void handle_uncategorized(arm_saved_state_t *, arm_neon_saved_state_t *);
+ 
+ static void handle_kernel_breakpoint(arm_saved_state_t *, uint64_t);
+ 
+@@ -1010,7 +1014,7 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+ 			break;
+ 		}
+ #endif /* CONFIG_XNUPOST */
+-		handle_uncategorized(&context->ss);
++		handle_uncategorized(&context->ss, &context->ns);
+ 		break;
+ 
+ 	case ESR_EC_SP_ALIGN:
+@@ -1115,7 +1119,7 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+ 		__builtin_unreachable();
+ 
+ 	default:
+-		handle_uncategorized(state);
++		handle_uncategorized(state, &context->ns);
+ 	}
+ 
+ #ifdef CONFIG_XNUPOST
+@@ -1181,8 +1185,681 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+  * Uncategorized exceptions are a catch-all for general execution errors.
+  * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: the iOS 26 userland is built for apple-a13 and newer (ARMv8.4+), the Cortex-A76/A55 of SM8150 are
++ * ARMv8.2 (+LRCPC, DotProd). Emulate the user instructions they lack that the compiler emits freely:
++ *   FEAT_LRCPC2  STLUR/LDAPUR/LDAPURS* (thousands of sites in the shared cache: acquire/release atomics)
++ *   FEAT_FlagM   CFINV, RMIF, SETF8/SETF16; FEAT_FlagM2 AXFLAG/XAFLAG
++ *   FEAT_SB      SB (speculation barrier: DSB+ISB is stronger)
++ *   FEAT_DIT     MSR DIT, #imm / MSR DIT, Xt (ignored), MRS Xt, DIT (reads 0)
++ * Trapping costs a few microseconds per execution, fine for bring-up. Everything else that is undefined is
++ * logged (first 64) with the process, pc and instruction word, then raised as before (SIGILL).
++ */
++#include <arm/atomic.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
++static unsigned sweet_emul_logged, sweet_undef_logged;
++extern void proc_selfname(char *buf, int size);  /* bsd/kern/proc_info / kern_proc.c */
++
++static inline uint64_t
++sweet_xreg(arm_saved_state_t *state, unsigned r, bool sp_for_31)
++{
++	if (r == 31) {
++		return sp_for_31 ? saved_state64(state)->sp : 0;
++	}
++	return saved_state64(state)->x[r];
++}
++
++static inline void
++sweet_set_xreg(arm_saved_state_t *state, unsigned r, uint64_t v)
++{
++	if (r != 31) {
++		saved_state64(state)->x[r] = v;
++	}
++}
++
++/*
++ * 2026-11-17: user memory for the LRCPC2 emulation is accessed single-copy atomically. copyin()/copyout() of fewer
++ * than 16 bytes copy BYTE BY BYTE (BCOPY_IMPL), so an emulated STLUR of a pointer was visible to the other cores
++ * half written, and an emulated LDAPUR could read one half old, one half new: with 8 cores that tears the
++ * acquire/release atomics libdispatch and others use (suspected in locationd's spin in _dispatch_wait_for_enqueuer
++ * and its SIGBUS on a CFString where a voucher belongs). Aligned 4/8-byte accesses use copy{in,out}_atomic{32,64};
++ * an aligned 2-byte load reads its containing aligned word atomically. Unaligned accesses (not atomic in hardware
++ * either) and 2-byte stores (no user-memory compare-and-swap here) keep the byte copy.
++ */
++static int
++sweet_user_load(user_addr_t addr, unsigned bytes, uint64_t *v)
++{
++	*v = 0;
++	if (bytes == 8 && !(addr & 7)) {
++		return copyin_atomic64(addr, v);
++	}
++	if (bytes == 4 && !(addr & 3)) {
++		uint32_t w;
++		int err = copyin_atomic32(addr, &w);
++		if (!err) {
++			*v = w;
++		}
++		return err;
++	}
++	if (bytes == 2 && !(addr & 1)) {
++		uint32_t w;
++		int err = copyin_atomic32(addr & ~(user_addr_t)3, &w);
++		if (!err) {
++			*v = (w >> (8 * (addr & 3))) & 0xffff;
++		}
++		return err;
++	}
++	return copyin(addr, v, bytes);  /* little-endian: the low bytes of *v */
++}
++
++static int
++sweet_user_store(user_addr_t addr, unsigned bytes, uint64_t v)
++{
++	if (bytes == 8 && !(addr & 7)) {
++		return copyout_atomic64(v, addr);
++	}
++	if (bytes == 4 && !(addr & 3)) {
++		return copyout_atomic32((uint32_t)v, addr);
++	}
++	return copyout(&v, addr, bytes);
++}
++
++/*
++ * How often user code traps here: every LRCPC2 site in the shared cache (acquire/release atomics with an offset)
++ * costs an exception. One line at most every 10 s: the count since the last line, LRCPC2 loads and stores apart.
++ */
++static uint64_t sweet_emul_total, sweet_emul_ld, sweet_emul_st, sweet_emul_last;
++enum {
++	SWEET_EMUL_EOR3 = 3, SWEET_EMUL_BCAX, SWEET_EMUL_RAX1, SWEET_EMUL_XAR,
++	SWEET_EMUL_SHA512H, SWEET_EMUL_SHA512H2, SWEET_EMUL_SHA512SU0, SWEET_EMUL_SHA512SU1,
++	SWEET_EMUL_FMLAL, SWEET_EMUL_FMLAL2, SWEET_EMUL_FMLSL, SWEET_EMUL_FMLSL2,
++	SWEET_EMUL_FRINT32Z, SWEET_EMUL_FRINT32X,
++	SWEET_EMUL_FRINT64Z, SWEET_EMUL_FRINT64X, SWEET_EMUL_KIND_MAX
++};
++static uint64_t sweet_emul_kinds[SWEET_EMUL_KIND_MAX];
++
+ static void
+-handle_uncategorized(arm_saved_state_t *state)
++sweet_emul_count(int kind)      /* 0 other, 1 LDAPUR, 2 STLUR */
++{
++	os_atomic_inc(&sweet_emul_total, relaxed);
++	if (kind == 1) {
++		os_atomic_inc(&sweet_emul_ld, relaxed);
++	} else if (kind == 2) {
++		os_atomic_inc(&sweet_emul_st, relaxed);
++	} else if (kind > 2 && kind < SWEET_EMUL_KIND_MAX) {
++		os_atomic_inc(&sweet_emul_kinds[kind], relaxed);
++	}
++	uint64_t now = mach_absolute_time(), last = os_atomic_load(&sweet_emul_last, relaxed), ns;
++	absolutetime_to_nanoseconds(now - last, &ns);
++	if (ns < 10ull * NSEC_PER_SEC || !os_atomic_cmpxchg(&sweet_emul_last, last, now, relaxed)) {
++		return;
++	}
++	uint64_t total = os_atomic_xchg(&sweet_emul_total, 0, relaxed);
++	uint64_t ld = os_atomic_xchg(&sweet_emul_ld, 0, relaxed), st = os_atomic_xchg(&sweet_emul_st, 0, relaxed);
++	uint64_t k[SWEET_EMUL_KIND_MAX];
++	for (unsigned i = 3; i < SWEET_EMUL_KIND_MAX; i++) {
++		k[i] = os_atomic_xchg(&sweet_emul_kinds[i], 0, relaxed);
++	}
++	if (last == 0) {
++		return;                 /* first call: just starts the clock */
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	printf("SWEET EMUL: %llu emulated in %llu ms (%llu/s): LDAPUR %llu, STLUR %llu, other %llu; EOR3 %llu BCAX %llu RAX1 %llu XAR %llu SHA512H %llu H2 %llu SU0 %llu SU1 %llu FMLAL %llu FMLAL2 %llu FMLSL %llu FMLSL2 %llu FRINT32Z %llu 32X %llu 64Z %llu 64X %llu; now in %s\n",
++	    total, ns / NSEC_PER_MSEC, total * NSEC_PER_SEC / (ns ? ns : 1), ld, st, total - ld - st,
++	    k[SWEET_EMUL_EOR3], k[SWEET_EMUL_BCAX], k[SWEET_EMUL_RAX1], k[SWEET_EMUL_XAR],
++	    k[SWEET_EMUL_SHA512H], k[SWEET_EMUL_SHA512H2], k[SWEET_EMUL_SHA512SU0], k[SWEET_EMUL_SHA512SU1],
++	    k[SWEET_EMUL_FMLAL], k[SWEET_EMUL_FMLAL2], k[SWEET_EMUL_FMLSL], k[SWEET_EMUL_FMLSL2],
++	    k[SWEET_EMUL_FRINT32Z], k[SWEET_EMUL_FRINT32X],
++	    k[SWEET_EMUL_FRINT64Z], k[SWEET_EMUL_FRINT64X], name);
++}
++
++static void
++sweet_emul_note(const char *what, arm_saved_state_t *state, uint32_t instr)
++{
++	if (sweet_emul_logged < 32) {
++		sweet_emul_logged++;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SWEET EMUL: %s in %s pc 0x%llx instr 0x%08x\n", what, name,
++		    (uint64_t)saved_state64(state)->pc, instr);
++	}
++}
++
++#define SWEET_PSR_N (1u << 31)
++#define SWEET_PSR_Z (1u << 30)
++#define SWEET_PSR_C (1u << 29)
++#define SWEET_PSR_V (1u << 28)
++
++static inline uint64_t
++sweet_ror64(uint64_t x, unsigned n)
++{
++	return (x >> n) | (x << (64 - n));
++}
++
++static inline uint64_t
++sweet_sha512_big0(uint64_t x)
++{
++	return sweet_ror64(x, 28) ^ sweet_ror64(x, 34) ^ sweet_ror64(x, 39);
++}
++
++static inline uint64_t
++sweet_sha512_big1(uint64_t x)
++{
++	return sweet_ror64(x, 14) ^ sweet_ror64(x, 18) ^ sweet_ror64(x, 41);
++}
++
++static inline uint64_t
++sweet_sha512_small0(uint64_t x)
++{
++	return sweet_ror64(x, 1) ^ sweet_ror64(x, 8) ^ (x >> 7);
++}
++
++static inline uint64_t
++sweet_sha512_small1(uint64_t x)
++{
++	return sweet_ror64(x, 19) ^ sweet_ror64(x, 61) ^ (x >> 6);
++}
++
++/* Integer-only implementation of FRINT{32,64}{Z,X}; keep this trap path general-register-only. */
++static uint64_t
++sweet_frintn(uint64_t bits, bool is_double, unsigned intsize, unsigned rounding, uint32_t *fpsr)
++{
++	unsigned fracbits = is_double ? 52 : 23;
++	unsigned expbits = is_double ? 11 : 8;
++	int bias = is_double ? 1023 : 127;
++	uint64_t fracmask = (1ull << fracbits) - 1;
++	uint64_t expmask = (1ull << expbits) - 1;
++	bool sign = (bits >> (fracbits + expbits)) != 0;
++	uint64_t exp = (bits >> fracbits) & expmask;
++	uint64_t frac = bits & fracmask;
++	uint64_t q = 0, rem = 0;
++	unsigned shift = 0;
++	bool inexact = false;
++	if (exp == expmask) {
++		*fpsr |= 1u;            /* IOC: NaN or infinity */
++		goto minint;
++	}
++	if (exp == 0 && frac == 0) {
++		return bits;            /* preserve signed zero */
++	}
++	int e = (exp ? (int)exp - bias : 1 - bias);
++	uint64_t sig = (exp ? (1ull << fracbits) : 0) | frac;
++	if (e < 0) {
++		q = 0;
++		rem = sig;
++		shift = (unsigned)(fracbits - e);
++	} else if ((unsigned)e >= fracbits) {
++		if ((unsigned)e >= intsize) {
++			goto minint;
++		}
++		if ((unsigned)e == intsize - 1 && (!sign || frac != 0)) {
++			goto minint;
++		}
++		q = sig << ((unsigned)e - fracbits);
++	} else {
++		shift = fracbits - (unsigned)e;
++		q = sig >> shift;
++		rem = sig & ((1ull << shift) - 1);
++	}
++	inexact = rem != 0;
++	if (inexact) {
++		bool increment = false;
++		if (rounding == 1) {           /* +infinity */
++			increment = !sign;
++		} else if (rounding == 2) {    /* -infinity */
++			increment = sign;
++		} else if (rounding == 0 && shift != 0 && shift < 64) { /* nearest, ties to even */
++			uint64_t half = 1ull << (shift - 1);
++			increment = rem > half || (rem == half && (q & 1));
++		}
++		if (increment) {
++			q++;
++		}
++	}
++	if (q > (sign ? (1ull << (intsize - 1)) : ((1ull << (intsize - 1)) - 1))) {
++		goto minint;
++	}
++	if (inexact) {
++		*fpsr |= 1u << 4;      /* IXC */
++	}
++	{
++		uint64_t mag = q;
++		uint64_t minint = sign ? (uint64_t)(0 - mag) : mag;
++		if (mag == 0) {
++			return sign ? (1ull << (fracbits + expbits)) : 0;
++		}
++		unsigned top = 63u - (unsigned)__builtin_clzll(mag);
++		uint64_t encoded_sig;
++		if (top <= fracbits) {
++			encoded_sig = mag << (fracbits - top);
++		} else {
++			unsigned drop = top - fracbits;
++			encoded_sig = mag >> drop;
++		}
++		uint64_t encoded_exp = (uint64_t)(top + bias) << fracbits;
++		return (sign ? (1ull << (fracbits + expbits)) : 0) | encoded_exp | (encoded_sig & fracmask);
++	}
++minint:
++	*fpsr |= 1u;
++	if (intsize == 32) {
++		return is_double ? 0xc1e0000000000000ull : 0xcf000000u; /* -2^31 */
++	}
++	return is_double ? 0xc3e0000000000000ull : 0xdf000000u; /* -2^63 */
++}
++
++/* FHM is absent on SM8150, but the scalar half->single conversion and single FMA are baseline ARMv8 FP ops. */
++static inline uint32_t
++sweet_fma_half(uint16_t a, uint16_t b, uint32_t acc, bool subtract, uint32_t fpcr, uint32_t *fpsr)
++{
++	uint32_t result = acc;
++	uint64_t status = 0, host_fpcr = 0, host_fpsr = 0;
++	__asm__ volatile("mrs %0, FPCR\n\tmrs %1, FPSR" : "=r"(host_fpcr), "=r"(host_fpsr));
++	__asm__ volatile("msr FPCR, %0\n\tmsr FPSR, %1" :: "r"((uint64_t)fpcr), "r"((uint64_t)*fpsr) : "memory");
++	if (subtract) {
++		__asm__ volatile(
++		    "fmov h0, %w2\n\tfcvt s0, h0\n\tfmov h1, %w3\n\tfcvt s1, h1\n\t"
++		    "fmov s2, %w0\n\tfmsub s2, s0, s1, s2\n\tfmov %w0, s2\n\tmrs %1, FPSR"
++		    : "+r"(result), "=r"(status) : "r"((uint32_t)a), "r"((uint32_t)b)
++		    : "v0", "v1", "v2", "memory");
++	} else {
++		__asm__ volatile(
++		    "fmov h0, %w2\n\tfcvt s0, h0\n\tfmov h1, %w3\n\tfcvt s1, h1\n\t"
++		    "fmov s2, %w0\n\tfmadd s2, s0, s1, s2\n\tfmov %w0, s2\n\tmrs %1, FPSR"
++		    : "+r"(result), "=r"(status) : "r"((uint32_t)a), "r"((uint32_t)b)
++		    : "v0", "v1", "v2", "memory");
++	}
++	__asm__ volatile("msr FPCR, %0\n\tmsr FPSR, %1" :: "r"(host_fpcr), "r"(host_fpsr) : "memory");
++	*fpsr = (uint32_t)status;
++	return result;
++}
++
++static bool
++sweet_emulate_user(arm_saved_state_t *state, arm_neon_saved_state_t *neon, uint32_t instr)
++{
++	uint32_t cpsr = saved_state64(state)->cpsr;
++	arm_neon_saved_state64_t *vstate = (neon != NULL && is_neon_saved_state64(neon)) ? neon_state64(neon) : NULL;
++	int emul_kind = 0;
++
++	/* FEAT_SHA3: 128-bit logical operations. The exception context's NEON image is restored by locore on EL0 return. */
++	if (vstate != NULL && (instr & 0xffc08000) == 0xce000000) {
++		unsigned rd = instr & 31, rn = (instr >> 5) & 31, ra = (instr >> 10) & 31, rm = (instr >> 16) & 31;
++		uint64_t *d = (uint64_t *)&vstate->v.q[rd];
++		const uint64_t *n = (const uint64_t *)&vstate->v.q[rn];
++		const uint64_t *a = (const uint64_t *)&vstate->v.q[ra];
++		const uint64_t *m = (const uint64_t *)&vstate->v.q[rm];
++		uint64_t lo, hi;
++		if (instr & (1u << 21)) { /* BCAX: Vn XOR (Vm AND NOT(Va)). */
++			lo = n[0] ^ (m[0] & ~a[0]);
++			hi = n[1] ^ (m[1] & ~a[1]);
++			sweet_emul_note("BCAX", state, instr);
++			emul_kind = SWEET_EMUL_BCAX;
++		} else {
++			lo = n[0] ^ m[0] ^ a[0];
++			hi = n[1] ^ m[1] ^ a[1];
++			sweet_emul_note("EOR3", state, instr);
++			emul_kind = SWEET_EMUL_EOR3;
++		}
++		d[0] = lo; d[1] = hi;
++		goto done;
++	}
++	if (vstate != NULL && (instr & 0xffe00000) == 0xce800000) { /* XAR */
++		unsigned rd = instr & 31, rn = (instr >> 5) & 31, rot = (instr >> 10) & 63, rm = (instr >> 16) & 31;
++		uint64_t *d = (uint64_t *)&vstate->v.q[rd];
++		const uint64_t *n = (const uint64_t *)&vstate->v.q[rn];
++		const uint64_t *m = (const uint64_t *)&vstate->v.q[rm];
++		d[0] = rot ? sweet_ror64(n[0] ^ m[0], rot) : (n[0] ^ m[0]);
++		d[1] = rot ? sweet_ror64(n[1] ^ m[1], rot) : (n[1] ^ m[1]);
++		sweet_emul_note("XAR", state, instr);
++		emul_kind = SWEET_EMUL_XAR;
++		goto done;
++	}
++	if (vstate != NULL && (instr & 0xffe0f000) == 0xce608000) { /* SHA512H/H2/SU1; SHA3 RAX1 */
++		unsigned rd = instr & 31, rn = (instr >> 5) & 31, op = (instr >> 10) & 3, rm = (instr >> 16) & 31;
++		uint64_t *d = (uint64_t *)&vstate->v.q[rd];
++		const uint64_t *n = (const uint64_t *)&vstate->v.q[rn];
++		const uint64_t *m = (const uint64_t *)&vstate->v.q[rm];
++		uint64_t d0 = d[0], d1 = d[1];
++		switch (op) {
++		case 0: /* SHA512H */
++			d1 += sweet_sha512_big1(m[1]) + ((m[1] & n[0]) ^ (~m[1] & n[1]));
++			d0 += sweet_sha512_big1(d1 + m[0]) + (((d1 + m[0]) & m[1]) ^ (~(d1 + m[0]) & n[0]));
++			sweet_emul_note("SHA512H", state, instr); emul_kind = SWEET_EMUL_SHA512H; break;
++		case 1: /* SHA512H2 */
++			d1 += sweet_sha512_big0(m[0]) + ((n[0] & m[1]) | ((n[0] | m[1]) & m[0]));
++			d0 += sweet_sha512_big0(d1) + ((d1 & m[0]) | ((d1 | m[0]) & m[1]));
++			sweet_emul_note("SHA512H2", state, instr); emul_kind = SWEET_EMUL_SHA512H2; break;
++		case 2: /* SHA512SU1 */
++			d0 += sweet_sha512_small1(n[0]) + m[0];
++			d1 += sweet_sha512_small1(n[1]) + m[1];
++			sweet_emul_note("SHA512SU1", state, instr); emul_kind = SWEET_EMUL_SHA512SU1; break;
++		case 3: /* RAX1 */
++			d0 = n[0] + sweet_ror64(m[0], 1);
++			d1 = n[1] + sweet_ror64(m[1], 1);
++			sweet_emul_note("RAX1", state, instr); emul_kind = SWEET_EMUL_RAX1; break;
++		}
++		d[0] = d0; d[1] = d1;
++		goto done;
++	}
++	if (vstate != NULL && (instr & 0xfffffc00) == 0xcec08000) { /* SHA512SU0 */
++		unsigned rd = instr & 31, rn = (instr >> 5) & 31;
++		uint64_t *d = (uint64_t *)&vstate->v.q[rd];
++		const uint64_t *n = (const uint64_t *)&vstate->v.q[rn];
++		d[0] += sweet_sha512_small0(d[1]);
++		d[1] += sweet_sha512_small0(n[0]);
++		sweet_emul_note("SHA512SU0", state, instr);
++		emul_kind = SWEET_EMUL_SHA512SU0;
++		goto done;
++	}
++	if (vstate != NULL && (instr & 0xff207c00) == 0x1e204000) { /* scalar FRINT32/64 Z/X */
++		unsigned op = (instr >> 15) & 0x3f;
++		if (op >= 0x10 && op <= 0x13) {
++			unsigned rn = (instr >> 5) & 31, rd = instr & 31;
++			bool is_double = ((instr >> 22) & 3) == 1;
++			bool is32 = op < 0x12;
++			bool z = !(op & 1);
++			unsigned width = is32 ? 32 : 64;
++			uint64_t *src = (uint64_t *)&vstate->v.q[rn];
++			uint64_t *dst = (uint64_t *)&vstate->v.q[rd];
++			uint64_t in = is_double ? src[0] : (uint32_t)src[0];
++			unsigned rmode = z ? 3 : ((vstate->fpcr >> 22) & 3);
++			uint64_t out = sweet_frintn(in, is_double, width, rmode, &vstate->fpsr);
++			dst[0] = is_double ? out : (uint32_t)out;
++			dst[1] = 0;
++			sweet_emul_note(is32 ? (z ? "FRINT32Z" : "FRINT32X") : (z ? "FRINT64Z" : "FRINT64X"), state, instr);
++			emul_kind = is32 ? (z ? SWEET_EMUL_FRINT32Z : SWEET_EMUL_FRINT32X) : (z ? SWEET_EMUL_FRINT64Z : SWEET_EMUL_FRINT64X);
++			goto done;
++		}
++	}
++	if (vstate != NULL) {
++		uint32_t fixed = instr & 0xbfbffc00; /* ignore Q, Rn, Rd */
++		unsigned q = (instr >> 30) & 1;
++		unsigned op;
++		if (fixed == 0x0e21e800) op = 0;
++		else if (fixed == 0x2e21e800) op = 1;
++		else if (fixed == 0x0e61f800) op = 2;
++		else if (fixed == 0x2e61f800) op = 3;
++		else op = 4;
++		if (op < 4 && !(((instr >> 22) & 1) && !q)) {
++			unsigned rn = (instr >> 5) & 31, rd = instr & 31;
++			bool is_double = op >= 2, is32 = op < 2, z = !(op & 1);
++			unsigned width = is32 ? 32 : 64;
++			unsigned lanes = (q ? 16 : 8) / (is_double ? 8 : 4);
++			unsigned rmode = z ? 3 : ((vstate->fpcr >> 22) & 3);
++			uint64_t src[2] = { ((uint64_t *)&vstate->v.q[rn])[0], ((uint64_t *)&vstate->v.q[rn])[1] };
++			uint64_t out[2] = { 0, 0 };
++			for (unsigned lane = 0; lane < lanes; lane++) {
++				uint64_t in = is_double ? src[lane] : (uint32_t)(src[lane / 2] >> ((lane & 1) * 32));
++				uint64_t value = sweet_frintn(in, is_double, width, rmode, &vstate->fpsr);
++				if (is_double) out[lane] = value;
++				else out[lane / 2] |= (uint32_t)value << ((lane & 1) * 32);
++			}
++			((uint64_t *)&vstate->v.q[rd])[0] = out[0];
++			((uint64_t *)&vstate->v.q[rd])[1] = out[1];
++			sweet_emul_note(is32 ? (z ? "FRINT32Z" : "FRINT32X") : (z ? "FRINT64Z" : "FRINT64X"), state, instr);
++			emul_kind = is32 ? (z ? SWEET_EMUL_FRINT32Z : SWEET_EMUL_FRINT32X) : (z ? SWEET_EMUL_FRINT64Z : SWEET_EMUL_FRINT64X);
++			goto done;
++		}
++	}
++	if (vstate != NULL) {
++		/* FMLAL{2}/FMLSL{2}, vector and by-element forms (FEAT_FHM). */
++		unsigned rd = instr & 31, rn = (instr >> 5) & 31, rm = (instr >> 16) & 31;
++		unsigned q = (instr >> 30) & 1;
++		uint32_t encoding = instr & 0xbf80f000;
++		bool by_element = false, upper = false, subtract = false;
++		if (encoding == 0x0e00e000) { /* FMLAL */ }
++		else if (encoding == 0x2e00c000) { upper = true; }
++		else if (encoding == 0x0e80e000) { subtract = true; }
++		else if (encoding == 0x2e80c000) { upper = true; subtract = true; }
++		else if (encoding == 0x0f800000) { by_element = true; }
++		else if (encoding == 0x2f808000) { by_element = true; upper = true; }
++		else if (encoding == 0x0f804000) { by_element = true; subtract = true; }
++		else if (encoding == 0x2f80c000) { by_element = true; upper = true; subtract = true; }
++		else goto frint_done;
++		{
++			uint16_t srcn[8], srcm[8];
++			uint32_t out[4];
++			const uint16_t *alln = (const uint16_t *)&vstate->v.q[rn];
++			const uint16_t *allm = (const uint16_t *)&vstate->v.q[rm];
++			unsigned lanes = q ? 4 : 2;
++			unsigned part = upper ? (q ? 4 : 2) : 0;
++			bcopy(alln + part, srcn, lanes * sizeof(uint16_t));
++			if (by_element) {
++				unsigned index = ((instr >> 20) & 3) | (((instr >> 11) & 1) << 2);
++				uint16_t element = allm[index];
++				for (unsigned i = 0; i < lanes; i++) srcm[i] = element;
++			} else {
++				bcopy(allm + part, srcm, lanes * sizeof(uint16_t));
++			}
++			uint32_t *dst = (uint32_t *)&vstate->v.q[rd];
++			bcopy(dst, out, sizeof(out));
++			for (unsigned i = 0; i < lanes; i++) {
++				out[i] = sweet_fma_half(srcn[i], srcm[i], out[i], subtract, vstate->fpcr, &vstate->fpsr);
++			}
++			bcopy(out, dst, lanes * sizeof(uint32_t));
++			if (!q) ((uint64_t *)&vstate->v.q[rd])[1] = 0;
++			sweet_emul_note(subtract ? (upper ? "FMLSL2" : "FMLSL") : (upper ? "FMLAL2" : "FMLAL"), state, instr);
++			emul_kind = subtract ? (upper ? SWEET_EMUL_FMLSL2 : SWEET_EMUL_FMLSL) : (upper ? SWEET_EMUL_FMLAL2 : SWEET_EMUL_FMLAL);
++			goto done;
++		}
++	}
++frint_done:
++
++	/* LRCPC2: size 011001 opc 0 imm9 00 Rn Rt */
++	if ((instr & 0x3f200c00) == 0x19000000) {
++		unsigned size = instr >> 30, opc = (instr >> 22) & 3;
++		unsigned rn = (instr >> 5) & 31, rt = instr & 31;
++		int64_t imm9 = (int64_t)((int32_t)(instr << 11) >> 23);
++		user_addr_t addr = (user_addr_t)(sweet_xreg(state, rn, true) + (uint64_t)imm9);
++		unsigned bytes = 1u << size;
++		uint64_t v = 0;
++
++		if (opc == 0) {                 /* STLUR */
++			v = sweet_xreg(state, rt, false);
++			__builtin_arm_dmb(DMB_ISH);
++			if (sweet_user_store(addr, bytes, v) != 0) {
++				return false;
++			}
++		} else {
++			if ((opc == 2 && size == 3) || (opc == 3 && size >= 2)) {
++				return false;   /* unallocated */
++			}
++			if (sweet_user_load(addr, bytes, &v) != 0) {
++				return false;
++			}
++			__builtin_arm_dmb(DMB_ISH);
++			if (opc >= 2) {         /* LDAPURS: sign-extend to 64 (opc 2) or 32 (opc 3) bits */
++				unsigned bits = 8u * bytes;
++				v = (uint64_t)(((int64_t)(v << (64 - bits))) >> (64 - bits));
++				if (opc == 3) {
++					v &= 0xffffffffull;
++				}
++			}
++			sweet_set_xreg(state, rt, v);
++		}
++		sweet_emul_note(opc == 0 ? "STLUR" : "LDAPUR", state, instr);
++		sweet_emul_count(opc == 0 ? 2 : 1);
++		goto lrcpc_done;
++	}
++	if (instr == 0xd500401f) {              /* CFINV */
++		cpsr ^= SWEET_PSR_C;
++		sweet_emul_note("CFINV", state, instr);
++		goto flags;
++	}
++	if (instr == 0xd500405f || instr == 0xd500403f) {       /* AXFLAG / XAFLAG */
++		bool n = cpsr & SWEET_PSR_N, z = cpsr & SWEET_PSR_Z, c = cpsr & SWEET_PSR_C, v = cpsr & SWEET_PSR_V;
++		bool nn, nz, nc, nv;
++		if (instr == 0xd500405f) {
++			nn = false; nz = z || v; nc = c && !v; nv = false;
++		} else {
++			nn = !c && !z; nz = z && c; nc = c || z; nv = !c && z;
++		}
++		(void)n;
++		cpsr &= ~(SWEET_PSR_N | SWEET_PSR_Z | SWEET_PSR_C | SWEET_PSR_V);
++		cpsr |= (nn ? SWEET_PSR_N : 0) | (nz ? SWEET_PSR_Z : 0) | (nc ? SWEET_PSR_C : 0) | (nv ? SWEET_PSR_V : 0);
++		sweet_emul_note(instr == 0xd500405f ? "AXFLAG" : "XAFLAG", state, instr);
++		goto flags;
++	}
++	if ((instr & 0xffe07c10) == 0xba000400) {       /* RMIF Xn, #shift, #mask */
++		unsigned shift = (instr >> 15) & 63, rn = (instr >> 5) & 31, mask = instr & 15;
++		uint64_t x = sweet_xreg(state, rn, false);
++		uint64_t t = shift ? ((x >> shift) | (x << (64 - shift))) : x;
++		static const uint32_t bit[4] = { SWEET_PSR_V, SWEET_PSR_C, SWEET_PSR_Z, SWEET_PSR_N };
++		for (unsigned i = 0; i < 4; i++) {
++			if (mask & (1u << i)) {
++				cpsr = (t & (1ull << i)) ? (cpsr | bit[i]) : (cpsr & ~bit[i]);
++			}
++		}
++		sweet_emul_note("RMIF", state, instr);
++		goto flags;
++	}
++	if ((instr & 0xffffbc1f) == 0x3a00080d) {       /* SETF8 / SETF16 Wn */
++		unsigned rn = (instr >> 5) & 31, msb = (instr & (1u << 14)) ? 15 : 7;
++		uint64_t x = sweet_xreg(state, rn, false);
++		bool n = (x >> msb) & 1, z = (x & ((1ull << (msb + 1)) - 1)) == 0, v = (((x >> (msb + 1)) ^ (x >> msb)) & 1) != 0;
++		cpsr &= ~(SWEET_PSR_N | SWEET_PSR_Z | SWEET_PSR_V);
++		cpsr |= (n ? SWEET_PSR_N : 0) | (z ? SWEET_PSR_Z : 0) | (v ? SWEET_PSR_V : 0);
++		sweet_emul_note(msb == 7 ? "SETF8" : "SETF16", state, instr);
++		goto flags;
++	}
++	if (instr == 0xd50330ff) {              /* SB */
++		__builtin_arm_dsb(DSB_SY);
++		__builtin_arm_isb(ISB_SY);
++		sweet_emul_note("SB", state, instr);
++		goto done;
++	}
++	if ((instr & 0xfffff0ff) == 0xd503405f) {       /* MSR DIT, #imm */
++		sweet_emul_note("MSR DIT", state, instr);
++		goto done;
++	}
++	if ((instr & 0xffffffe0) == 0xd51b42a0) {       /* MSR DIT, Xt */
++		sweet_emul_note("MSR DIT", state, instr);
++		goto done;
++	}
++	if ((instr & 0xffffffe0) == 0xd53b42a0) {       /* MRS Xt, DIT */
++		sweet_set_xreg(state, instr & 31, 0);
++		sweet_emul_note("MRS DIT", state, instr);
++		goto done;
++	}
++
++	/*
++	 * FEAT_PAuth (v8.3) outside the HINT space: the iOS 27 userland is arm64e-only and JavaScriptCore's JIT emits
++	 * these at run time (the lowering only rewrote the code on disk). The A76/A55 have no pointer authentication,
++	 * so nothing is ever signed here: PAC* / AUT* / XPAC* leave the register as it is, the authenticated branches
++	 * and loads are the plain ones. (PACIASP, AUTIBSP, XPACLRI etc. are HINTs: NOPs on this CPU, no trap.)
++	 */
++	if ((instr & 0xfe1ff800) == 0xd61f0800) {       /* BRAA(Z)/BRAB(Z), BLRAA(Z)/BLRAB(Z), RETAA/RETAB */
++		unsigned z = (instr >> 24) & 1, opc = (instr >> 21) & 7, rn = (instr >> 5) & 31, rm = instr & 31;
++		uint64_t pc = saved_state64(state)->pc, target;
++		if (opc == 2 && !z && rn == 31 && rm == 31) {
++			target = sweet_xreg(state, 30, false);
++			sweet_emul_note("RETAx", state, instr);
++		} else if (opc <= 1 && (z || rm == 31)) {
++			target = sweet_xreg(state, rn, false);
++			if (opc == 1) {
++				sweet_set_xreg(state, 30, pc + 4);
++			}
++			sweet_emul_note(opc == 1 ? "BLRAx" : "BRAx", state, instr);
++		} else {
++			goto undef;
++		}
++		saved_state64(state)->pc = target;
++		return true;
++	}
++	if ((instr & 0xffff8000) == 0xdac10000 && ((instr >> 10) & 0x3f) <= 0x11) {
++		/* PACIA..AUTDB, PACIZA..AUTDZB, XPACI/XPACD: Rd keeps its value */
++		sweet_emul_note("PAC/AUT/XPAC", state, instr);
++		goto done;
++	}
++	if ((instr & 0xffe0fc00) == 0x9ac03000) {       /* PACGA Xd, Xn, Xm|SP: a 32-bit code in the top half */
++		uint64_t h = sweet_xreg(state, (instr >> 5) & 31, false) * 0x9e3779b97f4a7c15ull;
++		h ^= sweet_xreg(state, (instr >> 16) & 31, true) + 0x632be59bd9b4e019ull + (h << 6) + (h >> 2);
++		h *= 0xbf58476d1ce4e5b9ull;
++		sweet_set_xreg(state, instr & 31, (h ^ (h >> 29)) & 0xffffffff00000000ull);
++		sweet_emul_note("PACGA", state, instr);
++		goto done;
++	}
++	if ((instr & 0xff200400) == 0xf8200400) {       /* LDRAA/LDRAB Xt, [Xn|SP, #simm10*8]{!} */
++		unsigned rn = (instr >> 5) & 31, rt = instr & 31, w = (instr >> 11) & 1;
++		int64_t off = (int64_t)((((instr >> 22) & 1) << 9) | ((instr >> 12) & 0x1ff));
++		off = (off << 54) >> 54;
++		user_addr_t addr = (user_addr_t)(sweet_xreg(state, rn, true) + (uint64_t)(off * 8));
++		uint64_t v;
++		if (copyin(addr, &v, 8) != 0) {
++			return false;
++		}
++		if (w) {
++			if (rn == 31) {
++				saved_state64(state)->sp = addr;
++			} else {
++				sweet_set_xreg(state, rn, addr);
++			}
++		}
++		sweet_set_xreg(state, rt, v);
++		sweet_emul_note("LDRAx", state, instr);
++		goto done;
++	}
++	if ((instr & 0xfffffc00) == 0x1e7e0000 && vstate != NULL) {
++		/* FJCVTZS Wd, Dn (FEAT_JSCVT): double -> int32 as JavaScript's ToInt32, Z = exact */
++		uint64_t bits = ((uint64_t *)&vstate->v.q[(instr >> 5) & 31])[0];
++		unsigned exp = (unsigned)((bits >> 52) & 0x7ff);
++		uint64_t mant = bits & ((1ull << 52) - 1);
++		bool neg = bits >> 63, exact = false;
++		uint32_t r = 0;
++		if (exp == 0x7ff) {
++			r = 0;
++		} else if (exp == 0) {
++			exact = mant == 0 && !neg;      /* +0 exact; -0 and denormals are not */
++		} else {
++			mant |= 1ull << 52;
++			int sh = (int)exp - 1075;
++			uint64_t ip;
++			bool frac = false, big = false;
++			if (sh >= 0) {
++				ip = sh >= 64 ? 0 : mant << sh;
++				big = sh > 10;          /* |value| >= 2^63 > int32 */
++			} else if (sh <= -64) {
++				ip = 0; frac = true;
++			} else {
++				ip = mant >> -sh; frac = (mant & ((1ull << -sh) - 1)) != 0;
++			}
++			r = (uint32_t)ip;
++			if (neg) {
++				r = (uint32_t)-r;
++			}
++			exact = !frac && !big && (neg ? ip <= 0x80000000ull : ip <= 0x7fffffffull) && !(neg && ip == 0);
++		}
++		sweet_set_xreg(state, instr & 31, r);
++		cpsr &= ~(SWEET_PSR_N | SWEET_PSR_Z | SWEET_PSR_C | SWEET_PSR_V);
++		cpsr |= exact ? SWEET_PSR_Z : 0;
++		sweet_emul_note("FJCVTZS", state, instr);
++		goto flags;
++	}
++
++undef:
++	if (sweet_undef_logged < 64) {
++		sweet_undef_logged++;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SWEET UNDEF: %s pc 0x%llx instr 0x%08x (not emulated)\n", name,
++		    (uint64_t)saved_state64(state)->pc, instr);
++	}
++	return false;
++
++flags:
++	saved_state64(state)->cpsr = cpsr;
++done:
++	sweet_emul_count(emul_kind);
++lrcpc_done:
++	saved_state64(state)->pc += 4;
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
++static void
++handle_uncategorized(arm_saved_state_t *state, arm_neon_saved_state_t *neon)
+ {
+ 	exception_type_t           exception = EXC_BAD_INSTRUCTION;
+ 	mach_exception_data_type_t codes[2]  = {EXC_ARM_UNDEFINED};
+@@ -1191,6 +1868,12 @@ handle_uncategorized(arm_saved_state_t *state)
+ 
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_emulate_user(state, neon, instr)) {
++		return;
++	}
++#endif
++
+ #if CONFIG_DTRACE
+ 
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
+@@ -2801,7 +3484,59 @@ handle_mach_continuous_time_trap(arm_saved_state_t *state)
+ }
+ 
+ 
+-__attribute__((noreturn))
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++extern int sweet_tb24;  /* osfmk/arm64/machine_routines.c */
++static unsigned sweet_tb24_logged;
++
++/*
++ * sweet 2026-11-17: with the 24 MHz timebase (pexpert/arm/pe_identify_machine.c) EL0 has no access to the generic
++ * timer (USER_TIMEBASE_NONE clears CNTKCTL_EL1.EL0VCTEN/EL0PCTEN), so a direct MRS of the counter or its frequency
++ * traps here. Answer it in the kernel's 24 MHz units: CNTVCT/CNTPCT(SS) = mach_absolute_time(), CNTFRQ = 24 MHz.
++ * ISS for EC 0x18: Op0 [21:20], Op2 [19:17], Op1 [16:14], CRn [13:10], Rt [9:5], CRm [4:1], read [0].
++ */
++static bool
++sweet_tb24_mrs(arm_saved_state_t *state, uint64_t esr)
++{
++	uint32_t iss = (uint32_t)ESR_ISS(esr);
++	unsigned op0 = (iss >> 20) & 3, op2 = (iss >> 17) & 7, op1 = (iss >> 14) & 7, crn = (iss >> 10) & 15;
++	unsigned rt = (iss >> 5) & 31, crm = (iss >> 1) & 15;
++	uint64_t v;
++	const char *what;
++
++	if (!sweet_tb24 || !(iss & 1) || op0 != 3 || op1 != 3 || crn != 14 || crm != 0) {
++		return false;
++	}
++	switch (op2) {
++	case 0:
++		v = gPEClockFrequencyInfo.timebase_frequency_hz;
++		what = "CNTFRQ_EL0";
++		break;
++	case 1:
++	case 2:
++	case 5:
++	case 6:
++		v = mach_absolute_time();
++		what = op2 == 1 ? "CNTPCT_EL0" : op2 == 2 ? "CNTVCT_EL0" : op2 == 5 ? "CNTPCTSS_EL0" : "CNTVCTSS_EL0";
++		break;
++	default:
++		return false;
++	}
++	if (rt != 31) {
++		saved_state64(state)->x[rt] = v;
++	}
++	add_saved_state_pc(state, 4);
++	if (sweet_tb24_logged < 16) {
++		sweet_tb24_logged++;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SWEET TB24: EL0 read of %s in %s pc 0x%llx (emulated, 24 MHz)\n", what, name,
++		    (uint64_t)get_saved_state_pc(state) - 4);
++	}
++	return true;
++}
++#endif
++
+ static void
+ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
+ {
+@@ -2818,6 +3553,12 @@ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
+ 		panic("MSR/MRS trap (ESR 0x%llx) from kernel", esr);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_tb24_mrs(state, esr)) {
++		return;
++	}
++#endif
++
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 	codes[1] = instr;
+ 
+@@ -3008,6 +3749,33 @@ sleh_irq(arm_saved_state_t *state)
+ #endif
+ 
+ 
++#if defined(SWEET)
++	/* TrustZone owns Group 0; the SM8150 timer/IPIs arrive as Group 1 IRQs. */
++	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
++	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	if (intid >= 1020 && intid <= 1023) {
++		return;
++	}
++	if (intid == sweet_vtimer_intid) {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
++		cdp->cpu_decrementer = -1;
++		rtclock_intr(TRUE);
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++	} else if (intid < 16) {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		__builtin_arm_isb(ISB_SY);
++		cpu_signal_handler();
++	} else {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++		if (cdp->interrupt_handler) {
++			cdp->interrupt_handler(cdp->interrupt_target, cdp->interrupt_refCon,
++			    cdp->interrupt_nub, intid);
++		}
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++	}
++	__builtin_arm_isb(ISB_SY);
++#else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 
+ #if USE_APPLEARMSMP
+@@ -3019,6 +3787,7 @@ sleh_irq(arm_saved_state_t *state)
+ 	    cdp->interrupt_nub,
+ 	    cdp->interrupt_source);
+ #endif
++#endif /* SWEET */
+ 
+ 	entropy_collect();
+ 

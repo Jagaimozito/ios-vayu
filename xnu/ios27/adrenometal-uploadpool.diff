@@ -1,0 +1,174 @@
+--- NativeBridgeMetalFrontend.mm.orig
++++ NativeBridgeMetalFrontend.mm
+@@ -15,6 +15,7 @@
+ #include <os/log.h>
+ #include <algorithm>
+ #include <array>
++#include <map>
+ #include <memory>
+ #include <deque>
+ #include <condition_variable>
+@@ -1076,6 +1077,9 @@
+ @property(atomic) uint32_t contentsChanges;           // how often the answer differed from the one before
+ @property(atomic) int64_t watchedNonzero;             // the nonzero words the buffer watch last saw (-1: not yet)
+ @property(nonatomic) void *cachedContents;            // -contents after its first non-null answer
++// 2026-11-19 (upload reuse): made by newBufferWithBytes: in a size the pool keeps, and nothing since made it unsafe to hand the same
++// memory to a later newBufferWithBytes: (its GPU address handed out, a purgeable state set, made aliasable). See gUploadPool.
++@property(nonatomic) BOOL poolable;
+ - (void)noteContents:(void *)p;
+ @end
+ @interface NBTexture : NBObject
+@@ -1104,14 +1108,67 @@
+  void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
+ }
+ static void releaseSurface(void *context,void *,uint64_t) {DetailSpan timing(7,(uintptr_t)context);gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
++// 2026-11-19 (Minecraft, ~5% of its render thread in newBufferWithBytes:): small upload buffers are kept when the app lets them go
++// and handed to the next newBufferWithBytes: of the same length and options, with the new bytes copied in, instead of a runtime
++// allocation each time. Safe at -dealloc: every command that names a buffer holds its object (NBCommandBuffer own:) until the
++// command buffer completed or went, so a buffer object that goes is named by nothing the GPU still runs. A buffer whose GPU address
++// was handed out is never kept (an argument buffer names it without own:), nor one the app made purgeable or aliasable, nor a heap,
++// no-copy or surface buffer (none of them is made by newBufferWithBytes: anyway). At most kUploadPoolPerSize buffers of one kind and
++// kUploadPoolBytes in all; everything kept goes back at memory pressure. /var/local/sweet-nobufpool turns it off (read once).
++static const uint64_t kUploadPoolMaxLength=64*1024,kUploadPoolBytes=8u<<20;
++static const size_t kUploadPoolPerSize=64;
++struct PooledUpload {NmbBuffer *handle;void *contents;};
++static std::mutex gUploadPoolLock;
++// Under gUploadPoolLock. Never destroyed: a buffer may go while the process exits.
++static auto &gUploadPool=*new std::map<std::pair<uint64_t,uint64_t>,std::vector<PooledUpload>>;
++static uint64_t gUploadPoolHeld;   // bytes kept, under gUploadPoolLock
++static std::atomic<uint64_t> gUploadReused,gUploadMade,gUploadKept,gUploadDropped;
++static bool uploadPoolOn() {static const bool on=access("/var/local/sweet-nobufpool",F_OK)!=0;return on;}
++static bool uploadPoolable(uint64_t length,MTLResourceOptions options) {
++ const uint64_t storage=(options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift;
++ return length && length<=kUploadPoolMaxLength && storage==MTLStorageModeShared && uploadPoolOn();
++}
++// A kept buffer for (length, options), or {nullptr,nullptr}.
++static PooledUpload takeUpload(uint64_t length,MTLResourceOptions options) {
++ std::lock_guard<std::mutex> lock(gUploadPoolLock);
++ auto it=gUploadPool.find({length,(uint64_t)options});
++ if(it==gUploadPool.end() || it->second.empty())return {nullptr,nullptr};
++ PooledUpload u=it->second.back();it->second.pop_back();gUploadPoolHeld-=length;
++ return u;
++}
++// Keeps `handle` for a later newBufferWithBytes:; NO where the pool is full (the caller releases it).
++static bool keepUpload(NmbBuffer *handle,void *contents,uint64_t length,MTLResourceOptions options) {
++ std::lock_guard<std::mutex> lock(gUploadPoolLock);
++ if(gUploadPoolHeld+length>kUploadPoolBytes)return false;
++ auto &list=gUploadPool[{length,(uint64_t)options}];
++ if(list.size()>=kUploadPoolPerSize)return false;
++ list.push_back({handle,contents});gUploadPoolHeld+=length;
++ return true;
++}
++// Every kept buffer back to the runtime (memory pressure).
++static void drainUploads() {
++ std::vector<NmbBuffer *> gone;
++ {
++  std::lock_guard<std::mutex> lock(gUploadPoolLock);
++  for(auto &entry:gUploadPool)for(auto &u:entry.second)gone.push_back(u.handle);
++  gUploadPool.clear();gUploadPoolHeld=0;
++ }
++ for(NmbBuffer *handle:gone)nmb_buffer_release(handle);
++}
+ @implementation NBBuffer {
+  uint8_t _purgeCounted;   // which of gPurgeable[3] and [4] counts its bytes (0: neither)
+ }
+ - (BOOL)isAliasable {return nmb_buffer_is_aliasable(_handle);}
+-- (void)makeAliasable {if(!nmb_buffer_make_aliasable(_handle))NBLOG(@"native-metal: buffer makeAliasable: %@",lastError());}
++- (void)makeAliasable {_poolable=NO;if(!nmb_buffer_make_aliasable(_handle))NBLOG(@"native-metal: buffer makeAliasable: %@",lastError());}
+ - (void)dealloc {
+  DetailSpan timing(4,(uintptr_t)_handle);
+  if(_purgeCounted)countPurgeable(_purgeCounted,0,nmb_buffer_length(_handle));
++ // Upload reuse (gUploadPool): the contents pointer is the one the memory keeps (a shared buffer's pointer never moves).
++ if(_poolable && !_purgeCounted && !_parentHeap && !_wrapped && !_importedSurface) {
++  void *contents=_cachedContents?_cachedContents:nmb_buffer_contents(_handle);
++  if(contents && keepUpload(_handle,contents,nmb_buffer_length(_handle),_options)){gUploadKept++;return;}
++  gUploadDropped++;
++ }
+  nmb_buffer_release(_handle);
+  // A heap whose last resource went may be discarded now: the age timer runs again if the heap waits for it.
+  if(_parentHeap)armPurgeAge();
+@@ -1139,13 +1196,14 @@
+  if(!self.firstContents)self.firstContents=p;else if(p!=self.lastContents)self.contentsChanges++;
+  self.lastContents=p;
+ }
+-- (uint64_t)gpuAddress {self.gpuAddressCalls++;return nmb_buffer_gpu_address(_handle);}
++- (uint64_t)gpuAddress {_poolable=NO;self.gpuAddressCalls++;return nmb_buffer_gpu_address(_handle);}
+ - (MTLResourceOptions)resourceOptions {return _options;}
+ - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
+ - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+ - (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
+ - (void)didModifyRange:(NSRange)range {(void)range;self.modifyCalls++;}
+ - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
++ if(state!=MTLPurgeableStateKeepCurrent)_poolable=NO;
+  return notePurgeable(0,nmb_buffer_set_purgeable_state(_handle,state),state,[self allocatedSize],_purgeCounted,"buffer");
+ }
+ - (NSUInteger)allocatedSize {return nmb_buffer_length(_handle);}
+@@ -1215,6 +1273,7 @@
+ // 0021 and 0034), as Metal's resource cache gives memory back. The bytes discarded.
+ extern "C" uint64_t native_bridge_metal_relieve_memory(void) {
+  trimHeldImports(true);
++ drainUploads();
+  const uint64_t discarded=native_bridge_metal_purge(0,0);
+  if(gDevice)gPressureEvents[2]+=nmb_device_release_kept_memory(gDevice);
+  return discarded;
+@@ -3386,9 +3445,28 @@
+  return (id<MTLTexture>)(id)shadow;
+ }
+ 
++// 2026-11-19 (bridge patch 0044 and the upload reuse): every 1000th commit, one line with the deferred render pass openings and the
++// upload buffers reused; with diag=1 always, otherwise only when an opening ran out of order or was refused since the last line (the
++// ordering check: those two stay 0 unless the hand-off is wrong).
++static void noteCommitCounters() {
++ static std::atomic<uint64_t> commits{0},seenBad{0};
++ const uint64_t n=++commits;
++ if(n%1000)return;
++ uint64_t d[5]={};
++ if(!nmb_deferred_open_counts(d))return;
++ const uint64_t bad=d[3]+d[4];
++ if(seenBad.exchange(bad)==bad && !diagOn())return;
++ os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal opens: commit %llu | deferred %llu (thread %llu, program %llu) out-of-order %llu refused %llu | "
++  "uploads reused %llu made %llu kept %llu dropped %llu",(unsigned long long)n,(unsigned long long)d[0],(unsigned long long)d[1],
++  (unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)d[4],(unsigned long long)gUploadReused.load(),
++  (unsigned long long)gUploadMade.load(),(unsigned long long)gUploadKept.load(),(unsigned long long)gUploadDropped.load());
++}
+ static void watchBuffersAtCommit(uint64_t commit) {
+  if(commit%500==0)fprintf(stderr,"native-metal binds: commit %llu made %llu skipped %llu (unchanged slots)\n",(unsigned long long)commit,
+                           (unsigned long long)gBindsMade.load(),(unsigned long long)gBindsSkipped.load());
++ if(commit%500==0)fprintf(stderr,"native-metal uploads: commit %llu reused %llu made %llu kept %llu dropped %llu\n",(unsigned long long)commit,
++                          (unsigned long long)gUploadReused.load(),(unsigned long long)gUploadMade.load(),
++                          (unsigned long long)gUploadKept.load(),(unsigned long long)gUploadDropped.load());
+  NSArray *all=gWatchedBuffers.allObjects;
+  for(id o in all) {
+   NBBuffer *b=(NBBuffer *)o;const uint8_t *c=(const uint8_t *)nmb_buffer_contents(b.handle);if(!c)continue;
+@@ -3786,6 +3864,7 @@
+ }
+ - (void)commit {
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
++ noteCommitCounters();
+  if(gWatchedBuffers){static std::atomic<uint64_t> commits{0};const uint64_t n=++commits;if(n%50==0)watchBuffersAtCommit(n);}
+  if(_dumpBuffers.count) {   // 2026-11-19: are the bound buffers' bytes there by commit time, and by completion (written after encoding)?
+   for(NBBuffer *b in _dumpBuffers) {
+@@ -4832,9 +4911,22 @@
+ }
+ - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
+  if(!bytes)return nil;
++ // Upload reuse (gUploadPool): a kept buffer of this length and these options, with the new bytes in it.
++ const bool poolable=uploadPoolable(length,options);
++ if(poolable) {
++  const PooledUpload u=takeUpload(length,options);
++  if(u.handle) {
++   memcpy(u.contents,bytes,length);gUploadReused++;
++   NBBuffer *buffer=[NBBuffer new];buffer.handle=u.handle;buffer.options=options;buffer.madeBy="newBufferWithBytes";
++   buffer.cachedContents=u.contents;buffer.poolable=YES;
++   return (id<MTLBuffer>)buffer;
++  }
++ }
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options&kNBDefinedResourceOptions,bytes);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.madeBy="newBufferWithBytes";return (id<MTLBuffer>)buffer;
++ if(poolable)gUploadMade++;
++ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.madeBy="newBufferWithBytes";buffer.poolable=poolable;
++ return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
+  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;

@@ -1,0 +1,59 @@
+--- a/bsd/dev/sweet_ufs.c	2026-11-20 22:30:01.658000487 +0000
++++ b/bsd/dev/sweet_ufs.c	2026-11-20 22:30:01.671715758 +0000
+@@ -431,7 +431,16 @@
+ 	if (count == 0) {
+ 		goto done;
+ 	}
+-	if (buf_map(bp, &vaddr)) {
++	/*
++	 * 2026-11-20: raw I/O (physio from /dev/rdisk*, e.g. macOS's boot-time fsck_hfs) hands us a B_PHYS buffer whose
++	 * data pointer is the caller's USER address; buf_map returns that address as is, and a plain memcpy to it is a
++	 * kernel access to a user page: PAN permission fault (macOS 27 panic "Kernel data abort" in memmove from
++	 * sweet_ufs_strategy, task fsck_hfs). physio runs the strategy in the caller's thread with the pages wired, so
++	 * copyout/copyin to the user address are right there. iOS never did raw reads, so it never got here.
++	 */
++	bool user = (buf_flags(bp) & B_PHYS) != 0;
++	user_addr_t uaddr = user ? (user_addr_t)buf_dataptr(bp) : 0;
++	if (!user && buf_map(bp, &vaddr)) {
+ 		error = EIO;
+ 		goto done;
+ 	}
+@@ -447,7 +456,11 @@
+ 		if (rd) {
+ 			error = ufs_read_blocks(su.first_block + lba, blocks);
+ 			if (!error) {
+-				memcpy(vaddr + done, (const char *)bounce + skip, want);
++				if (user) {
++					error = copyout((const char *)bounce + skip, uaddr + done, want);
++				} else {
++					memcpy(vaddr + done, (const char *)bounce + skip, want);
++				}
+ 			}
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+@@ -455,7 +468,13 @@
+ 				error = ufs_read_blocks(su.first_block + lba, blocks);
+ 			}
+ 			if (!error) {
+-				memcpy((char *)bounce + skip, vaddr + done, want);
++				if (user) {
++					error = copyin(uaddr + done, (char *)bounce + skip, want);
++				} else {
++					memcpy((char *)bounce + skip, vaddr + done, want);
++				}
++			}
++			if (!error) {
+ 				error = ufs_write_blocks(su.first_block + lba, blocks);
+ 			}
+ 		}
+@@ -466,7 +485,9 @@
+ 		buf_setresid(bp, count - done);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+-	buf_unmap(bp);
++	if (!user) {
++		buf_unmap(bp);
++	}
+ 
+ done:
+ 	if (error) {

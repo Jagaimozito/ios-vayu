@@ -22,6 +22,13 @@ typedef void (*qrtr_cb_t)(const struct qrtr_hdr *h, const uint8_t *data, uint32_
 extern int verbose_link;
 extern unsigned link_stats[4];	/* remote RX_DONE, RX_DONE_W_REUSE, our intent requests */
 extern void (*link_idle)(void);	/* called every poll round */
+/*
+ * 2026-11-17: bumped wherever wland does real work (a GLINK message, a CE ring RX or TX, a message from the kernel
+ * bridge, a packet from utun). The long idle loop (link_poll with ms >= 100) sleeps 1 ms between rounds while that
+ * moves and naps longer once nothing has happened for a while (link.c link_nap): polling every 1 ms cost 10-13 % of
+ * a core at idle. WLAND_NAP=0 in the environment: always 1 ms.
+ */
+extern unsigned link_activity;
 uint64_t link_ms(void);		/* since the first call */
 int link_up(qrtr_cb_t cb, unsigned timeout_ms);
 int link_poll(unsigned ms);		/* handle what arrived; for ms (0 = just once) */

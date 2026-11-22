@@ -43,6 +43,7 @@
 #define PSCI_CPU_OFF		0x84000002UL
 #define PSCI_CPU_ON		0xc4000003UL
 #define PSCI_MIGRATE_INFO_TYPE	0x84000006UL
+#define PSCI_SYSTEM_OFF		0x84000008UL
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define PSCI_FEATURES		0x8400000aUL
 #define PSCI_SYSTEM_SUSPEND	0xc400000eUL
@@ -387,58 +388,106 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
+#if defined(BOARD_GUACAMOLE)
+	con_quiet = 1;	/* black until the menu; an error turns the text back on */
+	/* No clear here: the menu clears the screen with the MMU on (3 ms instead of ~190 ms). */
+#else
 	con_clear(MENU_BG);	/* 2026-11-17: was red, a red flash before the menu */
+#endif
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_str("BOARD", BOARD_NAME);
 	con_skip();
 #if defined(BOARD_GUACAMOLE)
 	/*
-	 * Boot menu (menu.c): iOS 27 / iOS 16 / Android, volume keys to move, power to start.
-	 * The Alert Slider picks the default like the menu reads, top to bottom (2026-11-17): top iOS 27,
-	 * middle iOS 16, bottom Android (unknown: iOS 16), which
-	 * starts after 5 s unless a key is pressed. If Android cannot be started the reason
-	 * stays on screen for 15 s, then iOS 16 boots.
+	 * Boot menu (menu.c), 2026-11-20: pictures of iOS 27 / macOS 27 / Android, then small Restart and
+	 * Power off buttons in the bottom right corner; volume keys to move, power to start.
+	 * No Alert Slider: the default is the last choice, kept in the boot menu memory block (ufs.c
+	 * ufs_bootmem_*: unallocated space at the end of LUN 0); none kept, iOS 27. It starts after 5 s
+	 * unless a key is pressed. If Android cannot be started the reason stays on screen for 15 s,
+	 * then iOS 27 boots. Payload 0 = iOS 27 (partition ios27), payload 1 = macOS 27 (partition macos).
 	 */
 	stage = "bootsel";
-	uint32_t slider_raw = 0;
-	int slider = bootsel_slider(&slider_raw);
+	static uint8_t mem[4096] __attribute__((aligned(4096)));
+	int memok = !ufs_open() && !ufs_bootmem_read(mem);
+	int kept = -1;
+	if (memok && mem[0] == 'S' && mem[1] == 'W' && mem[2] == 'B' && mem[3] == 'M' && mem[4] == 1 &&
+	    mem[5] < 3 && mem[6] == (uint8_t)~mem[5])
+		kept = mem[5];
 	/* Filled in code, not with an initializer: a table of string pointers in data would need
 	 * relocation, and the shim runs unrelocated. */
-	struct menu_entry entries[3];
-	/* tools/mktripleboot.py: payload 0 = iOS 16 (partition ios), payload 1 = iOS 27 (partition ios26) */
+	struct menu_entry entries[5];
 	int npay = loader_count(dtb);
 	entries[0].title = "iOS 27";
-	entries[0].detail = npay >= 2 ? "iPhone 14 Pro, partition ios26" : "not in this boot image";
-	entries[0].enabled = npay >= 2;
-	entries[1].title = "iOS 16";
-	entries[1].detail = "iPhone X, partition ios";
-	entries[1].enabled = 1;
+	entries[0].detail = npay >= 1 ? "iPhone 14 Pro, partition ios27" : "not in this boot image";
+	entries[0].enabled = npay >= 1;
+	entries[0].icon = menu_icon_ios27;
+	entries[1].title = "macOS 27";
+	entries[1].detail = npay >= 2 ? "partition macos" : "not installed yet";
+	entries[1].enabled = npay >= 2;
+	entries[1].icon = menu_icon_macos27;
 	entries[2].title = "Android";
 	entries[2].detail = "boot_a";
 	entries[2].enabled = 1;
+	entries[2].icon = menu_icon_android;
+	for (int i = 0; i < 3; i++)
+		entries[i].small = 0;
+	entries[3].title = "Restart";
+	entries[4].title = "Power off";
+	for (int i = 3; i < 5; i++) {
+		entries[i].detail = "";
+		entries[i].enabled = 1;
+		entries[i].icon = 0;
+		entries[i].small = 1;
+	}
 	__asm__ volatile("" ::: "memory");
-	int def = (slider == SLIDER_TOP && entries[0].enabled) ? 0 : slider == SLIDER_BOTTOM ? 2 : 1;
+	int def = (kept >= 0 && entries[kept].enabled) ? kept : entries[0].enabled ? 0 : 2;
+	/* MMU on for drawing (mmu.c: image Normal WB, framebuffer Normal-NC, everything else Device as
+	 * with the MMU off); off again before the UFS write below. Without it the menu still works, slowly. */
+	stage = "menu mmu";
+	int menu_mmu = mmu_enable(&mi) == 0;
+	if (!menu_mmu)
+		con_clear(MENU_BG);
 	stage = "menu";
-	int choice = menu_choose(entries, 3, def, 5000);
-	con_quiet = 1;	/* only "Booting ..." until the kernel takes the screen; errors turn it back on */
+	/* Restart / Power off (PSCI) never return when they work; if one does, the menu comes back
+	 * with no countdown. Neither is remembered as the default. */
+	int choice = menu_choose(entries, 5, def, 5000);
+	while (choice >= 3) {
+		smc(choice == 3 ? PSCI_SYSTEM_RESET : PSCI_SYSTEM_OFF, 0, 0, 0);
+		entries[choice].title = "Failed";
+		choice = menu_choose(entries, 5, choice, 0);
+	}
+	/* The chosen OS's picture while the MMU is still on, then MMU off for everything that follows. */
+	menu_booting(choice == 2 ? menu_icon_android : choice == 1 && entries[1].enabled ? menu_icon_macos27 :
+		     menu_icon_ios27);
+	if (menu_mmu)
+		mmu_disable();
+	stage = "bootsel";
+	if (memok && choice != kept) {	/* written only when the choice changed */
+		for (unsigned i = 0; i < sizeof(mem); i++)
+			mem[i] = 0;
+		mem[0] = 'S'; mem[1] = 'W'; mem[2] = 'B'; mem[3] = 'M'; mem[4] = 1;
+		mem[5] = (uint8_t)choice; mem[6] = (uint8_t)~choice;
+		(void)ufs_bootmem_write(mem);
+	}
+	con_quiet = 1;	/* only the chosen picture until the kernel takes the screen; errors turn text back on */
 	if (choice == 2) {
 		stage = "android";
-		menu_booting("Booting Android");
 		const char *afail = android_boot(dtb);
 		con_quiet = 0;
 		con_clear(BLACK);
 		con_str("ANDROID", afail);
-		bootsel_report(dtb, slider, slider_raw);
+		bootsel_report(dtb, SLIDER_UNKNOWN, 0);
+		if (memok) {	/* next boot defaults to iOS 27, not to the Android that failed */
+			mem[5] = 0; mem[6] = 0xff;
+			(void)ufs_bootmem_write(mem);
+		}
 		delay_ms(15000);
 		con_quiet = 1;
 	}
 	stage = "loader";
 	int pay_index = 0;
-	if (choice == 0 && entries[0].enabled) {
+	if (choice == 1 && entries[1].enabled) {
 		pay_index = 1;
-		menu_booting("Booting iOS 27");
-	} else {
-		menu_booting("Booting iOS 16");
 	}
 #else
 	int pay_index = 0;

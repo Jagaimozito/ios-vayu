@@ -1,0 +1,54 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -775,6 +775,40 @@
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++#if XNU_TARGET_OS_OSX
++/*
++ * macOS 27, 2026-11-20: cfprefsd starts with qtn_proc_apply_to_self(), a __mac_syscall("Quarantine", ...), and exits
++ * 254 ("Failure to configure quarantine ... Exiting daemon.") when no Quarantine policy answers (macOS gets it from
++ * the Quarantine kext, which this kernel has none of). Everything that reads preferences then waits for cfprefsd.
++ * A stand-in "Quarantine" policy accepts every call and quarantines nothing; the first 32 calls are logged.
++ */
++static unsigned sweet_qtn_logged;
++
++static int
++sweet_quarantine_syscall(struct proc *p, int call, user_addr_t arg __unused)
++{
++	if (sweet_qtn_logged < 32) {
++		char name[20];
++		sweet_qtn_logged++;
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET Quarantine: %s[%d] op %d -> 0\n", name, proc_pid(p), call);
++	}
++	return 0;
++}
++
++static const struct mac_policy_ops sweet_quarantine_mac_ops = {
++	.mpo_policy_syscall = sweet_quarantine_syscall,
++};
++
++static struct mac_policy_conf sweet_quarantine_mac_conf = {
++	.mpc_name = "Quarantine",
++	.mpc_fullname = "SWEET permissive quarantine stand-in",
++	.mpc_ops = &sweet_quarantine_mac_ops,
++};
++
++static mac_policy_handle_t sweet_quarantine_mac_handle;
++#endif /* XNU_TARGET_OS_OSX */
++
+ /* Called from kernel_bootstrap_thread after mac_policy_initmach, before machine_lockdown. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -787,5 +821,10 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++#if XNU_TARGET_OS_OSX
++	error = mac_policy_register(&sweet_quarantine_mac_conf, &sweet_quarantine_mac_handle, NULL);
++	printf("SWEET Quarantine: permissive policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
++#endif
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

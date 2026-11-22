@@ -11,3 +11,6 @@ struct mmu_info {
 
 int mmu_enable(struct mmu_info *info);
 uint64_t mmu_probe(uintptr_t va);
+/* Clean + invalidate our image from the D-cache and turn the MMU and caches off again
+ * (identity map, so execution continues). Everything after it runs as with the MMU never on. */
+void mmu_disable(void);

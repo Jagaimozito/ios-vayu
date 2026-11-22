@@ -151,6 +151,7 @@ void bridge_poll(void)
 		struct fw_hdr h;
 		memcpy(&h, m, sizeof(h));
 		const uint8_t *p = m + sizeof(h);
+		link_activity++;
 		switch (h.type) {
 		case FW_SCAN:
 			if (scan_pending)
