@@ -14,6 +14,7 @@
 #include "console.h"
 #include "font.h"
 #include "menu.h"
+#include "touch.h"
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 
@@ -264,6 +265,26 @@ static void draw_button(const struct menu_entry *all, int n, int i, int selected
 	text(x + BTN_PAD, BTN_Y + (BTN_H - 16 * BTN_SCALE) / 2, BTN_SCALE, all[i].title, TEXT);
 }
 
+/* The entry under panel pixel (x, y): a picture (with its ring margin) or a small button; -1 = none. */
+static int hit(const struct menu_entry *all, int n, int x, int y)
+{
+	for (int i = 0; i < n; i++) {
+		if (all[i].small) {
+			int bx = BTN_RIGHT;
+			for (int k = n - 1; k >= i; k--)
+				if (all[k].small)
+					bx -= btn_w(&all[k]) + (k > i ? BTN_GAP : 0);
+			if (x >= bx - 20 && x < bx + btn_w(&all[i]) + 20 && y >= BTN_Y - 20 && y < BTN_Y + BTN_H + 20)
+				return i;
+		} else if (all[i].icon) {
+			int iy = ICON_Y0 + i * (MENU_ICON + ICON_GAP);
+			if (x >= ICON_X - 22 && x < ICON_X + MENU_ICON + 22 && y >= iy - 22 && y < iy + MENU_ICON + 22)
+				return i;
+		}
+	}
+	return -1;
+}
+
 static void draw_entry(const struct menu_entry *all, int n, int i, int selected, int full)
 {
 	const struct menu_entry *e = &all[i];
@@ -306,6 +327,13 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 		draw_entry(e, n, i, i == sel, 1);
 	if (apid_pon < 0 || (apid_vup < 0 && apid_vdn < 0))
 		text_c(BAR_Y + 80, 3, "keys not found: starting the default", TEXT_DIM);
+	/*
+	 * 2026-11-22: touch (touch.c). Starting it only powers the IC; it answers ~300 ms later, so the menu
+	 * shows at once and taps count from then on. A tap on a picture starts that system; a tap on Restart or
+	 * Power off selects it, a second tap on it does it. Any failure: keys only, as before.
+	 */
+	(void)touch_begin();
+	int tdown = 0, tstart = -1, tx = 0, ty = 0;
 
 	/* Keys held from power-on do not count: wait until all are released (at most 3 s). */
 	uint64_t t = now(), end = t + ms_ticks(3000);
@@ -326,6 +354,33 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 		}
 		unsigned k = keys_now(), pressed = k & ~prev;
 		prev = k;
+		/* touch: act on lift, on the entry the finger went down on */
+		int tap = -1, fx, fy, f = touch_poll(&fx, &fy);
+		if (f == 1) {
+			if (!tdown)
+				tstart = hit(e, n, fx, fy);
+			tdown = 1;
+			tx = fx;
+			ty = fy;
+			if (counting) {
+				counting = 0;
+				draw_bar(0, 0);
+			}
+		} else if (f == 0 && tdown) {
+			tdown = 0;
+			if (tstart >= 0 && hit(e, n, tx, ty) == tstart && e[tstart].enabled)
+				tap = tstart;
+		}
+		if (tap >= 0) {
+			int again = tap == sel;
+			if (tap != sel) {
+				draw_entry(e, n, sel, 0, 0);
+				draw_entry(e, n, tap, 1, 0);
+				sel = tap;
+			}
+			if (!e[sel].small || again)
+				break;
+		}
 		if (pressed && counting) {
 			counting = 0;
 			draw_bar(0, 0);
@@ -349,6 +404,7 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 		while (now() < w)
 			;
 	}
+	touch_end();
 	return sel;
 }
 
