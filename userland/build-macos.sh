@@ -20,3 +20,8 @@ xcrun --sdk macosx clang -arch arm64 -mmacos-version-min=14.0 -isysroot $SDK -O2
 	-framework CoreGraphics -o out/macos/sweet-displayd jb/sweet-displayd.m
 codesign -f -s - --entitlements macos/sweet-displayd-ents.plist out/macos/sweet-displayd
 echo out/macos/sweet-displayd
+# Bluetooth: btbridge (userland/bt) in its -p mode, a pty at /dev/cu.BLTH for macOS's bluetoothd (H4 transport,
+# BT_HCI_TRANSPORT=H4) instead of iOS's kernel control (2026-11-22).
+$CC -Wno-unused-parameter -Wno-sign-compare -o out/macos/btbridge bt/btbridge.c wland/pmem.c -Iwland -Ibt
+codesign -f -s - out/macos/btbridge
+echo out/macos/btbridge

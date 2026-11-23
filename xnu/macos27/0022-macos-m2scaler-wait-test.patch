@@ -1,0 +1,59 @@
+--- a/bsd/dev/sweet_scaler.c
++++ b/bsd/dev/sweet_scaler.c
+@@ -35,6 +35,9 @@
+ int sweet_scaler_swap = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_swap, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_swap, 0,
+     "SweetM2Scaler rectangle requests: 1 copy +000 into +004 (tiles into the picture), 0 copy +004 into +000");
++int sweet_scaler_wait_ms = 0;    /* 2026-11-23 test: ms to wait before a rectangle copy from a YUV tile */
++SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_wait_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_wait_ms, 0,
++    "SweetM2Scaler: ms to wait before a rectangle copy from a YUV tile (test)");
+ uint8_t sweet_scaler_last[0x170];
+ char sweet_scaler_last_what[160];
+ uint32_t sweet_scaler_last_n;
+--- a/iokit/Kernel/arm/SweetM2Scaler.cpp
++++ b/iokit/Kernel/arm/SweetM2Scaler.cpp
+@@ -180,6 +180,7 @@
+ extern int sweet_scaler_rot;
+ extern int sweet_scaler_rects;
+ extern int sweet_scaler_swap;
++extern int sweet_scaler_wait_ms;
+ extern uint8_t sweet_scaler_last[0x170];
+ extern char sweet_scaler_last_what[160];
+ extern uint32_t sweet_scaler_last_n;
+@@ -437,11 +438,22 @@
+     if (selector != 1 || args == NULL || args->structureInput == NULL ||
+         args->structureInputSize < 0x170) {
+         static uint32_t bad;
+-        if (++bad <= 6) {
++        if (++bad <= 16) {
++            /* 2026-11-23: SecurityAgent sends selector 10 (24 bytes) and 4 (32 bytes) before every HEIC tile copy;
++             * the bytes are logged to find out what they ask for (a wait for the decoder's write?) */
+             char name[32]; proc_selfname(name, sizeof(name));
+-            IOLog("SWEET SCALER BAD #%u: %s selector=%u in=%u out=%u scalars=%u\n", bad, name, selector,
++            char hex[3 * 48 + 1] = "";
++            uint32_t n = 0;
++            if (args && args->structureInput) {
++                n = (uint32_t)args->structureInputSize;
++                if (n > 48) n = 48;
++                for (uint32_t i = 0; i < n; i++)
++                    snprintf(hex + i * 3, 4, "%02x ", ((const uint8_t *)args->structureInput)[i]);
++            }
++            IOLog("SWEET SCALER BAD #%u: %s selector=%u in=%u out=%u scalars=%u [%llx %llx] %s\n", bad, name, selector,
+                 args ? (uint32_t)args->structureInputSize : 0, args ? (uint32_t)args->structureOutputSize : 0,
+-                args ? args->scalarInputCount : 0);
++                args ? args->scalarInputCount : 0, args && args->scalarInputCount > 0 ? args->scalarInput[0] : 0ull,
++                args && args->scalarInputCount > 1 ? args->scalarInput[1] : 0ull, hex);
+         }
+         return kIOReturnBadArgument;
+     }
+@@ -487,6 +499,10 @@
+         bool swap = sweet_scaler_swap != 0;
+         SweetSurface *from = swap ? dst : src, *to = swap ? src : dst;
+         const sweet_scaler_rect &fr = swap ? dr : sr, &tr = swap ? sr : dr;
++        /* kern.sweet_scaler_wait_ms (test, default 0): wait before copying from a YUV tile, in case the decoder is
++         * still writing it (the macOS login wallpaper came out as a mosaic of misplaced and black tiles) */
++        if (sweet_scaler_wait_ms > 0 && from && !sweet_scaler_is32(from))
++            IOSleep((unsigned)(sweet_scaler_wait_ms > 1000 ? 1000 : sweet_scaler_wait_ms));
+         ok = sweet_scaler_convert_rect(from, to, fr, tr);
+         static uint32_t rectlog;
+         if (rectlog++ < 8) {

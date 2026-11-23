@@ -23,6 +23,10 @@
  *   btbridge -q       only errors and a summary every 60 s
  *   btbridge -s       stay at 115200 (options combine: -q -s)
  *   btbridge -a       also one line per ACL packet (start of its data)
+ *   btbridge -p [PATH] macOS: offer the host side as a pseudo-terminal linked at PATH (default /dev/cu.BLTH) instead of
+ *                     the kernel control. macOS 27's bluetoothd has no kernel-control UART transport: its "H4"
+ *                     transport (BT_HCI_TRANSPORT=H4, record "POSIX") opens a serial device, /dev/cu.BLTH unless
+ *                     given as "H4:path,baud", at 3 Mbaud (outputs/macos-bt, bluetoothd 0x1000d5c78, 2026-11-22).
  * Needs Wi-Fi up (wland: the controller's rails) and /var/local/fw/bt/crbtfw21.tlv + crnv21.bin.
  * MIT, as userland/.
  */
@@ -36,6 +40,9 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/file.h>
+#include <termios.h>
+#include <stdlib.h>
+#include <poll.h>
 
 /* Kernel-control headers are private and absent from the iOS SDK. */
 #define SYSPROTO_CONTROL 2
@@ -46,6 +53,38 @@ struct sockaddr_ctl { uint8_t sc_len, sc_family; uint16_t ss_sysaddr; uint32_t s
 #define CTLIOCGINFO _IOWR('N', 3, struct ctl_info)
 
 static int quiet, acl_log;
+
+/* The host side. Kernel control: one write, as before. Pty (-p): its buffer is small (an ACL packet may not fit at
+ * once) and a packet cut short would put bluetoothd out of step, so the rest is written as room appears; if nobody
+ * reads for 300 ms (bluetoothd not running) the pty's queue is flushed and the packet dropped. */
+static int pty_sfd = -1;
+static ssize_t host_write(int m, const void *buf, size_t len)
+{
+	if (pty_sfd < 0)
+		return write(m, buf, len);
+	const uint8_t *p = buf;
+	size_t done = 0;
+	int waited = 0;
+	while (done < len) {
+		ssize_t w = write(m, p + done, len - done);
+		if (w > 0) {
+			done += (size_t)w;
+			continue;
+		}
+		if (w < 0 && errno != EAGAIN && errno != EINTR)
+			return -1;
+		if (waited >= 300) {
+			static unsigned long flushes;
+			if (!(flushes++ % 100))
+				printf("btbridge: nobody reading the pty: queue flushed (%lu times)\n", flushes);
+			tcflush(pty_sfd, TCIFLUSH);
+			return (ssize_t)len;
+		}
+		usleep(1000);
+		waited++;
+	}
+	return (ssize_t)len;
+}
 
 /* -a: one line per ACL packet, the first 40 bytes (handle, L2CAP length + channel, then e.g. the AVDTP / SDP / AVCTP
  * signal), to see how far audio setup gets (2026-11-09: AirPods connected, encrypted, no audio, ~50 ACL each way) */
@@ -180,6 +219,44 @@ static int open_host(void)
 	return fd;
 }
 
+/* -p: a pseudo-terminal for macOS's bluetoothd (H4 over a serial port). The slave stays open here too, raw, so the
+ * master never sees EIO while bluetoothd (or BlueTool) is between opens and the link keeps its settings; bluetoothd
+ * sets its own termios on open. The speed it asks for means nothing on a pty. */
+static int open_host_pty(const char *path)
+{
+	int fd = posix_openpt(O_RDWR | O_NOCTTY);
+	if (fd < 0 || grantpt(fd) || unlockpt(fd)) {
+		printf("btbridge: posix_openpt: %s\n", strerror(errno));
+		return -1;
+	}
+	const char *slave = ptsname(fd);
+	int sfd = slave ? open(slave, O_RDWR | O_NOCTTY) : -1;
+	if (sfd < 0) {
+		printf("btbridge: open pty slave %s: %s\n", slave ? slave : "?", strerror(errno));
+		return -1;
+	}
+	struct termios t;
+	if (tcgetattr(sfd, &t) == 0) {
+		cfmakeraw(&t);
+		t.c_cflag |= CLOCAL | CREAD;
+		cfsetspeed(&t, B115200);
+		tcsetattr(sfd, TCSANOW, &t);
+	}
+	if (tcgetattr(fd, &t) == 0) {
+		cfmakeraw(&t);
+		tcsetattr(fd, TCSANOW, &t);
+	}
+	unlink(path);
+	if (symlink(slave, path)) {
+		printf("btbridge: symlink %s -> %s: %s\n", path, slave, strerror(errno));
+		return -1;
+	}
+	chmod(slave, 0666);
+	pty_sfd = sfd;
+	fcntl(fd, F_SETFL, O_NONBLOCK);
+	printf("btbridge: host side is the pty %s, linked at %s (bluetoothd: BT_HCI_TRANSPORT=H4)\n", slave, path);
+	return fd;
+}
 
 /* 0x0c "Command Disallowed" for LE_Set_Scan_Parameters (2026-11-09, every time: 01 0b 20 07 01 40 00 30 00 01 00):
  * bluetoothd scans with own address type 1 (random), and sets its random address through Apple / Broadcom vendor
@@ -286,7 +363,7 @@ static void scan_parameters(int m, const uint8_t *cmd, unsigned n)
 		printf("btbridge: LE scan parameters with own address type public -> %#x\n", st);
 	}
 	uint8_t ev[] = { 0x04, 0x0e, 0x04, 0x01, 0x0b, 0x20, st };
-	if (write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
+	if (host_write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
 		printf("btbridge: write: %s\n", strerror(errno));
 }
 
@@ -294,7 +371,7 @@ static void scan_parameters(int m, const uint8_t *cmd, unsigned n)
 static void fake_complete(int m, uint16_t opcode)
 {
 	uint8_t ev[] = { 0x04, 0x0e, 0x04, 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0x00 };
-	if (write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
+	if (host_write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
 		printf("btbridge: write: %s\n", strerror(errno));
 }
 
@@ -322,13 +399,13 @@ static void fake_vendor_complete(int m, uint16_t opcode, const uint8_t *params, 
 	if (nparams > 0 && ((opcode == 0xfce2 && params[0] == 0x1c) || (opcode == 0xfd23 && params[0] == 0x0a))) {
 		uint8_t short_ev[11] = { 0x04, 0x0e, 3 + 1 + 4, 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0x00,
 			params[0], 0x01, 0x00, 0x00 };
-		if (write(m, short_ev, sizeof(short_ev)) != (ssize_t)sizeof(short_ev))
+		if (host_write(m, short_ev, sizeof(short_ev)) != (ssize_t)sizeof(short_ev))
 			printf("btbridge: write: %s\n", strerror(errno));
 		printf("btbridge: cached-info read %04x/%02x answered with %02x %02x %02x %02x\n", opcode, params[0],
 		    short_ev[7], short_ev[8], short_ev[9], short_ev[10]);
 		return;
 	}
-	if (write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
+	if (host_write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
 		printf("btbridge: write: %s\n", strerror(errno));
 }
 
@@ -340,7 +417,7 @@ static void fake_local_version(int m)
 		0x04, 0x0e, 0x0c, 0x01, 0x01, 0x10,   /* Command Complete for opcode 0x1001 (OGF 4, OCF 1) */
 		0x00, 0x09, 0x00, 0x00, 0x09, 0x0f, 0x00, 0x0e, 0x42
 	};
-	if (write(m, event, sizeof(event)) != (ssize_t)sizeof(event))
+	if (host_write(m, event, sizeof(event)) != (ssize_t)sizeof(event))
 		printf("btbridge: Read Local Version reply: %s\n", strerror(errno));
 }
 
@@ -370,6 +447,7 @@ static int h4_len(const uint8_t *b, unsigned n)
 int main(int argc, char **argv)
 {
 	int fast = 1;
+	const char *pty_path = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-q"))
 			quiet = 1;
@@ -377,6 +455,8 @@ int main(int argc, char **argv)
 			fast = 0;
 		else if (!strcmp(argv[i], "-a"))
 			acl_log = 1;
+		else if (!strcmp(argv[i], "-p"))
+			pty_path = i + 1 < argc && argv[i + 1][0] == '/' ? argv[++i] : "/dev/cu.BLTH";
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	/* one instance: a second one would reset the controller under the first (launchd job com.sweet.btbridge) */
@@ -394,7 +474,7 @@ int main(int argc, char **argv)
 		return 1;
 	if (ensure_hcd())
 		return 1;
-	int m = open_host();
+	int m = pty_path ? open_host_pty(pty_path) : open_host();
 	if (m < 0)
 		return 1;
 
@@ -420,7 +500,7 @@ int main(int argc, char **argv)
 		} else if (r == 0) {
 			printf("btbridge: the kernel control closed\n");
 			return 1;
-		} else if (r < 0 && errno != EAGAIN) {
+		} else if (r < 0 && errno != EAGAIN && !(pty_path && errno == EIO)) {
 			printf("btbridge: read: %s\n", strerror(errno));
 		}
 		for (;;) {
@@ -467,7 +547,7 @@ int main(int argc, char **argv)
 					if (!quiet)
 						show("host LE_Read_Periodic_Advertiser_List_Size (answered here)", host, (unsigned)len);
 					uint8_t ev[] = { 0x04, 0x0e, 0x05, 0x01, 0x4a, 0x20, 0x00, 0x03 };
-					if (write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
+					if (host_write(m, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
 						printf("btbridge: write: %s\n", strerror(errno));
 				} else if (op == 0x200b && len == 11) {
 					if (host[9] & 1)
@@ -559,7 +639,7 @@ int main(int argc, char **argv)
 				show_acl("in ", ctl, (unsigned)len);
 			}
 			/* with no iOS side connected the kernel drops it (and counts it) */
-			if (forward && write(m, ctl, (size_t)len) != len)
+			if (forward && host_write(m, ctl, (size_t)len) != len)
 				printf("btbridge: write: %s\n", strerror(errno));
 			memmove(ctl, ctl + len, nc - (unsigned)len);
 			nc -= (unsigned)len;

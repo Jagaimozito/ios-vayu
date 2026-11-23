@@ -1,0 +1,47 @@
+--- a/bsd/vfs/vfs_cluster.c
++++ b/bsd/vfs/vfs_cluster.c
+@@ -6276,20 +6276,39 @@
+ 		upl_flags = UPL_QUERY_OBJECT_TYPE;
+ 
+ 		vm_map_t map = UIO_SEG_IS_USER_SPACE(uio->uio_segflg) ? current_map() : kernel_map;
+-		if ((vm_map_get_upl(map,
++		u_int32_t asked_size = upl_size;
++		kern_return_t upl_kr;
++		if ((upl_kr = vm_map_get_upl(map,
+ #if HAS_MTE || HAS_MTE_EMULATION_SHIMS
+ 		    vm_memtag_canonicalize(map, vm_map_trunc_page(iov_base, vm_map_page_mask(map))),
+ #else /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
+ 		    vm_map_trunc_page(iov_base, vm_map_page_mask(map)),
+ #endif /* HAS_MTE || HAS_MTE_EMULATION_SHIMS */
+-		    &upl_size, &upl, NULL, NULL, &upl_flags, VM_KERN_MEMORY_FILE, 0)) != KERN_SUCCESS) {
++		    &upl_size, &upl, NULL, NULL, &upl_flags, VM_KERN_MEMORY_FILE, 0)) != KERN_SUCCESS || upl_size == 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			/*
++			 * 2026-11-23: on this phone the query fails for ordinary user memory (malloc, valloc, mmap, vm_allocate
++			 * alike), so every uncached read/write (F_NOCACHE: libcopyfile sets it, so every copyfile() and
++			 * NSFileManager copy) failed with EFAULT: wallpaper snapshots ("AllLevelsExceptFloating.atx couldn't be
++			 * copied"), customizations not saved. Do the I/O through the cache instead (IO_COPY): copyin/copyout
++			 * still give EFAULT for an address that really is bad.
++			 */
++			static uint32_t sweet_logged;
++			if (sweet_logged < 4) {
++				sweet_logged++;
++				printf("SWEET VFS: direct I/O query failed (kr %d, size %u, user %d, map page shift %d): copying instead\n",
++				    upl_kr, asked_size, UIO_SEG_IS_USER_SPACE(uio->uio_segflg) ? 1 : 0, vm_map_page_shift(map));
++			}
++			*io_length = asked_size;
++			*io_type = IO_COPY;
++			KERNEL_DEBUG((FSDBG_CODE(DBG_FSRW, 94)) | DBG_FUNC_END, iov_base, *io_type, *io_length, 0, 0);
++			return 0;
++#else
+ 			/*
+ 			 * the user app must have passed in an invalid address
+ 			 */
+ 			retval = EFAULT;
+-		}
+-		if (upl_size == 0) {
+-			retval = EFAULT;
++#endif
+ 		}
+ 
+ 		*io_length = upl_size;

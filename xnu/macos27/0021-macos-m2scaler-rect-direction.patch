@@ -1,0 +1,74 @@
+--- a/bsd/dev/sweet_scaler.c	2026-11-23 09:27:31.566008291 +0000
++++ b/bsd/dev/sweet_scaler.c	2026-11-23 09:27:44.790068091 +0000
+@@ -28,6 +28,13 @@
+ #endif
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_rect, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_rects, 0,
+     "SweetM2Scaler rectangle requests: 0 refuse (as before), 1 do, 2 do except backboardd's");
++/* 2026-11-23: direction of rectangle requests. 1 (default): +000 is the source (16.16 rectangle, size at +048), +004
++ * the destination (pixel rectangle, size at +070): decoded HEIC tiles go INTO the whole picture. 0: the other way
++ * round (the 2026-11-23 morning builds; macOS login came out solid green = an untouched '444f' picture, iOS home
++ * screen black). Boot-arg sweetscalerswap=0 or kern.sweet_scaler_swap=0 goes back to that. */
++int sweet_scaler_swap = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_swap, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_swap, 0,
++    "SweetM2Scaler rectangle requests: 1 copy +000 into +004 (tiles into the picture), 0 copy +004 into +000");
+ uint8_t sweet_scaler_last[0x170];
+ char sweet_scaler_last_what[160];
+ uint32_t sweet_scaler_last_n;
+--- a/iokit/Kernel/arm/SweetM2Scaler.cpp	2026-11-23 09:27:31.565008291 +0000
++++ b/iokit/Kernel/arm/SweetM2Scaler.cpp	2026-11-23 09:27:54.554878268 +0000
+@@ -179,6 +179,7 @@
+ extern "C" {
+ extern int sweet_scaler_rot;
+ extern int sweet_scaler_rects;
++extern int sweet_scaler_swap;
+ extern uint8_t sweet_scaler_last[0x170];
+ extern char sweet_scaler_last_what[160];
+ extern uint32_t sweet_scaler_last_n;
+@@ -269,7 +270,10 @@
+     /* 2026-11-23: +000 is the DESTINATION (as the rest of this file has it; the turned copy depends on it), with its
+      * size at +048 and its rectangle at +028..+040 (16.16); the source is +004, size at +070, rectangle at +060..+06c
+      * (pixels). Read the other way round (first version), the copies went from the empty tiles into the decoded
+-     * picture: wallpapers came out black. Example: dst 56x56 thumbnail <- src 128x64 whole (0,0 128x64). */
++     * picture: wallpapers came out black. Example: dst 56x56 thumbnail <- src 128x64 whole (0,0 128x64).
++     * Later the same day (macOS login solid green, iOS home screen black) the order of the logged copies showed the
++     * first reading was right after all: the black then came from '420f' sources being refused part-way. Which way the
++     * copy goes is now kern.sweet_scaler_swap (externalMethod); the names here stay +000 "dst", +004 "src". */
+     uint32_t dW = sweet_scaler_u32(in + 0x48), dH = sweet_scaler_u32(in + 0x4c);
+     uint32_t sW = sweet_scaler_u32(in + 0x70), sH = sweet_scaler_u32(in + 0x74);
+     if (!dst || !src || !dW || !dH || !sW || !sH || dst->width != dW || dst->height != dH ||
+@@ -465,6 +469,12 @@
+         rect_arg = PE_parse_boot_argn("sweetscalerrect", &v, sizeof(v)) ? (int)(v > 2 ? 2 : v) : 3;
+         if (rect_arg != 3) sweet_scaler_rects = rect_arg;
+     }
++    static int swap_arg = -1;
++    if (swap_arg < 0) {
++        uint32_t v = 0;
++        swap_arg = PE_parse_boot_argn("sweetscalerswap", &v, sizeof(v)) ? (v ? 1 : 0) : 2;
++        if (swap_arg != 2) sweet_scaler_swap = swap_arg;
++    }
+     /* kern.sweet_scaler_rect: 0 refuse rectangle requests (as before), 1 do them, 2 do them except backboardd's
+      * (its own per-frame display copies; the wallpapers' tile stitching runs in other processes) */
+     char caller[32];
+@@ -472,12 +482,18 @@
+     bool rect_ok = sweet_scaler_rects == 1 || (sweet_scaler_rects == 2 && strcmp(caller, "backboardd") != 0);
+     if (rect_ok && !sweet_scaler_turned(src, dst) && sweet_scaler_parse_rects(in, dst, src, &sr, &dr)) {
+         rect = true;
+-        ok = sweet_scaler_convert_rect(src, dst, sr, dr);
++        /* parse_rects names +000 "dst" and +004 "src"; with kern.sweet_scaler_swap=1 (default) the copy actually goes
++         * from +000 into +004 (see bsd/dev/sweet_scaler.c): the decoded tile into its place in the whole picture */
++        bool swap = sweet_scaler_swap != 0;
++        SweetSurface *from = swap ? dst : src, *to = swap ? src : dst;
++        const sweet_scaler_rect &fr = swap ? dr : sr, &tr = swap ? sr : dr;
++        ok = sweet_scaler_convert_rect(from, to, fr, tr);
+         static uint32_t rectlog;
+         if (rectlog++ < 8) {
+-            IOLog("SWEET SCALER RECT: %s flags %08x src=%u %08x (%u,%u %ux%u) -> dst=%u %08x (%u,%u %ux%u) -> %s\n",
+-                caller, sweet_scaler_u32(in + 0x20), srcID, src ? src->pixelFormat : 0, sr.x, sr.y, sr.w, sr.h, dstID,
+-                dst ? dst->pixelFormat : 0, dr.x, dr.y, dr.w, dr.h, ok ? "copied" : "refused");
++            IOLog("SWEET SCALER RECT%s: %s flags %08x from=%u %08x (%u,%u %ux%u) -> to=%u %08x (%u,%u %ux%u) -> %s\n",
++                swap ? "" : " (unswapped)", caller, sweet_scaler_u32(in + 0x20), swap ? dstID : srcID,
++                from ? from->pixelFormat : 0, fr.x, fr.y, fr.w, fr.h, swap ? srcID : dstID,
++                to ? to->pixelFormat : 0, tr.x, tr.y, tr.w, tr.h, ok ? "copied" : "refused");
+         }
+     }
+     if (!rect)

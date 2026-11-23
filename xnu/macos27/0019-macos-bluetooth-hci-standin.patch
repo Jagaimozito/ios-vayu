@@ -1,0 +1,96 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -24,6 +24,7 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetMedia.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetBluetooth.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -121,6 +121,11 @@
+     "   },"
+ #if XNU_TARGET_OS_OSX
+     "   {"
++    "     'IOClass'         = IOBluetoothHCIController;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOBluetoothHCIController;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDPointer;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDPointer;"
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBluetooth.cpp
+@@ -0,0 +1,69 @@
++/*
++ * SweetBluetooth: a stand-in IOBluetoothHCIController for macOS 27's bluetoothd (2026-11-22, macOS only).
++ *
++ * On a Mac, IOBluetoothFamily.kext publishes IOBluetoothHCIController. bluetoothd's HID shim waits for that service
++ * on its main thread (bluetoothd 27.2 arm64e 0x100567508: IOServiceAddMatchingNotification + a 5 s run loop, for
++ * ever: "Couldn't find IOBluetoothHCIController service, waiting for it to appear -- HIDShim") and then opens it
++ * (IOServiceOpen, type 0). This kernel has no IOBluetoothFamily, so the stack never got past it. The controller
++ * itself is reached elsewhere: bluetoothd's H4 transport over the pty btbridge makes (userland/bt/btbridge.c -p,
++ * BT_HCI_TRANSPORT=H4:POSIX). This object only lets the shim find and open something; its calls are logged (the
++ * first 16, with sizes) and answered kIOReturnUnsupported until we know which ones matter.
++ * Boot-arg sweetbtctl=0 leaves it out.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
++
++#if XNU_TARGET_OS_OSX
++
++class IOBluetoothHCIController : public IOService {
++	OSDeclareDefaultStructors(IOBluetoothHCIController);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IOBluetoothHCIController, IOService);
++
++class SweetBluetoothHCIUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetBluetoothHCIUserClient);
++public:
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE { terminate(); return kIOReturnSuccess; }
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE { (void)properties; return kIOReturnSuccess; }
++};
++OSDefineMetaClassAndStructors(SweetBluetoothHCIUserClient, IOUserClient);
++
++static uint32_t sweet_bthci_log;
++
++bool
++IOBluetoothHCIController::start(IOService *provider)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("sweetbtctl", &on, sizeof(on));
++	if (!on || !IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetBluetoothHCIUserClient");
++	setProperty("SweetStandIn", "bluetoothd HID shim; HCI goes through btbridge's pty");
++	registerService();
++	IOLog("SWEET BTHCI: IOBluetoothHCIController stand-in registered\n");
++	return true;
++}
++
++IOReturn
++SweetBluetoothHCIUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	if (sweet_bthci_log++ < 16) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET BTHCI: %s selector %u scalars in %u out %u struct in %u out %u -> unsupported\n", name, selector,
++		    args ? args->scalarInputCount : 0, args ? args->scalarOutputCount : 0,
++		    args ? (uint32_t)args->structureInputSize : 0, args ? (uint32_t)args->structureOutputSize : 0);
++	}
++	return kIOReturnUnsupported;
++}
++
++#endif /* XNU_TARGET_OS_OSX */

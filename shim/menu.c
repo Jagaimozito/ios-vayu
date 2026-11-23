@@ -409,6 +409,25 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 }
 
 /* "Booting ..." on the menu background, centred: the screen until the kernel draws its own. */
+extern const uint8_t menu_bootpic_data[];
+
+int menu_bootpic(void)
+{
+	const uint8_t *p = menu_bootpic_data;
+	int w = p[4] | p[5] << 8, h = p[6] | p[7] << 8;
+	if (p[0] != 'S' || p[1] != 'W' || p[2] != 'B' || p[3] != 'P' || w <= 0 || h <= 0 || w > FB_W || h > FB_H)
+		return 0;
+	fill(0, 0, FB_W, FB_H, BG);
+	int x0 = (FB_W - w) / 2, y0 = (FB_H - h) / 2;
+	p += 8;
+	for (int j = 0; j < h; j++) {
+		volatile uint32_t *row = con_fb + (y0 + j) * (FB_STRIDE / 4) + x0;
+		for (int i = 0; i < w; i++, p += 3)
+			row[i] = 0xff000000u | (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
+	}
+	return 1;
+}
+
 void menu_booting(const uint8_t *icon)
 {
 	/* 2026-11-20: the chosen OS's picture in the centre of a black screen, no "Booting ..." line */
