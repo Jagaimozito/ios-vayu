@@ -1,3 +1,101 @@
+# Shared-tree iOS touchfix quiet image (2026-11-23)
+- Built the iOS kernel from `work/xnu-12377` with the iOS SDK and `BUILD/obj-ios26-sweet`; `work/xnu-ios27` was not
+  used. Kernel SHA-256: `bcb9d3f5a2eca495ed30fe7153b6429a148e6da437af45760231f529a7892853`.
+- Checks: `displayUUID` 0, `sweetquiet` 1, `SWEET BTHCI` 0, `csr_active_config` 0. The iOS
+  `CONFIG_CSR` option is absent from `config/MASTER.arm64.sweet`.
+- Updated `tools/mkmenuboot.py` to validate iOS payload kernels from `work/xnu-12377/BUILD/obj-ios26-sweet` and
+  macOS payload kernels from `work/xnu-12377/BUILD/obj-macos27-sweet`; a macOS payload requires both checks.
+- Image: `outputs/guacamole-menu-shared-touchfix-quiet.img`, SHA-256
+  `dc0517acc8b7c0101055f1cdc51a5a95301c0f565a0cdedae1a928c7668e36dd`. It reuses the touchfix reference shim and
+  the byte-identical 21,513,536-byte macOS payload. iOS args are the touchfix args minus `debug=0xc` and `serial=3`,
+  with a fresh `sweettime`; sidecar: `outputs/guacamole-menu-shared-touchfix-quiet-ios-boot-args.txt`.
+- Image provenance checks passed for both kernel build directories. Not flashed or committed.
+
+# iOS touch displayUUID fix, CSR off (2026-11-22)
+- In `work/xnu-ios27` only, kept `CONFIG_CSR` disabled and applied
+  `xnu/ios27/xnu12377-touch-displayuuid-macos-only.diff` in `SweetHID.cpp`.
+- The first no-scaler kernel still contained one `displayUUID` string, from the display-side property in
+  `SweetFramebuffer.cpp`. Guarded that property with `#if XNU_TARGET_OS_OSX` in the iOS tree too. Final kernels have
+  `displayUUID` count 0 and `csr_active_config` count 0. No `work/xnu-12377` files were changed.
+- No-scaler: `outputs/guacamole-menu-iostree-touchfix.img`, SHA-256
+  `ee33aa9c74e21ad36f473657efda8aaca076aa3ef1cd6211bc999c1ffc3a06d0`; kernel SHA-256
+  `e51d27757c853415729d1540f595939d013365b9a25655985a7404f94d3c3aed`.
+- With `xnu/ios27/xnu12377-scaler-rect.diff`: `outputs/guacamole-menu-iostree-touchfix-scaler.img`, SHA-256
+  `95efee324b2e956f149d0d2aaacf9c6d8b6d44f9872580d0cda47fffceff2be7`; kernel SHA-256
+  `4464c4abc1387db0ef1245951b8f0bf19d9c665528de82961047503849896505`; `sweet_scaler_rect` count 1.
+- Both images reuse the reference shim and macOS payload, use the reference iOS arguments with fresh `sweettime`,
+  and passed `mkmenuboot.py` kernel-provenance verification. Neither was flashed; no commit was made.
+
+# iOS no-CSR test images (2026-11-22)
+- Follow-up to the failed iOS-tree test images: removed `options CONFIG_CSR # <config_csr>` from
+  `work/xnu-ios27/config/MASTER.arm64.sweet` only; `work/xnu-12377` retains its macOS CSR setting.
+- Rebuilt the iOS tree twice. The first build temporarily reversed `xnu/ios27/xnu12377-scaler-rect.diff`; the second
+  reapplied that scaler-only diff. No unguarded `csr_check` reference caused a link failure.
+- Both kernels report `strings <kernel> | grep -c csr_active_config` = 0. The scaler kernel has one
+  `sweet_scaler_rect` string. Both use the reference shim and macOS payload, and the iOS args from
+  `guacamole-menu-iostree-test.img` with a fresh `sweettime`; sidecars are beside each image.
+- No-scaler image: `outputs/guacamole-menu-iostree-nocsr.img`, SHA-256
+  `aa7b7437137e3a1c4e960e0b18d2d226986111eae67b01e5309ec224b482d383`; kernel
+  `work/xnu-ios27/BUILD/obj-ios27-split/DEVELOPMENT_ARM64_SWEET/mach.nocsr-noscaler`, SHA-256
+  `4a5edf969e27e76ac730c206dbd0a49b544e534caa64a2752f083a98c941074c`.
+- Scaler image: `outputs/guacamole-menu-iostree-nocsr-scaler.img`, SHA-256
+  `c5bb8f24ae64dc3be34f2cbf21098b4c5f9ee02e4810ce2667b72e8d23dae996`; kernel
+  `work/xnu-ios27/BUILD/obj-ios27-split/DEVELOPMENT_ARM64_SWEET/mach.nocsr-scaler`, SHA-256
+  `b3581b0624cb5f5ecdc8a65535558a505d81fa6e227c234f218cba1ba6a89f45`.
+- Neither image was flashed; no commit was made.
+
+# iOS/macOS kernel source split — iOS tree test images (2026-11-22)
+- Created `work/xnu-ios27` as a copy of `work/xnu-12377` without `BUILD/`; all iOS builds below use its independent
+  `BUILD/obj-ios27-split` and copied iOS support SDK. The macOS source tree `work/xnu-12377` was not edited.
+- In `work/xnu-ios27`, reversed all three requested undo patches cleanly: 0267 removed the scaler rectangle handler
+  and user-client close/property additions; 0268 removed the iOS `sweetquiet` default-console mute; 0269 removed the
+  unguarded keyboard personality. Kept serial-console and `SweetFramebuffer.cpp` macOS mute logic behind their
+  existing `#if XNU_TARGET_OS_OSX` guards, and preserved iOS `sweetfb_noconsole` behavior.
+- Step 2 platform cleanup: FEAT_SHA3/SHA512/FHM/FRINTTS instruction handling, helper functions, and telemetry in
+  `osfmk/arm64/sleh.c` are now macOS-only. Existing iOS LRCPC2 atomic user-memory access (`sweet_user_load`) and
+  earlier iOS `FJCVTZS` handling remain. `SweetHIDKeyboard`'s personality in `iokit/KernelConfigTables.cpp` is now
+  macOS-only. SweetFramebuffer's macOS-specific branches were already guarded and needed no edits.
+- Added the `--ios-kernel` requirement to `tools/mkmenuboot.py`: it rejects kernels outside
+  `work/xnu-ios27/BUILD` and compares every embedded Mach-O segment against the supplied kernel. Verified it rejects
+  the prior `work/xnu-12377/BUILD` kernel.
+- iOS build logs: `work/xnu-ios27-split-test-build.log` (baseline) and `work/xnu-ios27-split-scaler-build.log`.
+  The first make attempt needed `XNU_AVAILABILITY_PL=../../tools/macos27-availability-versions.py`; final builds
+  completed. The baseline kernel has no `sweet_scaler_rect`, `sweetquiet`, `SWEET BTHCI`, or SWEET SIMD-emulator
+  telemetry strings; the scaler kernel contains `sweet_scaler_rect` (count 1), has no `sweetquiet` or `SWEET BTHCI`.
+- Both menu images reuse the current shim and the macOS payload byte-for-byte from
+  `outputs/guacamole-menu-touchshim-ios27good-macos27fix1.img`. iOS boot arguments match that image, with only a
+  fresh `sweettime`; the macOS arguments are unchanged. The embedded iOS payload segments match each dedicated
+  iOS kernel build. Combined ramdisk is 41,755,968 / 48,234,496 bytes.
+- Baseline (no scaler change): `outputs/guacamole-menu-iostree-test.img`, 49,532,928 bytes, SHA-256
+  `a1f8e16f4e2bd23672955e00afacae8350d65a7e536692279c196f222212c48c`. iOS kernel SHA-256
+  `9500ecb6a382434ce33b1196f66a65fb53448ea2bf0b1793ee77e065293cc52e`; boot-args sidecar
+  `outputs/guacamole-menu-iostree-test-ios-boot-args.txt`.
+- Scaler test (after applying `xnu/ios27/xnu12377-scaler-rect.diff` only in `work/xnu-ios27`):
+  `outputs/guacamole-menu-iostree-scaler.img`, 49,532,928 bytes, SHA-256
+  `2d3c946a8e5398223b4d9e3af5bf2b3ce2a518e7f8abadcb50a1dcb7bff52cce`. iOS kernel SHA-256
+  `071a55bfa454a86bbf8595faec72867015ca2790dc6a98f4182a89f662b115d0`; boot-args sidecar
+  `outputs/guacamole-menu-iostree-scaler-ios-boot-args.txt`.
+- Neither image was flashed; no commit was made.
+
+# iOS/macOS split-kernel fix1 (2026-11-22)
+- Rebuilt both kernels independently from `work/xnu-12377`: iOS SDK / `obj-ios26-sweet` and macOS SDK /
+  `obj-macos27-sweet`. Logs: `work/xnu12377-ios27-fix1-build.log` and `work/xnu12377-macos27-build.log`.
+- iOS kernel SHA-256 `61e2963e48df339f5710fd7a6e41e74d99ff230f34c4887ea273ffeb6c8f761f`;
+  checks: `sweetquiet` 1, `sweet_scaler_rect` 2, `SWEET BTHCI` 0. macOS kernel SHA-256
+  `611340939bdbdcb3bbf66c307000b36aa06c4b64a446ff691eaa31b0e300c3a0`; checks: `SWEET BTHCI` 2,
+  `sweet_scaler_rect` 2.
+- The iOS link initially lacked `csr_check`: `config/MASTER.arm64.sweet` did not enable `config_csr` although
+  `IOPlatformExpert.cpp` referenced it. Added the SWEET config option and rebuilt successfully.
+- Rebuilt `shim/out/Image` with the LLVM 18 AArch64 wrapper; `shim/out/bootpic.bin` stayed byte-identical
+  (SHA-256 `cfc3e20bc0763b87eaf90ae23edcaf40ef7f669d6198321b57153795e26b59c8`).
+- Built `outputs/guacamole-menu-ios27-macos27-fix1.img` (49,532,928 bytes), SHA-256
+  `f9b6d95127ac9e3653ee4246dbb66750d6e69da219351d812a945bdb3915897f`. Both embedded payloads byte-match
+  their separate kernel builds. iOS boot args match `outputs/guacamole-menu-ios27-macos27.prev.img` except for
+  refreshed `sweettime`; macOS args are unchanged. Sidecars:
+  `outputs/guacamole-menu-ios27-macos27-fix1-ios-boot-args.txt` and
+  `outputs/guacamole-menu-ios27-macos27-fix1-macos-boot-args.txt`. Combined ramdisk 41,755,968 / 48,234,496 B.
+- Not flashed or committed. Fastboot command: `fastboot flash boot_b outputs/guacamole-menu-ios27-macos27-fix1.img`.
+
 # iOS 27 root script audit: everything the old phone root had by hand (2026-11-20, Claude)
 - A fresh 80g root came up with Setup, no GPU, no Bluetooth, no Wi-Fi IP, no Cellular row: the old root had been fixed
   by hand (boxes, SSH, mgtool, launchd-*.py) and tools/mkios27root-mac.sh never got those changes. Audited NOTES from

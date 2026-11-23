@@ -1,0 +1,16 @@
+--- a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -5583,7 +5583,12 @@
+ #if !TARGET_OS_OSX
+  const char *program=getprogname();
+  NSString *archivePath=d.url.path;
+- posterBoardRenderBoxArchive=program && !strcmp(program,"PosterBoard") &&
++ // 2026-11-23: off unless SHENG_PB_RB_ARCHIVE=1. With it PosterBoard compiled RenderBox's pipelines itself: the lock
++ // screen switcher (hold the lock screen) then hung on "image provider timed out while waiting for phase 2/6" and the
++ // scene-create watchdog killed PosterBoard after 10 s. The black home screen it was meant for was IOSurface use
++ // counts (SweetSurface.cpp, same day), so the archive is refused again as before and RenderBox takes its old path.
++ posterBoardRenderBoxArchive=program && !strcmp(program,"PosterBoard") && getenv("SHENG_PB_RB_ARCHIVE") &&
++     !strcmp(getenv("SHENG_PB_RB_ARCHIVE"),"1") &&
+      [archivePath isEqualToString:@"/System/Library/PrivateFrameworks/RenderBox.framework/archive.metallib"];
+ #endif
+  NmbBinaryArchive *handle=nmb_binary_archive_new(gDevice,d.url?d.url.fileSystemRepresentation:nullptr);

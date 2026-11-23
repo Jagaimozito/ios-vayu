@@ -20,3 +20,5 @@ int menu_choose(const struct menu_entry *e, int n, int sel, unsigned timeout_ms)
 
 /* Black screen with the chosen OS's picture (MENU_ICON, shim/art.S) in the centre; 0 = black only. */
 void menu_booting(const uint8_t *icon);
+/* The boot picture (tools/mkbootpic.py) centred on black; 0 if the build has none (then use menu_booting). */
+int menu_bootpic(void);

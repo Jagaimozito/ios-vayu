@@ -1,6 +1,13 @@
 # iOS 27.2 kernel and driver diffs
 
-The iOS 27.2 kernel is built from `work/xnu-12377` (Apple's xnu-12377.121.6 plus the SWEET port), which is not
+## Kernel source split
+
+The iOS 27 kernel must be built from the separate `work/xnu-ios27` copy and its own `BUILD/` directory. The
+macOS 27 kernel is built only from `work/xnu-12377`. Do not package an iOS payload built from the macOS tree:
+`tools/mkmenuboot.py` requires `--ios-kernel` under `work/xnu-ios27/BUILD/` and verifies that its Mach-O segments
+match the embedded iOS payload.
+
+The iOS 27.2 kernel is built from `work/xnu-ios27` (Apple's xnu-12377.121.6 plus the SWEET port), which is not
 in this repository. These are the individual changes made to that tree during the iOS 27 bring-up, kept here so
 they are not only in the ignored `research/` folder. Each was made with `diff -u` against a backup of the file
 just before the change, so they apply in the order the work was done (see `NOTES.md`), not to a clean xnu tree.

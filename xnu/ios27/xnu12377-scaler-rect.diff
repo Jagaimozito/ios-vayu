@@ -1,0 +1,278 @@
+--- a/bsd/dev/sweet_scaler.c
++++ b/bsd/dev/sweet_scaler.c
+@@ -17,6 +17,17 @@
+ #include <kern/kalloc.h>
+ 
+ int sweet_scaler_rot = 1;
++/* 2026-11-22: rectangle requests (SweetM2Scaler.cpp sweet_scaler_parse_rects, HEIC tile stitching). On by default on
++ * macOS, and on iOS in mode 2: the first iOS build with it (mode 1) broke the GUI (garbled screen, no touch): backboardd's own per-frame
++ * requests with rectangles were taken as tile copies. Boot-arg sweetscalerrect=0/1/2 or kern.sweet_scaler_rect: 0 off,
++ * 1 on, 2 on except for backboardd (its own display copies; wallpaper tile stitching runs in other processes). */
++#if XNU_TARGET_OS_OSX
++int sweet_scaler_rects = 1;
++#else
++int sweet_scaler_rects = 2;    /* iOS: wallpaper tiles yes, backboardd's display copies no (tested 2026-11-23: lock screen wallpaper OK) */
++#endif
++SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_rect, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_rects, 0,
++    "SweetM2Scaler rectangle requests: 0 refuse (as before), 1 do, 2 do except backboardd's");
+ uint8_t sweet_scaler_last[0x170];
+ char sweet_scaler_last_what[160];
+ uint32_t sweet_scaler_last_n;
+--- a/iokit/Kernel/arm/SweetM2Scaler.cpp
++++ b/iokit/Kernel/arm/SweetM2Scaler.cpp
+@@ -20,6 +20,8 @@
+ #include <sys/proc.h>
+ #include "SweetSurface.h"
+ #include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
+ 
+ class AppleM2ScalerCSCDriver : public IOService {
+     OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
+@@ -45,6 +47,10 @@
+     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+         IOExternalMethodDispatch *dispatch, OSObject *target,
+         void *reference) APPLE_KEXT_OVERRIDE;
++    /* 2026-11-22: without these every IOSurfaceAccelerator user leaked its connection (217 open after one boot) and
++     * IOSurfaceAcceleratorCreate logged "Failed to set client property" (IOConnectSetCFProperties) for each one. */
++    IOReturn clientClose(void) APPLE_KEXT_OVERRIDE { terminate(); return kIOReturnSuccess; }
++    IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE { (void)properties; return kIOReturnSuccess; }
+ };
+ OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriverUserClient, IOUserClient);
+ 
+@@ -172,6 +178,7 @@
+  * tiles so the column-wise reads stay in cache. */
+ extern "C" {
+ extern int sweet_scaler_rot;
++extern int sweet_scaler_rects;
+ extern uint8_t sweet_scaler_last[0x170];
+ extern char sweet_scaler_last_what[160];
+ extern uint32_t sweet_scaler_last_n;
+@@ -235,6 +242,189 @@
+         dstID, dst ? dst->pixelFormat : 0, dst ? dst->width : 0, dst ? dst->height : 0, dst ? dst->bytesPerRow : 0);
+ }
+ 
++/* 2026-11-22: rectangle requests (sub-rectangle of the source into a sub-rectangle of the destination). ImageIO
++ * stitches HEIC grid tiles with these: each 512x512 tile (clipped at the right/bottom edge) goes to its place in the
++ * whole picture. They were all refused, which left the wallpapers (iOS and macOS) with missing and stale squares.
++ * Request layout, from a refused request (Sonoma Horizon, the bottom-right tile):
++ *   +000 u32 source surface ID          +004 u32 destination surface ID
++ *   +028 u64 source x   +030 u64 source y   +038 u64 source width   +040 u64 source height   (16.16 fixed point)
++ *   +048 u32 source surface width       +04c u32 source surface height
++ *   +060 u32 dest x  +064 dest y  +068 dest width  +06c dest height  (pixels)
++ *   +070 u32 destination surface width  +074 u32 destination surface height
++ * Taken only when both surfaces' sizes match +048/+070 (which also tells the IDs' order), so the full-surface and the
++ * turned (copy_iosurface) paths below are unchanged. Scaling is nearest-neighbour, formats as sweet_scaler_convert. */
++struct sweet_scaler_rect { uint32_t x, y, w, h; };
++
++static inline uint64_t
++sweet_scaler_u64(const uint8_t *p)
++{
++    uint64_t v;
++    bcopy(p, &v, sizeof(v));
++    return v;
++}
++
++static bool
++sweet_scaler_parse_rects(const uint8_t *in, SweetSurface *dst, SweetSurface *src, sweet_scaler_rect *sr, sweet_scaler_rect *dr)
++{
++    /* 2026-11-23: +000 is the DESTINATION (as the rest of this file has it; the turned copy depends on it), with its
++     * size at +048 and its rectangle at +028..+040 (16.16); the source is +004, size at +070, rectangle at +060..+06c
++     * (pixels). Read the other way round (first version), the copies went from the empty tiles into the decoded
++     * picture: wallpapers came out black. Example: dst 56x56 thumbnail <- src 128x64 whole (0,0 128x64). */
++    uint32_t dW = sweet_scaler_u32(in + 0x48), dH = sweet_scaler_u32(in + 0x4c);
++    uint32_t sW = sweet_scaler_u32(in + 0x70), sH = sweet_scaler_u32(in + 0x74);
++    if (!dst || !src || !dW || !dH || !sW || !sH || dst->width != dW || dst->height != dH ||
++        src->width != sW || src->height != sH) return false;
++    uint64_t dx = sweet_scaler_u64(in + 0x28) >> 16, dy = sweet_scaler_u64(in + 0x30) >> 16;
++    uint64_t dw = sweet_scaler_u64(in + 0x38) >> 16, dh = sweet_scaler_u64(in + 0x40) >> 16;
++    uint32_t sx = sweet_scaler_u32(in + 0x60), sy = sweet_scaler_u32(in + 0x64);
++    uint32_t sw = sweet_scaler_u32(in + 0x68), sh = sweet_scaler_u32(in + 0x6c);
++    /* a zero rectangle means the whole surface */
++    if (!dw && !dh && !dx && !dy) { dw = dW; dh = dH; }
++    if (!sw && !sh && !sx && !sy) { sw = sW; sh = sH; }
++    if (!sw || !sh || !dw || !dh || (uint64_t)sx + sw > sW || (uint64_t)sy + sh > sH ||
++        dx + dw > dW || dy + dh > dH) return false;
++    *sr = (sweet_scaler_rect){ sx, sy, sw, sh };
++    *dr = (sweet_scaler_rect){ (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, (uint32_t)dh };
++    return true;
++}
++
++/*
++ * 2026-11-23: one YUV biplanar surface's planes, bounds-checked against the surface's allocation. sub: chroma
++ * subsampling, 2 for '420f'/'420v' (one CbCr pair per 2x2 pixels), 1 for '444f'/'444v' (a pair per pixel; macOS's
++ * login and desktop wallpapers and iOS's iPhone 14 Pro wallpapers come as '444f'). video: '...v' (16-235/240).
++ */
++struct sweet_scaler_yuv { uint8_t *y, *uv; uint32_t yp, uvp, sub; bool video; };
++
++static bool
++sweet_scaler_yuv_kind(uint32_t f, uint32_t *sub, bool *video)
++{
++    if (sweet_scaler_fourcc(f, '4','2','0','f')) { *sub = 2; *video = false; return true; }
++    if (sweet_scaler_fourcc(f, '4','2','0','v')) { *sub = 2; *video = true; return true; }
++    if (sweet_scaler_fourcc(f, '4','4','4','f')) { *sub = 1; *video = false; return true; }
++    if (sweet_scaler_fourcc(f, '4','4','4','v')) { *sub = 1; *video = true; return true; }
++    return false;
++}
++
++static bool
++sweet_scaler_yuv_planes(SweetSurface *s, uintptr_t base, sweet_scaler_yuv *o)
++{
++    uint32_t w = s->width, h = s->height;
++    if (!sweet_scaler_yuv_kind(s->pixelFormat, &o->sub, &o->video) || s->planeCount < 2) return false;
++    uint64_t cw = ((uint64_t)w + o->sub - 1) / o->sub, ch = ((uint64_t)h + o->sub - 1) / o->sub;
++    o->yp = s->planes[0].bytesPerRow;
++    o->uvp = s->planes[1].bytesPerRow;
++    if (o->yp < w || o->uvp < cw * 2) return false;
++    if ((uint64_t)(h - 1) * o->yp + w + s->planes[0].offset > s->allocSize ||
++        (ch - 1) * o->uvp + cw * 2 + s->planes[1].offset > s->allocSize) return false;
++    o->y = (uint8_t *)base + s->planes[0].offset;
++    o->uv = (uint8_t *)base + s->planes[1].offset;
++    return true;
++}
++
++/*
++ * A rectangle of the source into a rectangle of the destination, nearest neighbour.
++ * Source: BGRA, RGBA, 420f, 420v, 444f, 444v. Destination: BGRA, RGBA, and (2026-11-23) the same YUV formats: PosterBoard's wallpaper tiles
++ * are cut from the BGRA picture into '420f' tile surfaces; refusing those after other tiles had been done left the
++ * wallpaper black. YUV <-> RGB as the full-surface path: BT.601, '420f' full range, '420v' video range. YUV -> YUV is
++ * copied as it is (luma per pixel, chroma per 2x2 block).
++ */
++static bool
++sweet_scaler_convert_rect(SweetSurface *src, SweetSurface *dst, const sweet_scaler_rect &sr, const sweet_scaler_rect &dr)
++{
++    if (src == NULL || dst == NULL || src->width > 16384 || src->height > 16384 ||
++        dst->width > 16384 || dst->height > 16384) return false;
++    uintptr_t sb = src->kernelAddress(), db = dst->kernelAddress();
++    if (!sb || !db) return false;
++    bool srcBGRA = sweet_scaler_fourcc(src->pixelFormat, 'B','G','R','A');
++    bool srcRGBA = sweet_scaler_fourcc(src->pixelFormat, 'R','G','B','A');
++    bool dstBGRA = sweet_scaler_fourcc(dst->pixelFormat, 'B','G','R','A');
++    bool dstRGBA = sweet_scaler_fourcc(dst->pixelFormat, 'R','G','B','A');
++    uint32_t ssub, dsub;
++    bool svid, dvid;
++    bool srcYUV = sweet_scaler_yuv_kind(src->pixelFormat, &ssub, &svid);
++    bool dstYUV = sweet_scaler_yuv_kind(dst->pixelFormat, &dsub, &dvid);
++    if ((!srcBGRA && !srcRGBA && !srcYUV) || (!dstBGRA && !dstRGBA && !dstYUV)) return false;
++    uint32_t sW = src->width, sH = src->height, dW = dst->width, dH = dst->height;
++    uint32_t sp = src->bytesPerRow, dp = dst->bytesPerRow;
++    const uint8_t *s = NULL;
++    uint8_t *d = NULL;
++    sweet_scaler_yuv sy4 = {}, dy4 = {};
++    if (srcYUV) {
++        if (!sweet_scaler_yuv_planes(src, sb, &sy4)) return false;
++    } else {
++        if (sp < sW * 4 || (uint64_t)(sH - 1) * sp + (uint64_t)sW * 4 + src->offset > src->allocSize) return false;
++        s = (const uint8_t *)sb + src->offset;
++    }
++    if (dstYUV) {
++        if (!sweet_scaler_yuv_planes(dst, db, &dy4)) return false;
++    } else {
++        if (dp < dW * 4 || (uint64_t)(dH - 1) * dp + (uint64_t)dW * 4 + dst->offset > dst->allocSize) return false;
++        d = (uint8_t *)db + dst->offset;
++    }
++    bool same32 = (srcBGRA && dstBGRA) || (srcRGBA && dstRGBA);
++    for (uint32_t y = 0; y < dr.h; y++) {
++        uint32_t syy = sr.y + (uint32_t)((uint64_t)y * sr.h / dr.h);
++        uint32_t py = dr.y + y;
++        if (same32 && sr.w == dr.w) {
++            bcopy(s + (uint64_t)syy * sp + (uint64_t)sr.x * 4, d + (uint64_t)py * dp + (uint64_t)dr.x * 4, (size_t)dr.w * 4);
++            continue;
++        }
++        for (uint32_t x = 0; x < dr.w; x++) {
++            uint32_t sx = sr.x + (uint32_t)((uint64_t)x * sr.w / dr.w);
++            uint32_t px = dr.x + x;
++            if (srcYUV && dstYUV && sy4.video == dy4.video) {
++                dy4.y[(uint64_t)py * dy4.yp + px] = sy4.y[(uint64_t)syy * sy4.yp + sx];
++                if (px % dy4.sub == 0 && py % dy4.sub == 0) {
++                    const uint8_t *suv = sy4.uv + (uint64_t)(syy / sy4.sub) * sy4.uvp + (uint64_t)(sx / sy4.sub) * 2;
++                    uint8_t *duv = dy4.uv + (uint64_t)(py / dy4.sub) * dy4.uvp + (uint64_t)(px / dy4.sub) * 2;
++                    duv[0] = suv[0];
++                    duv[1] = suv[1];
++                }
++                continue;
++            }
++            int r, g, b, a = 255;
++            if (!srcYUV) {
++                const uint8_t *q = s + (uint64_t)syy * sp + (uint64_t)sx * 4;
++                if (srcBGRA) { b = q[0]; g = q[1]; r = q[2]; a = q[3]; }
++                else { r = q[0]; g = q[1]; b = q[2]; a = q[3]; }
++            } else {
++                int yy = sy4.y[(uint64_t)syy * sy4.yp + sx];
++                const uint8_t *uv = sy4.uv + (uint64_t)(syy / sy4.sub) * sy4.uvp + (uint64_t)(sx / sy4.sub) * 2;
++                int d1 = uv[0] - 128, e1 = uv[1] - 128;
++                if (sy4.video) {
++                    int c = yy - 16;
++                    r = sweet_scaler_clamp((298 * c + 409 * e1 + 128) >> 8);
++                    g = sweet_scaler_clamp((298 * c - 100 * d1 - 208 * e1 + 128) >> 8);
++                    b = sweet_scaler_clamp((298 * c + 516 * d1 + 128) >> 8);
++                } else {
++                    r = sweet_scaler_clamp(yy + ((359 * e1 + 128) >> 8));
++                    g = sweet_scaler_clamp(yy - ((88 * d1 + 183 * e1 + 128) >> 8));
++                    b = sweet_scaler_clamp(yy + ((454 * d1 + 128) >> 8));
++                }
++            }
++            if (dstYUV) {
++                /* BT.601 full range: Y = .299R + .587G + .114B, Cb/Cr centred on 128; '420v' squeezed to 16-235/240 */
++                int Y = (77 * r + 150 * g + 29 * b + 128) >> 8;
++                if (dy4.video) Y = 16 + ((Y * 219 + 127) / 255);
++                dy4.y[(uint64_t)py * dy4.yp + px] = (uint8_t)sweet_scaler_clamp(Y);
++                if (px % dy4.sub == 0 && py % dy4.sub == 0) {
++                    int cb = ((-43 * r - 85 * g + 128 * b + 128) >> 8);
++                    int cr = ((128 * r - 107 * g - 21 * b + 128) >> 8);
++                    if (dy4.video) { cb = cb * 224 / 255; cr = cr * 224 / 255; }
++                    uint8_t *duv = dy4.uv + (uint64_t)(py / dy4.sub) * dy4.uvp + (uint64_t)(px / dy4.sub) * 2;
++                    duv[0] = (uint8_t)sweet_scaler_clamp(cb + 128);
++                    duv[1] = (uint8_t)sweet_scaler_clamp(cr + 128);
++                }
++            } else {
++                uint8_t *q = d + (uint64_t)py * dp + (uint64_t)px * 4;
++                if (dstBGRA) { q[0] = (uint8_t)b; q[1] = (uint8_t)g; q[2] = (uint8_t)r; q[3] = (uint8_t)a; }
++                else { q[0] = (uint8_t)r; q[1] = (uint8_t)g; q[2] = (uint8_t)b; q[3] = (uint8_t)a; }
++            }
++        }
++    }
++    return true;
++}
++
+ IOReturn
+ AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector,
+     IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
+@@ -265,9 +455,34 @@
+     SweetSurface *src = sweet_surface_copy(srcID);
+     SweetSurface *dst = sweet_surface_copy(dstID);
+     uint64_t began = mach_absolute_time();
+-    bool rotated = false;
+-    bool ok = fullSurface && sweet_scaler_convert(src, dst);
+-    if (!ok && src && dst && sweet_scaler_turned(src, dst) && sweet_scaler_rot) {
++    bool rotated = false, rect = false;
++    bool ok = false;
++    sweet_scaler_rect sr, dr;
++    /* rectangle request (see sweet_scaler_parse_rects): dst is in+0, src in+4, as everywhere in this file */
++    static int rect_arg = -1;
++    if (rect_arg < 0) {
++        uint32_t v = 0;
++        rect_arg = PE_parse_boot_argn("sweetscalerrect", &v, sizeof(v)) ? (int)(v > 2 ? 2 : v) : 3;
++        if (rect_arg != 3) sweet_scaler_rects = rect_arg;
++    }
++    /* kern.sweet_scaler_rect: 0 refuse rectangle requests (as before), 1 do them, 2 do them except backboardd's
++     * (its own per-frame display copies; the wallpapers' tile stitching runs in other processes) */
++    char caller[32];
++    proc_selfname(caller, sizeof(caller));
++    bool rect_ok = sweet_scaler_rects == 1 || (sweet_scaler_rects == 2 && strcmp(caller, "backboardd") != 0);
++    if (rect_ok && !sweet_scaler_turned(src, dst) && sweet_scaler_parse_rects(in, dst, src, &sr, &dr)) {
++        rect = true;
++        ok = sweet_scaler_convert_rect(src, dst, sr, dr);
++        static uint32_t rectlog;
++        if (rectlog++ < 8) {
++            IOLog("SWEET SCALER RECT: %s flags %08x src=%u %08x (%u,%u %ux%u) -> dst=%u %08x (%u,%u %ux%u) -> %s\n",
++                caller, sweet_scaler_u32(in + 0x20), srcID, src ? src->pixelFormat : 0, sr.x, sr.y, sr.w, sr.h, dstID,
++                dst ? dst->pixelFormat : 0, dr.x, dr.y, dr.w, dr.h, ok ? "copied" : "refused");
++        }
++    }
++    if (!rect)
++        ok = fullSurface && sweet_scaler_convert(src, dst);
++    if (!ok && !rect && src && dst && sweet_scaler_turned(src, dst) && sweet_scaler_rot) {
+         rotated = ok = sweet_scaler_rotate(src, dst, sweet_scaler_rot);
+     }
+     if (ok) {

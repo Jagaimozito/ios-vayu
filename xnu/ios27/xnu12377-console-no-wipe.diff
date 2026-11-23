@@ -1,0 +1,49 @@
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -437,8 +437,18 @@
+ 
+ 		VCPUTC_LOCK_UNLOCK();
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* 2026-11-23: a muted console (macOS always, iOS unless sweetquiet=0) draws nothing, so it does not wipe the
++		 * panel either: the boot menu's boot picture stays until the GUI draws. A panic still draws its text. */
++		extern int sweet_console_quiet_early(void);
++		if (!sweet_console_quiet_early()) {
++			gc_ops.clear_screen(gc_x, gc_y, 0, vinfo.v_rows, 2);
++			gc_ops.show_cursor(gc_x, gc_y);
++		}
++#else
+ 		gc_ops.clear_screen(gc_x, gc_y, 0, vinfo.v_rows, 2);
+ 		gc_ops.show_cursor(gc_x, gc_y);
++#endif
+ 
+ 		gc_ops.enable(TRUE);
+ 		gc_enabled           = TRUE;
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -306,6 +306,25 @@
+ /* Set by AppleCLCD when macOS first presents or when iOS requests
+  * sweetfb_noconsole=1. Console text remains logged; panic output draws again. */
+ int sweet_console_muted;
++/*
++ * 2026-11-23: whether the panel console is muted, decided as early as needed: the video console is switched on (and
++ * would wipe the panel) from PE_init_platform in arm_init, before console_init runs. Same rule as console_init:
++ * macOS always, iOS unless boot-arg sweetquiet=0. Sets the flag too.
++ */
++int
++sweet_console_quiet_early(void)
++{
++#if XNU_TARGET_OS_OSX
++	sweet_console_muted = 1;
++#else
++	uint32_t quiet = 1;
++	(void)PE_parse_boot_argn("sweetquiet", &quiet, sizeof(quiet));
++	if (quiet != 0) {
++		sweet_console_muted = 1;
++	}
++#endif
++	return sweet_console_muted;
++}
+ /*
+  * Set by AppleCLCD while the display pipes scale (2026-11-17 hardware scaling): called once at the first console output
+  * of a panic, to put the pipes back on the 1:1 buffer the console draws into. Register writes only.

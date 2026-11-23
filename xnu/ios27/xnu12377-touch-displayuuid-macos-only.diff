@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -892,9 +892,13 @@
+ 	fOffY = 0;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
++#if XNU_TARGET_OS_OSX
+ 	/* WindowServer maps digitizers to displays by this property. The synthetic
+-	 * built-in panel is the primary display (the HID/display logs call it "main"). */
++	 * built-in panel is the primary display (the HID/display logs call it "main").
++	 * macOS only (2026-11-22): on iOS backboardd maps digitizers by it too, "main" is no iOS display, and every
++	 * touch was dropped (the first iOS kernel built after the macOS work had no touch). */
+ 	setProperty("displayUUID", "main");
++#endif
+ 	setProperty("SurfaceWidth", (unsigned long long)(71 << 16), 32);	/* mm, 16.16: 1440 px @516 ppi */
+ 	setProperty("SurfaceHeight", (unsigned long long)(154 << 16), 32);	/* 3120 px @516 ppi */
+ 	gSweetTouch = this;

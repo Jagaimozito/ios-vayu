@@ -1,0 +1,18 @@
+--- a/bsd/dev/sweet_scaler.c
++++ b/bsd/dev/sweet_scaler.c
+@@ -35,7 +35,14 @@
+ int sweet_scaler_swap = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_swap, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_swap, 0,
+     "SweetM2Scaler rectangle requests: 1 copy +000 into +004 (tiles into the picture), 0 copy +004 into +000");
+-int sweet_scaler_wait_ms = 0;    /* 2026-11-23 test: ms to wait before a rectangle copy from a YUV tile */
++/* 2026-11-23: ms to wait before a rectangle copy from a YUV tile. The HEIC decoder is still writing the tile when
++ * the copy is asked for (macOS login wallpaper: mosaic at 0, clean from 32 ms). macOS 35 until the real wait (what
++ * SecurityAgent's selector 10/4 calls ask for) is done; iOS 0 (PosterBoard is killed by its watchdog when slow). */
++#if XNU_TARGET_OS_OSX
++int sweet_scaler_wait_ms = 35;
++#else
++int sweet_scaler_wait_ms = 0;
++#endif
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_wait_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_wait_ms, 0,
+     "SweetM2Scaler: ms to wait before a rectangle copy from a YUV tile (test)");
+ uint8_t sweet_scaler_last[0x170];

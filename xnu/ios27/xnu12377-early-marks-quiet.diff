@@ -1,0 +1,35 @@
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -87,9 +87,19 @@
+ 	}
+ }
+ 
++/*
++ * 2026-11-23: the progress markers (a coloured block per stage along the bottom edge and a "SWEET EARLY n" line)
++ * stay off the screen unless the kernel is built with SWEET_EARLY_VERBOSE: the boot menu's boot picture shows until
++ * the GUI draws. An early panic still prints (sweet_early_panic).
++ */
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
++#if !defined(SWEET_EARLY_VERBOSE)
++	(void)stage;
++	(void)label;
++	return;
++#endif
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -525,8 +525,8 @@
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 
+-#if defined(SWEET)
+-	/* Early framebuffer marker: white band at the bottom of the ABL buffer. */
++#if defined(SWEET) && defined(SWEET_EARLY_VERBOSE)
++	/* Early framebuffer marker: white band at the bottom of the ABL buffer (debug builds only, 2026-11-23). */
+ 	MOV64	x0, (0x9c000000 + 3088 * 5760)
+ 	mov		w1, #-1
+ 	mov		x2, #32

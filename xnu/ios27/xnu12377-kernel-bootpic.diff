@@ -1,0 +1,117 @@
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -3058,6 +3058,13 @@
+ 	}
+ #endif
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* 2026-11-23: put the boot picture back after any change this made to the screen (osfmk/console/sweet_bootpic.c) */
++	{
++		extern void sweet_bootpic_draw(uintptr_t base, uint32_t rowbytes, uint32_t width, uint32_t height);
++		sweet_bootpic_draw((uintptr_t)vinfo.v_baseaddr, vinfo.v_rowbytes, vinfo.v_width, vinfo.v_height);
++	}
++#endif
+ }
+ 
+ void vcattach(void); /* XXX gcc 4 warning cleanup */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,8 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void sweet_bootpic_draw(uintptr_t base, uint32_t rowbytes, uint32_t width, uint32_t height);
++extern "C" void sweet_bootpic_stop(void);       /* osfmk/console/sweet_bootpic.c */
+ extern "C" uint32_t redwood_gpu_last(void);                                     /* bsd/dev/sweet_gpu.c */
+ extern "C" bool redwood_gpu_ready(void);
+ extern "C" int sweet_gpu_window_alloc(uint64_t bytes, uint64_t *base);         /* 0144 */
+@@ -722,9 +724,13 @@
+ 		return false;
+ 	}
+ #if XNU_TARGET_OS_OSX
+-	/* Mute and clear the boot console as soon as scanout exists; no boot-arg required. */
+-	pauseConsole();
++	/* Mute the boot console as soon as scanout exists; no boot-arg required. 2026-11-23: mute only. The full
++	 * pauseConsole (clear the panel, stop the boot picture) waits for the first GUI frame, so the boot picture stays
++	 * until then (it used to be wiped here, a second into the boot). */
++	sweet_console_muted = 1;
+ #endif
++	/* the boot picture again, in case set-up (console, scaler, buffers) painted over it */
++	sweet_bootpic_draw(fPixels, fRowBytes, fWidth, fHeight);
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -2106,6 +2112,7 @@
+ {
+ 	if (!fConsolePaused) {
+ 		fConsolePaused = true;
++		sweet_bootpic_stop();           /* the GUI draws from here on: the boot picture is not put back */
+ #if XNU_TARGET_OS_OSX
+ 		/* On macOS the first WindowServer present owns scanout; suppress video
+ 		 * console writes but leave serial and SWEETLOG output available. */
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -53,6 +53,8 @@
+ osfmk/arm/arm_init.c		standard
+ osfmk/arm64/arm_vm_init.c	standard
+ osfmk/arm64/sweet_early.c	standard
++osfmk/console/sweet_bootpic.c	standard
++osfmk/console/sweet_bootpic_data.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+--- /dev/null
++++ b/osfmk/console/sweet_bootpic.c
+@@ -0,0 +1,52 @@
++/*
++ * sweet_bootpic: the boot picture, drawn by the kernel too (2026-11-23). The boot menu (shim) shows it while it hands
++ * over, but the kernel's console start-up repaints the panel about a second later; the kernel redraws it, centred,
++ * whenever its console changes the screen and when the display driver starts, until the first frame of the GUI.
++ * The pixels are the boot menu's own picture (shim/out/bootpic.bin, made by tools/mkbootpic.py from a file the user
++ * gives it), written into sweet_bootpic_data.c by `tools/mkbootpic.py ... --kernel work/xnu-12377`; that generated
++ * file is not part of any repository. With no picture (width 0) nothing is drawn.
++ * Format: 'SWBP', u16 width, u16 height, then RGB bytes.
++ */
++#include <stdint.h>
++#include <console/video_console.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern const unsigned char sweet_bootpic_data[];
++extern const unsigned int sweet_bootpic_size;
++
++void sweet_bootpic_draw(uintptr_t base, uint32_t rowbytes, uint32_t width, uint32_t height);
++void sweet_bootpic_stop(void);
++
++static volatile int sweet_bootpic_stopped;
++
++/* the GUI has drawn: the picture is no longer put back */
++void
++sweet_bootpic_stop(void)
++{
++	sweet_bootpic_stopped = 1;
++}
++
++void
++sweet_bootpic_draw(uintptr_t base, uint32_t rowbytes, uint32_t width, uint32_t height)
++{
++	const unsigned char *p = sweet_bootpic_data;
++	if (sweet_bootpic_stopped || base == 0 || sweet_bootpic_size < 8 || p[0] != 'S' || p[1] != 'W' || p[2] != 'B' ||
++	    p[3] != 'P') {
++		return;
++	}
++	uint32_t w = p[4] | (uint32_t)p[5] << 8, h = p[6] | (uint32_t)p[7] << 8;
++	if (w == 0 || h == 0 || w > width || h > height || rowbytes < width * 4 ||
++	    8u + (uint64_t)w * h * 3 > sweet_bootpic_size) {
++		return;
++	}
++	uint32_t x0 = (width - w) / 2, y0 = (height - h) / 2;
++	p += 8;
++	for (uint32_t y = 0; y < h; y++) {
++		volatile uint32_t *row = (volatile uint32_t *)(base + (uint64_t)(y0 + y) * rowbytes) + x0;
++		for (uint32_t x = 0; x < w; x++, p += 3) {
++			row[x] = 0xff000000u | (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

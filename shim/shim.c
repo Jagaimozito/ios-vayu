@@ -457,8 +457,10 @@ void shim_main(uint64_t dtb)
 		choice = menu_choose(entries, 5, choice, 0);
 	}
 	/* The chosen OS's picture while the MMU is still on, then MMU off for everything that follows. */
-	menu_booting(choice == 2 ? menu_icon_android : choice == 1 && entries[1].enabled ? menu_icon_macos27 :
-		     menu_icon_ios27);
+	/* iOS / macOS: the boot picture when the build has one (tools/mkbootpic.py), else the OS's own picture */
+	if (choice == 2 || !menu_bootpic())
+		menu_booting(choice == 2 ? menu_icon_android : choice == 1 && entries[1].enabled ? menu_icon_macos27 :
+			     menu_icon_ios27);
 	if (menu_mmu)
 		mmu_disable();
 	stage = "bootsel";

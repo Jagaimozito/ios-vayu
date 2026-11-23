@@ -13,6 +13,8 @@ guacamole) CFLAGS="$CFLAGS -DBOARD_GUACAMOLE" ;;
 *) echo "unknown BOARD=$BOARD" >&2; exit 1 ;;
 esac
 mkdir -p out
+# The boot picture (tools/mkbootpic.py IMAGE); without one, an empty header: the OS's menu picture is shown instead.
+[ -f out/bootpic.bin ] || python3 ../tools/mkbootpic.py --none
 for f in start.S art.S shim.c console.c mmu.c fdt.c loader.c ufs.c spmi.c bootsel.c android.c menu.c touch.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done

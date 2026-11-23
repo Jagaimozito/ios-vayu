@@ -1,0 +1,129 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -71,6 +71,15 @@
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++/*
++ * 2026-11-23: use counts. IOSurfaceIsInUse(ForCategory) reads the state page (client+0x70) at +0x18: u32 for category
++ * 0, u32 for category 1 at +0x1c; nonzero = in use (research: outputs/usecount-dis.txt, IOSurfaceClientIsInUse). The
++ * framework counts per process (client+0x8) and calls trap 0 (increment) / 1 (decrement) with (id, category) only
++ * on 0 -> 1 and 1 -> 0, so the page holds how many processes use the surface. These traps did nothing: every
++ * surface looked unused, buffer pools handed out a surface still in use, and VTDecoderXPCService decoded the next
++ * HEIC tiles into the one SecurityAgent was still copying (macOS login wallpaper: mosaic, or tiles 3 places early).
++ */
++#define SWEET_SURFACE_STATE_USE         0x18    /* u32[2] in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
+@@ -428,19 +437,37 @@
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint32_t      use[2];       /* this client's use counts (trap 0/1) per category, taken back on free */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { use[0] = use[1] = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetSurfaceRef, OSObject);
+ 
++static void
++sweet_surface_use_add(SweetSurface *s, uint32_t category, int32_t delta)
++{
++	if (s == NULL || s->state == NULL || category > 1) {
++		return;
++	}
++	volatile SInt32 *c = (volatile SInt32 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE + 4 * category);
++	OSAddAtomic(delta, c);
++}
++
+ void
+ SweetSurfaceRef::free()
+ {
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
++		/* a process that goes away (or drops the surface) with uses left stops counting as a user */
++		for (uint32_t c = 0; c < 2; c++) {
++			if (use[c] != 0) {
++				sweet_surface_use_add(surface, c, -(int32_t)use[c]);
++				use[c] = 0;
++			}
++		}
+ 		sweet_surface_put(surface);
+ 		surface->release();
+ 		surface = NULL;
+@@ -498,6 +525,8 @@
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+ 	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapUseDecrement(void *id, void *category, void *, void *, void *, void *);
++	IOReturn useCount(uint32_t id, uint32_t category, int32_t delta);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -1263,12 +1292,37 @@
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
++IOSurfaceRootUserClient::useCount(uint32_t id, uint32_t category, int32_t delta)
+ {
++	if (category > 1) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef(id, NULL);
++	if (ref == NULL || (delta < 0 && ref->use[category] == 0)) {
++		IOLockUnlock(fLock);
++		sweet_surf_log_once(delta > 0 ? "use+ (no surface)" : "use- (none held)", (delta > 0 ? 40 : 42) + category);
++		return ref == NULL ? kIOReturnNotFound : kIOReturnSuccess;
++	}
++	ref->use[category] += delta;
++	sweet_surface_use_add(ref->surface, category, delta);
++	IOLockUnlock(fLock);
+ 	return kIOReturnSuccess;
+ }
+ 
++/* trap 0: IOSurfaceIncrementUseCount(ForCategory), trap 1: Decrement (id, category) */
++IOReturn
++IOSurfaceRootUserClient::trapUseCount(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, 1);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapUseDecrement(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, -1);
++}
++
+ /*
+  * 2026-11-17 GPU corruption (photos: icons and widgets with 16-pixel horizontal dashes, trails of an app card): CPU
+  * cache lines that never reached memory. Surfaces are mapped cacheable (mapCache kIOMapDefaultCache) and the
+@@ -1395,7 +1449,7 @@
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+ 	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseDecrement },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+--- a/bsd/dev/sweet_scaler.c
++++ b/bsd/dev/sweet_scaler.c
+@@ -35,7 +35,10 @@
+ int sweet_scaler_swap = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_swap, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_swap, 0,
+     "SweetM2Scaler rectangle requests: 1 copy +000 into +004 (tiles into the picture), 0 copy +004 into +000");
+-int sweet_scaler_wait_ms = 0;    /* 2026-11-23 test: ms to wait before a rectangle copy from a YUV tile */
++/* 2026-11-23: ms to wait before a rectangle copy from a YUV tile. The HEIC decoder is still writing the tile when
++ * the copy is asked for (macOS login wallpaper: mosaic at 0, clean from 32 ms). The real cause was IOSurface use counts
++ * (the decoder reused a tile surface still in use); kept as a test knob. */
++int sweet_scaler_wait_ms = 0;    /* 0 since IOSurface use counts work (SweetSurface.cpp, same day); 35 was the stopgap */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_wait_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_wait_ms, 0,
+     "SweetM2Scaler: ms to wait before a rectangle copy from a YUV tile (test)");
+ uint8_t sweet_scaler_last[0x170];

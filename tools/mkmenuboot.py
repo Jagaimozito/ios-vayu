@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mkmenuboot.py - one boot image for boot_b with the boot menu, iOS 27 and (later) macOS 27:
 
-  python3 tools/mkmenuboot.py STOCK_boot.img SHIM.Image IOS27_boot.img [MACOS27_boot.img] OUT.img
+  python3 tools/mkmenuboot.py STOCK_boot.img SHIM.Image --ios-kernel work/xnu-12377/BUILD/obj-ios26-sweet/... [--macos-kernel work/xnu-12377/BUILD/obj-macos27-sweet/...] IOS27_boot.img [MACOS27_boot.img] OUT.img
 
 2026-11-20: replaces tools/mktripleboot.py after the partition split (iOS 16 removed). IOS27_boot.img /
 MACOS27_boot.img are ordinary boot images as tools/guac-mkboot.sh makes them (iOS 27: ufsroot=ios27;
@@ -12,7 +12,7 @@ leaves about 50 MiB for the ramdisk above the DTB, less the shim's own size (3.5
 pictures): the image is refused past 46 MiB. Writes nothing to
 the phone.
 """
-import os, struct, subprocess, sys, tempfile
+import argparse, os, pathlib, struct, subprocess, sys, tempfile
 
 HDR = "<8s10I16s512s32s1024sIQIIQ"
 RAMDISK_ROOM = 46 * 1024 * 1024  # ~50 MiB, less the menu pictures in the shim (3.3 MB, shim/art.S)
@@ -32,17 +32,67 @@ def ramdisk_of(path):
     return rd, cmd
 
 
+def verify_kernel(payload, kernel_path, os_name, build_dir_name):
+    """Require a payload kernel to match its OS-specific build directory in work/xnu-12377."""
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    kernel_path = pathlib.Path(kernel_path).resolve()
+    build_dir = (repo / "work" / "xnu-12377" / "BUILD" / build_dir_name).resolve()
+    try:
+        kernel_path.relative_to(build_dir)
+    except ValueError:
+        sys.exit(f"{os_name} kernel must be built under {build_dir}, got {kernel_path}")
+    if not kernel_path.is_file():
+        sys.exit(f"{os_name} kernel not found: {kernel_path}")
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import mkpayload
+
+    kernel = bytearray(kernel_path.read_bytes())
+    macho = mkpayload.parse_macho(kernel)
+    mkpayload.apply_chained_fixups(kernel, macho)
+    kernel_segs = [s for s in macho["segs"] if s["vmsize"]]
+    magic, version, nsegs = struct.unpack_from("<8sII", payload, 0)
+    if magic != b"SWEETXNU" or version != 1 or nsegs < len(kernel_segs):
+        sys.exit(f"{os_name} payload has an invalid SWEETXNU header or kernel segment table")
+    for i, seg in enumerate(kernel_segs):
+        vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<4Q", payload, 0x2a8 + 32 * i)
+        if (vmaddr, vmsize) != (seg["vmaddr"], seg["vmsize"]):
+            sys.exit(f"{os_name} payload kernel segment {i} does not match {kernel_path}")
+        embedded = payload[fileoff:fileoff + filesize]
+        expected = kernel[seg["fileoff"]:seg["fileoff"] + seg["filesize"]]
+        if embedded != expected:
+            sys.exit(f"{os_name} payload kernel segment {i} differs from {kernel_path}")
+    print(f"{os_name} kernel provenance: matched {len(kernel_segs)} segments from {kernel_path}")
+
+
 def main():
-    if len(sys.argv) not in (5, 6):
-        sys.exit(__doc__)
-    stock, shim = sys.argv[1:3]
-    out = sys.argv[-1]
-    imgs = sys.argv[3:-1]
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("stock")
+    ap.add_argument("shim")
+    ap.add_argument("--ios-kernel", required=True,
+        help="iOS kernel from work/xnu-12377/BUILD/obj-ios26-sweet")
+    ap.add_argument("--macos-kernel",
+        help="macOS kernel from work/xnu-12377/BUILD/obj-macos27-sweet (required with a macOS payload)")
+    ap.add_argument("images", nargs="+")
+    a = ap.parse_args()
+    if len(a.images) not in (2, 3):
+        ap.error("provide iOS boot image, optional macOS boot image, and output path")
+    if len(a.images) == 3 and not a.macos_kernel:
+        ap.error("--macos-kernel from work/xnu-12377/BUILD/obj-macos27-sweet is required with a macOS payload")
+    if len(a.images) == 2 and a.macos_kernel:
+        ap.error("--macos-kernel was supplied without a macOS payload")
+    stock, shim = a.stock, a.shim
+    out = a.images[-1]
+    imgs = a.images[:-1]
     names = ["iOS 27", "macOS 27"][:len(imgs)]
     wants = ["ufsroot=ios27 ", "ufsroot=macos "]
     pays = []
-    for name, path, want in zip(names, imgs, wants):
+    for index, (name, path, want) in enumerate(zip(names, imgs, wants)):
         p, c = ramdisk_of(path)
+        if index == 0:
+            verify_kernel(p, a.ios_kernel, "iOS", "obj-ios26-sweet")
+        elif index == 1:
+            verify_kernel(p, a.macos_kernel, "macOS", "obj-macos27-sweet")
         if want not in c + " ":
             print(f"warning: {name} payload boot-args have no '{want.strip()}': {c[:120]}...", file=sys.stderr)
         pays.append((name, p, c))

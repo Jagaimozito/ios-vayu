@@ -37,15 +37,24 @@ static uint64_t now_ms(void);
 
 /* how long the idle loop sleeps now: 1 ms while there is traffic, 2 ms after 20 ms without any, 4 ms after 100 ms
  * (at most 4: each RX ring has 32 buffers, a burst after a long idle fills them in a few ms) */
+/*
+ * How long the main loop sleeps between rounds. 2026-11-22: it never slept more than 4 ms, so an idle wland woke
+ * 250+ times a second and each round reads the modem link, the copy engines, /dev/wlan and GNSS through /dev/pmem:
+ * ~20 % of a core on iOS with nothing happening. After a second without activity it now sleeps WLAND_NAPMAX ms
+ * (default 16, at most 50); any activity goes straight back to 1 ms. WLAND_NAP=0: always 1 ms.
+ */
 static unsigned link_nap(void)
 {
 	static int off = -1;
-	static unsigned seen;
+	static unsigned seen, napmax = 16;
 	static uint64_t last;
 	uint64_t now = now_ms();
 	if (off < 0) {
 		const char *e = getenv("WLAND_NAP");
 		off = e && e[0] == '0';
+		const char *m = getenv("WLAND_NAPMAX");
+		if (m && atoi(m) >= 1 && atoi(m) <= 50)
+			napmax = (unsigned)atoi(m);
 		last = now;
 	}
 	if (off || link_activity != seen) {
@@ -53,7 +62,7 @@ static unsigned link_nap(void)
 		last = now;
 		return 1;
 	}
-	return now - last < 20 ? 1 : now - last < 100 ? 2 : 4;
+	return now - last < 20 ? 1 : now - last < 100 ? 2 : now - last < 1000 ? 4 : napmax;
 }
 #define LOG(...) do { if (verbose_link) { printf("[%6llu] ", (unsigned long long)link_ms()); printf(__VA_ARGS__); } } while (0)
 
