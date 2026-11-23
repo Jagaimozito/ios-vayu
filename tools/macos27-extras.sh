@@ -68,6 +68,22 @@ plistlib.dump({'Label': 'com.sweet.wland', 'ProgramArguments': ['/bin/sh', '-c',
 PYEOF
 sudo chown 0:0 "$J"; sudo chmod 0644 "$J"
 echo "wland: /var/local/bin/wland, firmware, job com.sweet.wland"
+# Brightness slider -> the panel's own brightness, Night Shift -> the display controller's colour stage
+# (userland/jb/sweet-displayd.m, macOS build from userland/build-macos.sh; needs /dev/pmem, boot-arg sweetpmem=1).
+if [ -x "$U/sweet-displayd" ]; then
+	sudo install -o 0 -g 0 -m 0755 "$U/sweet-displayd" "$L/bin/sweet-displayd"
+	J="$R/System/Library/LaunchDaemons/com.sweet.displayd.plist"
+	sudo python3 - "$J" <<'PYEOF'
+import plistlib, sys
+plistlib.dump({'Label': 'com.sweet.displayd', 'ProgramArguments': ['/var/local/bin/sweet-displayd'], 'RunAtLoad': True,
+               'KeepAlive': True, 'ThrottleInterval': 10, 'StandardErrorPath': '/var/local/sweet-displayd.log'},
+              open(sys.argv[1], 'wb'))
+PYEOF
+	sudo chown 0:0 "$J"; sudo chmod 0644 "$J"
+	echo "displayd: /var/local/bin/sweet-displayd, job com.sweet.displayd"
+else
+	echo "WARNING: no $U/sweet-displayd (sh userland/build-macos.sh): no brightness / Night Shift" >&2
+fi
 
 # GPU firmware for the kernel's Adreno driver (the macOS boot log: a640_gmu.bin, a630_sqe.fw, a640_zap.* missing).
 if [ -d "$X/fw/gpu" ]; then
@@ -186,9 +202,12 @@ R = sys.argv[1]
 p = R + '/System/Library/xpc/launchd.plist'
 d = plistlib.load(open(p, 'rb'))
 ld = d['LaunchDaemons']
-for name in ('com.sweet.wland', 'com.sweet.diag'):
+for name in ('com.sweet.wland', 'com.sweet.diag', 'com.sweet.displayd'):
     key = '/System/Library/LaunchDaemons/%s.plist' % name
-    ld[key] = plistlib.load(open(R + key, 'rb'))
+    try:
+        ld[key] = plistlib.load(open(R + key, 'rb'))
+    except FileNotFoundError:
+        print('launchd cache: no', key)
 logind_key = '/System/Library/LaunchDaemons/com.apple.logind.plist'
 if logind_key in ld:
     ld[logind_key] = plistlib.load(open(R + logind_key, 'rb'))

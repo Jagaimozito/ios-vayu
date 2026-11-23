@@ -14,3 +14,9 @@ mkdir -p out/macos
 	pdmapper.c tftp.c scm.c wlfw.c radio.c ipnet.c bridge.c dms.c gnss.c)
 codesign -f -s - out/macos/wland
 echo out/macos/wland
+# Brightness (the panel's own, DCS 0x51) and Night Shift (the display controller's colour stage) for macOS:
+# userland/jb/sweet-displayd.m with DisplayServices as the brightness source (2026-11-22).
+xcrun --sdk macosx clang -arch arm64 -mmacos-version-min=14.0 -isysroot $SDK -O2 -fobjc-arc -framework Foundation \
+	-framework CoreGraphics -o out/macos/sweet-displayd jb/sweet-displayd.m
+codesign -f -s - --entitlements macos/sweet-displayd-ents.plist out/macos/sweet-displayd
+echo out/macos/sweet-displayd

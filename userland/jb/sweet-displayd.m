@@ -12,6 +12,9 @@
  *   sweet-displayd           run (launchd job com.sweet.displayd, or by hand in the background)
  *   sweet-displayd -v        also print every change
  *   sweet-displayd -1        print what iOS says once and exit (writes nothing)
+ * macOS 27 (2026-11-22, built by userland/build-macos.sh): the slider is DisplayServices' brightness of the main
+ * display (Control Center, the brightness keys) instead of BackBoardServices; Night Shift is the same
+ * CBBlueLightClient. Everything below the "what the OS has decided" part is shared.
  * MIT, as userland/.
  */
 #import <Foundation/Foundation.h>
@@ -25,6 +28,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <TargetConditionals.h>
 
 /* ---- the display controller (see dispcolor.c for the probe this rests on) ---- */
 #define MDP             0x0ae01000ull
@@ -142,6 +146,19 @@ static bool panel_brightness(unsigned level)
 
 /* ---- what iOS has decided ---- */
 static float (*BKSDisplayBrightnessGetCurrent)(void);
+#if TARGET_OS_OSX
+/* DisplayServices (private): the brightness Control Center and the keys set, 0.0 - 1.0 */
+static int (*DisplayServicesGetBrightness)(uint32_t display, float *brightness);
+static bool (*DisplayServicesCanChangeBrightness)(uint32_t display);
+extern uint32_t CGMainDisplayID(void);
+static float macos_brightness(void)
+{
+	float b = 1.0f;
+	if (DisplayServicesGetBrightness && DisplayServicesGetBrightness(CGMainDisplayID(), &b) != 0)
+		b = 1.0f;
+	return b;
+}
+#endif
 static id blueLight;
 
 static uint8_t last_status[128];
@@ -175,13 +192,23 @@ int main(int argc, char **argv)
 	@autoreleasepool {
 		bool verbose = argc > 1 && !strcmp(argv[1], "-v"), once = argc > 1 && !strcmp(argv[1], "-1");
 
+#if TARGET_OS_OSX
+		void *ds = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW);
+		DisplayServicesGetBrightness = ds ? (int (*)(uint32_t, float *))dlsym(ds, "DisplayServicesGetBrightness") : NULL;
+		DisplayServicesCanChangeBrightness = ds ? (bool (*)(uint32_t))dlsym(ds, "DisplayServicesCanChangeBrightness") : NULL;
+		BKSDisplayBrightnessGetCurrent = DisplayServicesGetBrightness ? macos_brightness : NULL;
+		if (DisplayServicesCanChangeBrightness)
+			fprintf(stderr, "sweet-displayd: DisplayServices says the main display %s change brightness\n",
+			    DisplayServicesCanChangeBrightness(CGMainDisplayID()) ? "can" : "can NOT");
+#else
 		void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
 		BKSDisplayBrightnessGetCurrent = bbs ? (float (*)(void))dlsym(bbs, "BKSDisplayBrightnessGetCurrent") : NULL;
+#endif
 		dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness", RTLD_NOW);
 		Class cls = NSClassFromString(@"CBBlueLightClient");
 		blueLight = cls ? [cls new] : nil;
 		fprintf(stderr, "sweet-displayd: brightness %s, Night Shift %s\n",
-		    BKSDisplayBrightnessGetCurrent ? "BKSDisplayBrightnessGetCurrent" : "UNAVAILABLE",
+		    BKSDisplayBrightnessGetCurrent ? (TARGET_OS_OSX ? "DisplayServicesGetBrightness" : "BKSDisplayBrightnessGetCurrent") : "UNAVAILABLE",
 		    blueLight ? "CBBlueLightClient" : "UNAVAILABLE");
 
 		if (once) {
