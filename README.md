@@ -1,76 +1,105 @@
-# iOS 27.2 on OnePlus 7 Pro (guacamole)
+# macOS 27 on the OnePlus 7 Pro (guacamole)
 
-> **Branch `macos27`:** this branch starts the macOS 27.2 (26B123, Mac17,5) port on the same phone, on top of the
-> iOS 27 work below. Plan and status: [`docs/macos27.md`](docs/macos27.md); working area: [`macos27/`](macos27/).
-> Nothing macOS-specific boots yet; the rest of this README describes the iOS 27 port this branch inherits.
+macOS 27.2 (build 26B123) running on a OnePlus 7 Pro (Snapdragon 855 / SM8150, Adreno 640, 8 GB RAM), on the same
+XNU 12377 kernel tree and Sweet* drivers as the iOS 27 port. This is the `macos27` branch. The iOS 27 port (and its
+README) is on the `ios27` branch; iOS 16 is retired on `ios16`.
+Plan and history: [`docs/macos27.md`](docs/macos27.md); day-to-day notes: [`NOTES.md`](NOTES.md).
 
-This branch ports the **iOS 27.2 (24B119) userland for iPhone 14 Pro (iPhone15,2 / D73AP)** to the OnePlus 7 Pro (`guacamole`, Qualcomm SM8150 / Snapdragon 855, Adreno 640, 8 GB RAM). The device tree presents the D73 identity while the custom XNU kernel and userland drivers adapt the phone's hardware.
+Apple artifacts (IPSW, filesystems, kernelcaches, dyld caches, crash reports, dumps) never go into git: they live in
+`research/macos27/` and `outputs/`, which are git-ignored.
 
-This is an experimental bring-up, not a daily-use phone OS. Many hardware features are incomplete, performance and graphics are unreliable, and the port disables or replaces parts of Apple's normal security and device stack. The iOS 16 port is maintained on a separate branch; this README describes the iOS 27 branch only.
+## Status (2026-11-22)
 
-## Current status
+| | |
+|---|---|
+| Boot | Boot menu (iOS 27 / macOS 27 / Android, volume keys or touch) -> SWEET kernel -> HFS+ root on the `macos` partition |
+| Login | Login window and autologin; desktop with Dock, menu bar, Finder, System Settings, Safari |
+| Display | 1560x720 landscape (the 1440x3120 panel rotated and halved, `sweetfb_rot` / `sweetfb_div`) |
+| GPU | Metal through the NativeAdrenoMetal plugin (Turnip/Vulkan underneath); Core Image, icons, wallpaper |
+| Input | Touchscreen as a trackpad, with haptic clicks; on-screen Accessibility Keyboard; text over SSH (`kern.sweet_hid_type`) |
+| Wi-Fi | `wland` (own WLAN firmware driver), DHCP; apps have DNS through `netsvc` |
+| Storage | Root disk is `disk0` to Disk Arbitration; Finder, About This Mac and Disk Utility's view work |
+| Brightness / Night Shift | Control Center slider -> panel brightness; Night Shift -> display colour stage (`sweet-displayd`) |
+| About This Mac | "OnePlus 7 Pro", "Qualcomm Snapdragon 855", 5 GB memory |
+| UFS health | `sysctl kern.sweet_ufs_health` (pre-EOL, life-time estimate A/B) |
 
-Status snapshot: **2026-11-18**. For detailed evidence, caveats, and engineering history, see [`docs/ios27.md`](docs/ios27.md) and [`NOTES.md`](NOTES.md).
+Not working (yet): USB devices and video out, Bluetooth, audio, keychain unlock (legacy keychains), speech plug-ins
+(crash loop), Software Update. APFS is a possible future step (see "Later").
 
-### Working
+## Trackpad (the touchscreen)
 
-- **Boot and system UI:** iOS 27.2 reaches the lock screen and SpringBoard when started through the triple-boot selector. The UI runs at a 2x scale (MobileGestalt adjusted, see `NOTES.md`).
-- **Display:** the dashed-line GPU corruption is gone: the kernel now presents each frame into a second buffer and flips the display pipes to it instead of overwriting the buffer being scanned out.
-- **Shutdown and reboot:** shutdown and reboot work normally on iOS 27; rebooting through SSH has also been confirmed, and `rebootbl` reboots straight into fastboot.
-- **Touch and navigation:** touch input works for navigating the UI and launching apps.
-- **System apps:** the rebuilt root image puts staged system apps in `/Applications`; Filza was separately installed and confirmed to open. Safari loads pages.
-- **Brightness and Night Shift:** both were confirmed working by the user through the `sweet-displayd` daemon and D73 backlight properties.
-- **Audio:** speaker playback works without cut-outs (ringtones, system sounds, downloaded mp3s). The cause of the earlier cut-outs was iOS 27 assuming Apple's 24 MHz timebase; the kernel now presents a 24 MHz timebase on the phone's 19.2 MHz timer (`xnu/ios27/xnu12377-tb24.diff`). `adspd` starts at boot from a launchd job.
-- **Haptics:** working, fixed together with audio (the haptics actuator runs through the same audio system).
-- **Bluetooth:** the Settings switch works, devices are found, and Bluetooth audio plays.
-- **Wi-Fi:** joining works and networks are remembered for auto-join; SSH works over Wi-Fi.
-- **Camera:** both cameras work in the Camera app, for the preview and photos. The rear main camera (Sony IMX586) has contrast autofocus through its lens/OIS controller (LC898124EP3). The front camera (Sony IMX471) rises on its pop-up motor when selected and lowers when you switch away or close the app. The kernel drives the sensors, receivers, image front end and SMMU itself and hands raw frames to `ISP.mediacapture` through `/dev/hakios-camera` (`xnu/ios27/xnu12377-camhw.diff`, `userland/camera/`). The lens controller's program comes from OnePlus's GPL driver and is kept out of git: `tools/lc898124-fw.py` makes it, and it goes to `/var/local/fw/lc898124-so2820.fw` on the phone.
-- **Passcode:** a device passcode can be set (4-digit or alphanumeric confirmed) and changed in Settings (turning it off is untested), and the lock screen asks for it with the matching number pad or keyboard. The kernel stands in for the Secure Enclave's credential manager and the keystore (`SweetACM`, `SweetKeyStore`, `bsd/dev/sweet_passcode.c`; `xnu/ios27/xnu12377-passcode.diff`, boot-arg `sweetpasscode=1`). It keeps only a PBKDF2 verifier in `/var/local/passcode.v1`: the passcode gates the UI but does not encrypt data. `sysctl kern.sweet_passcode_reset=1` (root) clears it. Ported from the redfin branch's iOS 16 passcode support. Face ID / Touch ID are not supported.
-- **Cellular (no SIM):** iOS sees a modem: Settings shows Cellular, iOS reports "No SIM", and Settings > General > About shows the phone's real IMEI. The kernel publishes stand-ins for Apple's baseband drivers (from the redfin branch, boot-arg `sweetabp=3`) and answers CommCenter's QMI questions itself as a modem with no SIM; `wland` asks the real modem for the IMEI (`userland/wland/dms.c`). Needs MobileGestalt `HasBaseband`, `cellular-data`, `telephony` and `CellularTelephonyCapability` set (`mgtool setbool`). Only SIM slot 1; no calls, SMS or mobile data (CommCenter never reaches the real modem). See `xnu/ios27/xnu12377-cell1.diff`.
-- **GPS through the modem:** `wland` runs a fix session on the modem's GNSS engine (QMI LOC, `userland/wland/gnss.c`) while `/var/local/gnss.on` exists, and `sweet-gnssfeed` (boot job `com.sweet.gnssfeed`) hands each fix to Location Services through locationd's simulation interface; Maps follows the modem's position. The modem locks its engine against our sessions: the word `unlock=all` in `gnss.on` clears that lock, after saving the original to `/var/local/gnss.lock-orig`; removing the word restores it. First fix takes a few minutes with no SIM or internet assistance; indoors accuracy is about 100 m.
-- **Fake signal bars:** `sweet-bars` (boot job `com.sweet.bars`) publishes a cellular entry into SystemStatus' status-bar overrides from `/var/local/bars.conf`, e.g. `bars=4 type=lte text=Sweet` (bars 0-4; type none, edge, 3g, 4g, lte, 5ge, 5g, ...; text = carrier name, last). Delete the file to remove the override. Display only: no real service.
-- **Memory:** iOS manages 5 GB (`hw.memsize=5367660544`), with a GPU pool of about 2 GB placed outside it.
+| Gesture | Does |
+|---|---|
+| One finger slide | Moves the pointer (relative, like a trackpad) |
+| Tap | Click |
+| Tap, then touch again and slide | Drag |
+| Two fingers slide | Scroll |
+| Two-finger tap | Right click |
+| Three fingers down and slide | Drag (move windows by the title bar, select text) |
 
-### Partial or unreliable
+Each click and drag start gives a haptic tick. Tune while running:
+`sysctl -w kern.sweet_pad_haptic_gain=N` (0 off .. 128) and `sysctl -w kern.sweet_pad_haptic_wave=W`
+(2 light, 5 medium, 10 buzz, 20 heavy). Default: wave 10, gain 128. Boot-arg `sweetpad=0` returns to "pointer under
+the finger"; `sweetpadhaptic=N` sets the gain at boot.
 
-- **Metal/GPU:** NativeAdrenoMetal and Turnip render the UI, at roughly 30-40 fps while scrolling (Turnip concurrent binning on: `tu-cb=1`). The display controller scales frames to the panel in hardware (QSEED3) instead of a GPU blit. Stutters are shorter (about 100 ms at worst while scrolling) but not gone; textures still use a linear layout. Unity games render since late store actions were added (Subway Surfers plays; `xnu/ios27/adrenometal-late-store.diff`, boot-arg `thid_should_crash=0`), but other apps and games are untested.
-- **Landscape apps:** working (the rotated framebuffer, apps' rotated drawables, the scaler's rotation;
-  `xnu/ios27/adrenometal-landscape.diff`, `xnu12377-scaler-rotate.diff`). Minecraft renders and plays, at a low frame
-  rate (about 20 fps), after the Metal fixes for vertex attributes and `blitCommandEncoderWithDescriptor:`
-  (`adrenometal-blitdesc.diff`) and skipping unchanged binds (`adrenometal-bindcache.diff`).
-- **Performance:** better after removing the spinning `PerfPowerServices` job and preferring the big CPU cores, but `locationd` can spin on a full core after boot (killing it works around it) and `wland` polls Wi-Fi every millisecond (about 12% of a core).
-- **Video playback:** plays in Safari (YouTube) and from local files since the YUV video layer fix (`xnu/ios27/xnu12377-fb-yuv.diff`); the player controls over the video are fixed in source but not yet confirmed on a build.
-- **Camera limits:** the rear camera takes about 2 s to start, because the sensor setup and lens program are sent over a slow 100 kHz I2C bus. The preview is processed on the CPU from full 4000x3000 frames, so it is not smooth. The pop-up is moved on a timer like Android's, but its position sensors and drop detection are not used yet. The ultra-wide and telephoto cameras are not supported, and photos come out as single frames (no multi-frame processing).
-- **Microphone:** input is unconfirmed.
-- **Sleep:** iOS's system sleep panicked the kernel (`SweetCPU::haltCPU` is not implemented). `tools/mkadt.py` now sets `sleep-disabled` in the device tree so iOS no longer attempts it; not yet confirmed on a build. Turning the screen off is unaffected.
-- **Identity:** the generated device tree uses the iPhone 14 Pro/D73 identity, but that does not guarantee all identity-dependent apps and services behave like they do on real iPhone hardware.
+## Build and flash (on the Mac)
 
-### Not working or not implemented
+From a `macos27` checkout (here the worktree `work/macos27-wt`, whose `work`, `outputs` and `dtb` link to the main
+checkout's):
 
-- **Full memory capacity:** about 5 of the phone's 8 GB go to iOS; giving it more needs XNU to use non-contiguous RAM ranges.
-- **Suspend (system sleep), cellular calls/SMS/data with a SIM, NFC, and most onboard sensors:** no working end-to-end port has been demonstrated. Location Services work from Wi-Fi and from the modem's GPS (see above).
+```
+cd ~/Documents/Codex/2026-11-06/ok/work/ios-sweet-latest/work/macos27-wt
+bash tools/mkmacos27kernel.sh
+grep -c sweet_pad_haptic_gain work/xnu-12377/BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet   # must be >= 1
+bash tools/mkmacos27boot.sh outputs/guacamole-ios27a-xfrot-ios27part.img
+grep -c -- ' -v' outputs/guacamole-menu-ios27-macos27-macos-boot-args.txt                                               # must be 0
+```
 
-## Booting
+Phone off, hold Volume Up + Power for fastboot:
 
-Use the combined menu boot image and select iOS 27 from the shim menu (iOS 27 / macOS 27 / Android; the last choice is the default). **Do not assume a standalone iOS wrapper image will boot**; this setup requires the selector/triple-boot path.
+```
+fastboot flash boot_b outputs/guacamole-menu-ios27-macos27.img
+fastboot reboot
+```
 
-The existing data partition is named `ios26`, so iOS 27 boot arguments commonly contain `ufsroot=ios26`. That is the partition label, not the OS version. See [`docs/dualboot.md`](docs/dualboot.md) for the image layout and selector workflow. The phone's Android installation and partition backups should be preserved when building or booting test images.
+Pick macOS. After every flash, clear logind's first-run marker (HFS+ does not empty /var/run) and reboot once:
 
-## Build and project layout
+```
+ssh guacmac 'rm -f /var/run/com.apple.logind.didRunThisBoot; sync; reboot'
+```
 
-- **iOS 27 kernel:** the tree at `work/xnu-12377` is not in this repository; each change made to it is kept as a diff in [`xnu/ios27/`](xnu/ios27/README.md).
-- **Metal plugin:** source/build work is in the separate Git repository at `work/UniXNU`; it is not included in commits to this repository.
-- **Root filesystem:** `tools/mkios27root-mac.sh` builds the iOS 27.2 root image on macOS from the prepared IPSW contents.
-- **Device tree and payload:** `tools/mkadt.py`, `tools/mkpayload.py`, and the shim build create the ADT and kernel payload used by the boot image.
-- **Menu boot image:** `tools/mkmenuboot.py` combines the stock boot image, selector shim, the iOS 27 payload and (later) a macOS 27 payload. See `docs/dualboot.md` for required inputs.
-- **Userland tools and drivers:** `userland/` contains Wi-Fi, Bluetooth, audio, display, haptics, GPU and diagnostic code, including the phone-side diagnostics `ptop` (CPU, memory and process churn), `tsample` (sampling profiler), `tprobe` (clocks, timed waits, thread policies) and `rebootbl` (reboot to fastboot) in `userland/jb/`.
-- **launchd jobs:** `tools/launchd-add-job.py` and `tools/launchd-drop-job.py` add and remove jobs in iOS's launchd plist (the `adspd` boot job, the removed `PerfPowerServices`).
-- **Detailed status:** [`docs/ios27.md`](docs/ios27.md) tracks the current feature state; [`NOTES.md`](NOTES.md) records experiments, build artifacts, crashes and decisions. A source change or successful build does not by itself establish that a feature works at runtime.
+The boot-menu shim (with touch) is built in the Linux workspace with `aarch64-linux-gnu-gcc` (see `shim/build.sh`);
+the Mac has no ARM64 Linux cross compiler. `tools/mkmacos27boot.sh` takes `shim/out/Image`.
 
-## Security and artifacts
+Userland helpers for macOS (`wland`, `sweet-displayd`): `sh userland/build-macos.sh`; on a running phone,
+`tools/macos27-displayd-install.sh` installs the `sweet-displayd` job. The root image's extras
+(Wi-Fi job, `netsvc`, the `hfs.util` wrapper, `sweet-displayd`, launchd overrides): `tools/macos27-extras.sh`.
 
-This port is for development on the owner's device. Code-signing, sandbox, and other security paths are modified or stubbed, so it should not be used for personal or sensitive data. iOS firmware, root images, device dumps, credentials, and generated build trees are not source-controlled; do not add them to Git.
+## What macOS needed (summary)
 
-## Credits
+- **Kernel** (`xnu/macos27/0001`..`0018`): HID stand-ins and keyboard identity, IOAccelerator/IOSurface names,
+  framebuffer formats and plane pitch, console mute, landscape and scaling, touch-as-trackpad, user SIMD emulation
+  (SHA3/SHA512/FHM/FRINTTS), cryptexd grafts, the root disk as `disk0` with an IOMedia/IOBlockStorageDevice stand-in
+  for Disk Arbitration, UFS health.
+- **Root**: `hfs.util` wrapper (macOS 27 reports a mounted HFS volume as an I/O failure), `fskitd` disabled
+  (storagekitd waited on it forever and the login screen waited on storagekitd), `clocksyncd`, `bluetoothd`,
+  `AppSSODaemon` disabled, `netsvc` (DNS), `sweet-displayd`, launchd job cache entries.
+- **dyld shared cache** (`dsc.01`): code-signing patch, and LaunchServices `LinkBinding::resolveBinding` must not
+  abort when the startup volume resolves to itself (`tools/patch-macos27-ls-linkbinding.py`; tested and installed
+  on the phone with `tools/macos27-dsc-ls-install.sh`, which also prints where the new cache lies on disk so it can be
+  restored offline from TWRP; the generated restore script is `outputs/twrp-restore-dsc01.sh`, not in git).
+- **Boot image**: `/product` name "OnePlus 7 Pro" and `product-soc-name` "Qualcomm Snapdragon 855"; model stays
+  `iPhone15,2` (a Mac identity is a separate, deliberate step).
 
-Built on Apple's open-source XNU and related releases, Qualcomm and OnePlus hardware documentation and kernel sources, [Mesa](https://mesa3d.org) Freedreno/Turnip, [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel), [ios-topaz](https://github.com/MakrSas/ios-topaz), [ios-flame](https://github.com/NWylynko/ios-flame), [UniXNU](https://github.com/UniXNU/UniXNU), and [OtVaL228/ios-sweet](https://github.com/OtVaL228/ios-sweet). See source files and component READMEs for origins and licenses. iOS itself is Apple's and is not distributed here.
+## Rules for this branch
+
+- macOS changes are committed to `macos27` only, never to `ios27`.
+- Partitions are flashed with fastboot; recovery steps for a macOS that does not come up use TWRP (adb), never SSH.
+- Root-image files are installed as `.new` and moved into place; originals are kept.
+
+## Later
+
+- APFS (one container for iOS and macOS volumes): first a test of loading an Apple kext into this kernel.
+- USB keyboard/mouse (DWC3 host + HID), and DisplayPort over USB-C at 1920x1080 with the panel off, if Android
+  shows the port can carry video.
+- A Mac identity (`Mac17,5`) once the system is stable.
