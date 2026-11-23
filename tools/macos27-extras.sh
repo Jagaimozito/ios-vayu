@@ -36,6 +36,13 @@ done
 L="$R/private/var/local"
 sudo install -d -o 0 -g 0 -m 0755 "$L" "$L/bin" "$L/fw"
 sudo install -o 0 -g 0 -m 0755 "$U/wland" "$L/bin/wland"
+# hfs.util wrapper: macOS 27's hfs.util -p reports FSUR_IO_FAIL for a mounted HFS volume (the kernel-mounted root),
+# so Disk Arbitration never recognised disk0 as mounted; the wrapper passes that one case on as recognised.
+H="$R/System/Library/Filesystems/hfs.fs/Contents/Resources"
+if [ ! -e "$H/hfs.util.real" ]; then sudo mv "$H/hfs.util" "$H/hfs.util.real"; fi
+sudo install -o 0 -g 0 -m 0755 "$REPO/userland/macos/hfs.util.sh" "$H/hfs.util"
+# netsvc (macOS, scutil): wland publishes each DHCP lease to configd with it; without it apps had no DNS.
+sudo install -o 0 -g 0 -m 0755 "$REPO/userland/macos/netsvc.sh" "$L/bin/netsvc"
 for d in modem rmtfs; do
 	sudo rm -rf "$L/fw/$d"
 	sudo cp -R "$X/fw/$d" "$L/fw/$d"
@@ -123,6 +130,10 @@ d['com.apple.clocksyncd'] = True
 d['com.apple.bluetoothd'] = True
 # AppSSODaemon aborts in PODaemonCoreProcess initForBaseSystem when its base-system string is NULL on this root.
 d['com.apple.AppSSODaemon'] = True
+# fskitd (FSKit) never answers storagekitd's question for the extension filesystems once Disk Arbitration knows the
+# root (disk0): storagekitd waited forever, the login screen waited on it for the wallpaper's disk (only the cursor).
+# With it off the question fails at once. FSKit only serves add-on filesystems (exFAT/FAT modules), not this HFS root.
+d['com.apple.filesystems.fskitd'] = True
 plistlib.dump(d, open(p, 'wb'))
 print('launchd overrides:', d)
 PYEOF

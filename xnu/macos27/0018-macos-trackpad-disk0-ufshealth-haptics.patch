@@ -1,0 +1,610 @@
+macOS 27 (2026-11-22): trackpad, root disk as disk0 for Disk Arbitration, UFS health, trackpad haptics.
+
+- SweetHID: the touchscreen as a trackpad (sweetpad, default 1): one finger moves, tap clicks, tap-and-slide drags,
+  two fingers scroll, two-finger tap right-clicks, three fingers hold the button and drag (windows by the title bar).
+  Haptic click on clicks and drag starts (sysctl kern.sweet_pad_haptic_gain/_wave, default waveform 10 at 0x80;
+  boot-arg sweetpadhaptic). Pointer release at the last finger position; press sent after a move-only event.
+- IOHIDEvent: number changed buttons in pointer events (right click was reported as button 1), macOS only.
+- sweet_haptic: sweet_haptic_tick() plays a waveform from a thread call (macOS).
+- SweetMedia: IOBlockStorageDevice stand-in parent and IOMediaIcon (DADiskCreateFromIOMedia needs both).
+- sweet_ufs / IOKitBSDInit: on macOS the root disk is only disk0 / rdisk0 and is mounted as /dev/disk0 (hfs.util -p
+  takes only "disk..." names; with two names Disk Arbitration tried to mount the root again and login hung);
+  the iOS "disk0" placeholder nub is left out on macOS. The UFS Health Descriptor is read once at start
+  (sysctl kern.sweet_ufs_health).
+
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -380,12 +380,26 @@
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void point(IOFixed nx, IOFixed ny, int px, int py, bool down, bool was);
++	void pad(int count, const IOFixed *nx, const IOFixed *ny);
++	bool fPad;              /* trackpad mode (sweetpad, default 1) */
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Mouse; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 5; }
+ private:
+ 	bool fPixels;
++	/* trackpad state (pad()) */
++	int fCount, fMaxCount;          /* fingers now, most fingers in this gesture */
++	int64_t fLastX, fLastY;         /* screen pixels << 8 of the tracked point */
++	int64_t fMoved;                 /* distance travelled in this gesture, pixels << 8 */
++	int64_t fRemX, fRemY;           /* sub-pixel remainders of the pointer, << 8 */
++	uint64_t fStart, fLastTapEnd;   /* gesture start, end of the last one-finger tap */
++	bool fScrolled, fDragging, fDrag3;      /* fDrag3: three-finger drag holds the button */
++	uint32_t fButtons;
++	int fScreenW, fScreenH;
++	void buttons(uint32_t b);
++	void tick(void);                /* haptic click (sweet_haptic.c), sweetpadhaptic */
++	void toScreen(IOFixed nx, IOFixed ny, int64_t *sx, int64_t *sy);
+ };
+ OSDefineMetaClassAndStructors(SweetHIDPointer, IOHIDEventService);
+ #endif
+@@ -450,6 +464,8 @@
+ static SweetHIDTouch *gSweetTouch;
+ #if XNU_TARGET_OS_OSX
+ static SweetHIDPointer *gSweetPointer;
++/* trackpad click haptics (SweetHIDPointer::tick; sysctls kern.sweet_pad_haptic_gain / _wave) */
++static unsigned int gPadTickGain = 0x80, gPadTickWave = 10;     /* 2026-11-22: what felt right on the phone */
+ #endif
+ 
+ bool
+@@ -607,11 +623,30 @@
+ 	}
+ 	int v = 0;
+ 	fPixels = PE_parse_boot_argn("sweetptrpx", &v, sizeof(v)) && v;
++	/*
++	 * 2026-11-22: the touchscreen works as a trackpad by default (boot-arg sweetpad=0: the pointer goes where the
++	 * finger is, as before). One finger moves the pointer by how far it slides; a tap clicks; tap, then touch again
++	 * and slide, drags; two fingers slide to scroll; a two-finger tap is a right click; three fingers down hold the
++	 * button and slide to drag (move windows by the title bar).
++	 * The screen size follows SweetFramebuffer's sweetfb_rot / sweetfb_div (1560x720 by default).
++	 */
++	uint32_t pad = 1, rot = 1, div = 2;
++	(void)PE_parse_boot_argn("sweetpad", &pad, sizeof(pad));
++	(void)PE_parse_boot_argn("sweetfb_rot", &rot, sizeof(rot));
++	(void)PE_parse_boot_argn("sweetfb_div", &div, sizeof(div));
++	if (div < 1 || div > 4) {
++		div = 2;
++	}
++	fPad = pad != 0;
++	(void)PE_parse_boot_argn("sweetpadhaptic", &gPadTickGain, sizeof(gPadTickGain));
++	fScreenW = (int)((rot == 0 ? 1440u : 3120u) / div);
++	fScreenH = (int)((rot == 0 ? 3120u : 1440u) / div);
+ 	setProperty(kIOHIDProductKey, "Sweet touch pointer");
+ 	setProperty("HIDPointerAccelerationType", "HIDMouseAcceleration");
+ 	gSweetPointer = this;
+ 	registerService();
+-	IOLog("SWEET HID: touch pointer registered (%s positions)\n", fPixels ? "pixel" : "normalised");
++	IOLog("SWEET HID: touch pointer registered (%s, screen %dx%d)\n", fPad ? "trackpad" : fPixels ? "pixel positions" :
++	    "normalised positions", fScreenW, fScreenH);
+ 	return true;
+ }
+ 
+@@ -664,6 +699,183 @@
+ }
+ #endif
+ 
++#if XNU_TARGET_OS_OSX
++/* Normalised panel position -> screen pixels << 8, turned as the screen is (sweetfb_rot). */
++void
++SweetHIDPointer::toScreen(IOFixed nx, IOFixed ny, int64_t *sx, int64_t *sy)
++{
++	static int rot = -1;
++	if (rot < 0) {
++		uint32_t r = 1;
++		(void)PE_parse_boot_argn("sweetfb_rot", &r, sizeof(r));
++		rot = (r == 0 || r == 3) ? (int)r : 1;
++	}
++	const IOFixed one = 0x10000;
++	IOFixed rx = nx, ry = ny;
++	if (rot == 1) {
++		rx = ny;
++		ry = one - nx;
++	} else if (rot == 3) {
++		rx = one - ny;
++		ry = nx;
++	}
++	*sx = ((int64_t)rx * fScreenW) >> 8;
++	*sy = ((int64_t)ry * fScreenH) >> 8;
++}
++
++void
++SweetHIDPointer::buttons(uint32_t b)
++{
++	IOHIDEvent *event = IOHIDEvent::relativePointerEvent(mach_absolute_time(), 0, 0, 0, b, fButtons);
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++	fButtons = b;
++}
++
++/*
++ * 2026-11-22: a light click from the vibration motor for each trackpad click and drag start, as a MacBook's trackpad
++ * gives. The lightest tap waveform (2) at a low gain, played from a thread call (sweet_haptic.c) so the touch thread
++ * never waits on the motor's I2C. Boot-arg sweetpadhaptic=N sets the gain (0 = off; Android's strongest is 0x80).
++ */
++extern "C" int sweet_haptic_tick(unsigned wave, unsigned gain);
++
++/*
++ * Tunable while running: sysctl -w kern.sweet_pad_haptic_gain=N (0 = off .. 128) and kern.sweet_pad_haptic_wave=W
++ * (OnePlus RAM waveforms: 2 light, 5 medium, 20 heavy tap, 10 the buzz, played once here). Default: waveform 10 at
++ * 0x80, chosen on the phone (waveform 2 at 0x20 was too faint).
++ */
++SYSCTL_UINT(_kern, OID_AUTO, sweet_pad_haptic_gain, CTLFLAG_RW | CTLFLAG_LOCKED, &gPadTickGain, 0,
++    "trackpad click strength (0 off .. 128)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_pad_haptic_wave, CTLFLAG_RW | CTLFLAG_LOCKED, &gPadTickWave, 0,
++    "trackpad click waveform (2 light, 5 medium, 20 heavy)");
++
++void
++SweetHIDPointer::tick(void)
++{
++	unsigned g = gPadTickGain > 0x80 ? 0x80 : gPadTickGain;
++	if (g) {
++		(void)sweet_haptic_tick(gPadTickWave ? gPadTickWave : 10, g);
++	}
++}
++
++void
++SweetHIDPointer::pad(int count, const IOFixed *nx, const IOFixed *ny)
++{
++	const uint64_t now = mach_absolute_time();
++	uint64_t ns;
++	int64_t sx = 0, sy = 0;
++	if (count >= 2) {
++		int n = count >= 3 ? 3 : 2;
++		for (int i = 0; i < n; i++) {
++			int64_t ax, ay;
++			toScreen(nx[i], ny[i], &ax, &ay);
++			sx += ax;
++			sy += ay;
++		}
++		sx /= n;
++		sy /= n;
++	} else if (count == 1) {
++		toScreen(nx[0], ny[0], &sx, &sy);
++	}
++
++	if (fCount == 0 && count > 0) {
++		/* a gesture starts; a touch soon after a one-finger tap holds the button: tap-and-drag */
++		fStart = now;
++		fMaxCount = count;
++		fMoved = 0;
++		fScrolled = false;
++		fDrag3 = false;
++		absolutetime_to_nanoseconds(now - fLastTapEnd, &ns);
++		if (count == 1 && fLastTapEnd != 0 && ns < 300 * NSEC_PER_MSEC) {
++			fDragging = true;
++			buttons(1);
++			tick();
++		} else if (count >= 3) {
++			fDrag3 = true;          /* three fingers landed together */
++			buttons(1);
++			tick();
++		}
++		fLastX = sx;
++		fLastY = sy;
++	} else if (count > 0 && count != fCount) {
++		/* fingers added or lifted: restart the deltas from here, no jump */
++		fMaxCount = count > fMaxCount ? count : fMaxCount;
++		fLastX = sx;
++		fLastY = sy;
++		/* three fingers down: press and hold, so sliding drags (windows by the title bar, selections) */
++		if (count >= 3 && !fDrag3 && !fDragging) {
++			fDrag3 = true;
++			buttons(1);
++			tick();
++		} else if (count < 3 && fDrag3) {
++			fDrag3 = false;
++			fScrolled = true;       /* no tap when these fingers lift */
++			buttons(0);
++		}
++	} else if (count > 0) {
++		int64_t dx = sx - fLastX, dy = sy - fLastY;
++		fLastX = sx;
++		fLastY = sy;
++		fMoved += (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
++		if (count == 1 || fDrag3) {
++			/* 1.5x the finger's travel; macOS adds its own acceleration */
++			fRemX += dx * 3 / 2;
++			fRemY += dy * 3 / 2;
++			SInt32 mx = (SInt32)(fRemX / 256), my = (SInt32)(fRemY / 256);
++			fRemX -= (int64_t)mx * 256;
++			fRemY -= (int64_t)my * 256;
++			if (mx || my) {
++				IOHIDEvent *event = IOHIDEvent::relativePointerEvent(now, mx, my, 0, fButtons, fButtons);
++				if (event) {
++					dispatchEvent(event);
++					event->release();
++				}
++			}
++		} else if (count == 2 && (dx || dy) && fMoved > (8 << 8)) {
++			/* content follows the fingers: one line per 10 pixels, in fixed point for smoothness */
++			fScrolled = true;
++			IOHIDEvent *event = IOHIDEvent::scrollEventWithFixed(now, (IOFixed)(dx * 256 / 10),
++			    (IOFixed)(dy * 256 / 10), 0);
++			if (event) {
++				dispatchEvent(event);
++				event->release();
++			}
++		}
++	}
++
++	if (fCount > 0 && count == 0) {
++		/* the gesture ends: a short one without travel is a tap */
++		absolutetime_to_nanoseconds(now - fStart, &ns);
++		bool tap = ns < 250 * NSEC_PER_MSEC && fMoved < (12 << 8) && !fScrolled;
++		if (fDrag3) {
++			buttons(0);
++			fDrag3 = false;
++			fLastTapEnd = 0;
++		} else if (fDragging) {
++			buttons(0);
++			fDragging = false;
++			fLastTapEnd = 0;
++		} else if (tap && fMaxCount == 1) {
++			buttons(1);
++			buttons(0);
++			tick();
++			fLastTapEnd = now;
++		} else if (tap && fMaxCount == 2) {
++			buttons(2);
++			buttons(0);
++			tick();
++			fLastTapEnd = 0;
++		} else {
++			fLastTapEnd = 0;
++		}
++		fRemX = fRemY = 0;
++	}
++	fCount = count;
++}
++#endif
++
+ bool
+ SweetHIDTouch::start(IOService *provider)
+ {
+@@ -778,6 +990,20 @@
+ 		fX[finger] = nx;
+ 		fY[finger] = ny;
+ 	}
++#if XNU_TARGET_OS_OSX
++	/* trackpad: the fingers down after this event (fDown is updated below), the first two positions */
++	int padCount = 0;
++	IOFixed padX[3] = {0, 0, 0}, padY[3] = {0, 0, 0};
++	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
++		if ((i == finger) ? down : fDown[i]) {
++			if (padCount < 3) {
++				padX[padCount] = fX[i];
++				padY[padCount] = fY[i];
++			}
++			padCount++;
++		}
++	}
++#endif
+ 	collection->setFixedValue(kIOHIDEventFieldDigitizerX, nx);
+ 	collection->setFixedValue(kIOHIDEventFieldDigitizerY, ny);
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerRange, any);
+@@ -806,7 +1032,12 @@
+ #endif
+ #if XNU_TARGET_OS_OSX
+ 	if (finger == 0 && gSweetPointer) {
+-		gSweetPointer->point(pnx, pny, x, y, down, was);
++		if (!gSweetPointer->fPad) {
++			gSweetPointer->point(pnx, pny, x, y, down, was);
++		}
++	}
++	if (gSweetPointer && gSweetPointer->fPad) {
++		gSweetPointer->pad(padCount, padX, padY);
+ 	}
+ #endif
+ 	if (was != down) {
+--- a/iokit/Kernel/arm/hid/IOHIDEvent.cpp
++++ b/iokit/Kernel/arm/hid/IOHIDEvent.cpp
+@@ -827,7 +827,12 @@
+     
+     
+     delta = buttonState ^ oldButtonState;
++#if XNU_TARGET_OS_OSX
++    /* 2026-11-22 (SWEET macOS): number each changed button (index was never advanced: a right click said button 1) */
++    for ( index=0; delta; delta>>=1, buttonState>>=1, index++) {
++#else
+     for ( index=0; delta; delta>>=1, buttonState>>=1) {
++#endif
+         IOHIDEvent * subEvent;
+         
+         if ( (delta & 0x1) == 0 )
+@@ -886,7 +891,12 @@
+     
+     
+     delta = buttonState ^ oldButtonState;
++#if XNU_TARGET_OS_OSX
++    /* 2026-11-22 (SWEET macOS): number each changed button (index was never advanced: a right click said button 1) */
++    for ( index=0; delta; delta>>=1, buttonState>>=1, index++) {
++#else
+     for ( index=0; delta; delta>>=1, buttonState>>=1) {
++#endif
+         IOHIDEvent * subEvent;
+         
+         if ( (delta & 0x1) == 0 )
+@@ -962,7 +972,12 @@
+     data->button.mask   = buttonState;
+     
+     delta = buttonState ^ oldButtonState;
++#if XNU_TARGET_OS_OSX
++    /* 2026-11-22 (SWEET macOS): number each changed button (index was never advanced: a right click said button 1) */
++    for ( index=0; delta; delta>>=1, buttonState>>=1, index++) {
++#else
+     for ( index=0; delta; delta>>=1, buttonState>>=1) {
++#endif
+         IOHIDEvent * subEvent;
+         
+         if ( (delta & 0x1) == 0 )
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -970,6 +970,66 @@
+ 	return err;
+ }
+ 
++#if XNU_TARGET_OS_OSX
++/*
++ * macOS (2026-11-22): a short click for the touchscreen trackpad (SweetHID.cpp), waveform `wave` at gain `gain`
++ * (DATDBG), played from a thread call so the caller (the touch thread) never waits on the I2C. Clicks closer than
++ * 40 ms together, or while one is still being started, are dropped.
++ */
++#include <kern/thread_call.h>
++int sweet_haptic_tick(unsigned wave, unsigned gain);
++static thread_call_t hap_tick_call;
++static volatile uint32_t hap_tick_wave, hap_tick_gain, hap_tick_busy;
++static uint64_t hap_tick_last;
++
++static void
++hap_tick_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	if (hp.ready) {
++		hap_ensure("trackpad");
++		lck_mtx_lock(hp.lock);
++		(void)hap_play_gain((uint8_t)hap_tick_wave, 0, (uint8_t)hap_tick_gain);
++		lck_mtx_unlock(hp.lock);
++	}
++	__atomic_store_n(&hap_tick_busy, 0, __ATOMIC_RELEASE);
++}
++
++int
++sweet_haptic_tick(unsigned wave, unsigned gain)
++{
++	if (!hp.ready || wave == 0 || wave > 127 || gain == 0 || gain > 0x80) {
++		return ENODEV;
++	}
++	uint64_t now = mach_absolute_time(), ns;
++	absolutetime_to_nanoseconds(now - hap_tick_last, &ns);
++	if (hap_tick_last != 0 && ns < 40 * NSEC_PER_MSEC) {
++		return EBUSY;
++	}
++	if (__atomic_exchange_n(&hap_tick_busy, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (hap_tick_call == NULL) {
++		hap_tick_call = thread_call_allocate_with_options(hap_tick_run, NULL, THREAD_CALL_PRIORITY_USER, 0);
++		if (hap_tick_call == NULL) {
++			__atomic_store_n(&hap_tick_busy, 0, __ATOMIC_RELEASE);
++			return ENOMEM;
++		}
++	}
++	hap_tick_last = now;
++	hap_tick_wave = wave;
++	hap_tick_gain = gain;
++	thread_call_enter(hap_tick_call);
++	return 0;
++}
++#else
++int sweet_haptic_tick(unsigned wave, unsigned gain);
++int
++sweet_haptic_tick(__unused unsigned wave, __unused unsigned gain)
++{
++	return ENODEV;
++}
++#endif
++
+ /* on: waveform 10 looped until buzz(0); off: stop whatever plays */
+ int
+ sweet_haptic_buzz(int on)
+--- a/iokit/Kernel/arm/SweetMedia.cpp
++++ b/iokit/Kernel/arm/SweetMedia.cpp
+@@ -24,10 +24,21 @@
+ 
+ #if XNU_TARGET_OS_OSX
+ 
+-class SweetBlockStorage : public IOService {
++/*
++ * 2026-11-22 (second pass): Disk Arbitration still said "unable to create disk". DADiskCreateFromIOMedia also
++ * walks up to a parent that conforms to IOBlockStorageDevice (its Protocol/Device Characteristics) and needs an
++ * IOMediaIcon somewhere up the tree. Both are here now: the stand-in base class (no IOStorageFamily in this
++ * kernel) and the icon IOStorageFamily gives internal disks.
++ */
++class IOBlockStorageDevice : public IOService {
++	OSDeclareDefaultStructors(IOBlockStorageDevice);
++};
++OSDefineMetaClassAndStructors(IOBlockStorageDevice, IOService);
++
++class SweetBlockStorage : public IOBlockStorageDevice {
+ 	OSDeclareDefaultStructors(SweetBlockStorage);
+ };
+-OSDefineMetaClassAndStructors(SweetBlockStorage, IOService);
++OSDefineMetaClassAndStructors(SweetBlockStorage, IOBlockStorageDevice);
+ 
+ class IOMedia : public IOService {
+ 	OSDeclareDefaultStructors(IOMedia);
+@@ -88,6 +99,19 @@
+ 		chars->release();
+ 	}
+ 
++	OSDictionary *icon = OSDictionary::withCapacity(2);
++	if (icon) {
++		OSString *bundle = OSString::withCString("com.apple.iokit.IOStorageFamily");
++		OSString *file = OSString::withCString("Internal.icns");
++		icon->setObject("CFBundleIdentifier", bundle);
++		icon->setObject("IOBundleResourceFile", file);
++		OSSafeReleaseNULL(bundle);
++		OSSafeReleaseNULL(file);
++		dev->setProperty("IOMediaIcon", icon);
++		media->setProperty("IOMediaIcon", icon);
++		icon->release();
++	}
++
+ 	/* The media: the whole disk, holding the HFS root (IOMedia.h keys). */
+ 	media->setProperty("Content", "Apple_HFS");
+ 	media->setProperty("Content Hint", "Apple_HFS");
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -40,6 +40,7 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++#include <sys/sysctl.h>
+ 
+ extern void sweet_media_publish(const char *name, int major, int minor, uint64_t bytes, uint32_t blockSize, int writable);
+ 
+@@ -264,6 +265,72 @@
+ 	return 0;
+ }
+ 
++#if XNU_TARGET_OS_OSX
++/*
++ * macOS (2026-11-22): the UFS device's Health Descriptor (JESD220 IDN 0x09), read once at start with a QUERY
++ * REQUEST UPIU in slot 0: pre-EOL information and the two life-time estimates (wear). Read only; nothing is
++ * written to the device. sysctl kern.sweet_ufs_health shows it.
++ */
++static char sweet_ufs_health[128] = "not read";
++SYSCTL_STRING(_kern, OID_AUTO, sweet_ufs_health, CTLFLAG_RD | CTLFLAG_LOCKED, sweet_ufs_health, 0,
++    "UFS Health Descriptor: pre-EOL info, life time estimate A/B");
++
++static void
++ufs_query_health(void)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++	const uint16_t want = 0x2c;             /* the descriptor's size; the device returns what it has */
++
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = 0x16;                     /* QUERY REQUEST UPIU */
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[5] = 0x01;                     /* standard read request */
++	ucd->cmd[12] = 0x01;                    /* READ DESCRIPTOR */
++	ucd->cmd[13] = 0x09;                    /* Health Descriptor */
++	ucd->cmd[18] = (uint8_t)(want >> 8);
++	ucd->cmd[19] = (uint8_t)want;
++	utrd->dw0 = (1u << 28) | (1u << 24);    /* UFS storage, no data phase, interrupt */
++	utrd->dw2 = 0x0f;
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UTRLDBR, 1);
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &deadline);
++	deadline += mach_absolute_time();
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (mach_absolute_time() > deadline) {
++			ufs_wr(REG_UTRLCLR, ~1u);
++			snprintf(sweet_ufs_health, sizeof(sweet_ufs_health), "query timed out");
++			printf("SWEET UFS: health query timed out\n");
++			return;
++		}
++		delay(1);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	const uint8_t *r = ucd->resp, *d = ucd->resp + 32;
++	uint32_t ocs = utrd->dw2 & 0xff, seg = ((uint32_t)r[10] << 8) | r[11];
++	if (ocs || r[0] != 0x36 || r[6] != 0 || seg < 5 || d[1] != 0x09) {
++		snprintf(sweet_ufs_health, sizeof(sweet_ufs_health), "query failed: ocs 0x%x upiu 0x%x response 0x%x len %u idn 0x%x",
++		    ocs, r[0], r[6], seg, d[1]);
++		printf("SWEET UFS: health %s\n", sweet_ufs_health);
++		return;
++	}
++	snprintf(sweet_ufs_health, sizeof(sweet_ufs_health), "pre-EOL 0x%02x, life time A 0x%02x, B 0x%02x (descriptor %u bytes)",
++	    d[2], d[3], d[4], d[0]);
++	printf("SWEET UFS: health %s\n", sweet_ufs_health);
++}
++#endif
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -658,6 +725,11 @@
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 	}
++#if XNU_TARGET_OS_OSX
++	if (!error) {
++		ufs_query_health();
++	}
++#endif
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
+@@ -675,13 +747,31 @@
+ 		return ENXIO;
+ 	}
+ 	su.bdev = makedev(su.bmajor, 0);
++#if XNU_TARGET_OS_OSX
++	/*
++	 * macOS: only disk0 / rdisk0 (below). With ufsroot0 made first, the mounted root was still named /dev/ufsroot0
++	 * (the device's first devfs name), and Disk Arbitration could not match it to disk0.
++	 */
++#else
+ 	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
++#endif
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
+-	/* macOS: describe the disk to Disk Arbitration (iokit/Kernel/arm/SweetMedia.cpp); a no-op on iOS. */
++#if XNU_TARGET_OS_OSX
++	/*
++	 * macOS (2026-11-22): the disk as disk0 / rdisk0 (not ufsroot0), and published to Disk Arbitration under that name
++	 * (iokit/Kernel/arm/SweetMedia.cpp); the root is mounted from /dev/disk0 (IOKitBSDInit.cpp). hfs.util -p only
++	 * takes "disk..." or "/dev/fd/N" devices: for "ufsroot0" it failed with FSUR_IO_FAIL, the probe failed, Disk
++	 * Arbitration never linked the root volume, and LaunchServices aborted on it (Finder, About This Mac).
++	 */
++	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "disk0");
++	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rdisk0");
++	sweet_media_publish("disk0", su.bmajor, 0, su.nblocks * UFS_BLOCK, su.secsize, su.writable);
++#else
+ 	sweet_media_publish("ufsroot0", su.bmajor, 0, su.nblocks * UFS_BLOCK, su.secsize, su.writable);
++#endif
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -807,6 +807,10 @@
+ 			panic("IOFindBSDRoot: SWEET UFS root %s unavailable: %d", rdBootVar, ufs_error);
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
++#if XNU_TARGET_OS_OSX
++		/* macOS: the root is mounted as /dev/disk0, the name Disk Arbitration knows it by (sweet_ufs.c) */
++		strlcpy(rootName, "disk0", rootNameSize);
++#endif
+ 		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
+ 		/*
+ 		 * MobileGestalt's NANDSize() (TotalDiskCapacity: Settings > About > Capacity, iPhone Storage) is
+@@ -818,6 +822,9 @@
+ 		{
+ 			extern uint64_t sweet_ufs_size_bytes(void);
+ 			uint32_t disk0 = 1;
++#if XNU_TARGET_OS_OSX
++			disk0 = 0;      /* macOS: the real IOMedia "disk0" comes from SweetMedia.cpp */
++#endif
+ 			PE_parse_boot_argn("sweetdisk0", &disk0, sizeof(disk0));
+ 			uint64_t bytes = sweet_ufs_size_bytes();
+ 			IOService *nub = disk0 && bytes ? new IOService : NULL;

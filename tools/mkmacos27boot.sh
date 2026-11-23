@@ -48,6 +48,43 @@ ARGS_LEN=${#ARGS}
 echo "boot-args: $ARGS"
 printf '%s\n' "$ARGS" > outputs/guacamole-menu-ios27-macos27-macos-boot-args.txt
 printf '%s\n' "$ARGS" > outputs/console.txt
+# The shown product name (About This Mac read "iPhone 14 Pro" from the iOS identity's /product). Only the two display
+# strings change, in place (same length); model/compatible stay iPhone15,2 until a Mac identity is done on purpose.
+python3 - work/macos27-from-ios27.adt <<'PY'
+import struct, sys
+path = sys.argv[1]
+d = bytearray(open(path, 'rb').read())
+NEW = b'OnePlus 7 Pro\0'
+done = []
+def soc_name_prop(v):
+    return b'product-soc-name'.ljust(32, b'\0') + struct.pack('<I', len(v)) + v + b'\0' * ((-len(v)) % 4)
+def walk(o, top):
+    start = o
+    np_, nc = struct.unpack_from('<II', d, o); o += 8
+    props = []
+    for _ in range(np_):
+        name = bytes(d[o:o + 32]).split(b'\0')[0].decode(); ln = struct.unpack_from('<I', d, o + 32)[0] & 0x7fffffff
+        props.append((name, o + 36, ln)); o += 36 + ((ln + 3) & ~3)
+    nm = next((bytes(d[v:v + l]).rstrip(b'\0').decode() for n, v, l in props if n == 'name'), '')
+    if nm == 'product' and top:
+        for n, v, l in props:
+            if n in ('product-name', 'product-description') and l == len(NEW):
+                d[v:v + l] = NEW; done.append(n)
+        # machdep.cpu.brand_string (About This Mac's "Chip") is /product product-soc-name (bsd/dev/arm64/sysctl.c);
+        # without it the kernel said "ARM architecture processor". Inserted after the node's last property.
+        if not any(n == 'product-soc-name' for n, v, l in props):
+            soc = b'Qualcomm Snapdragon 855\0'
+            prop = soc_name_prop(soc)
+            d[o:o] = prop
+            struct.pack_into('<I', d, start, np_ + 1)
+            o += len(prop); done.append('product-soc-name')
+    for _ in range(nc):
+        o = walk(o, nm == 'device-tree')
+    return o
+walk(0, False)
+open(path, 'wb').write(d)
+print('ADT /product:', ', '.join(done) or 'NOT CHANGED (lengths differ)')
+PY
 python3 tools/mkpayload.py "$K" work/macos27-from-ios27.adt work/payload-macos27.bin --cmdline "$ARGS"
 python3 tools/mkguacboot.py dtb/android-boot_b.img shim/out/Image outputs/guacamole-macos27-kernel.img --ramdisk work/payload-macos27.bin
 python3 tools/mkmenuboot.py dtb/android-boot_b.img shim/out/Image "$IOS" outputs/guacamole-macos27-kernel.img outputs/guacamole-menu-ios27-macos27.img
