@@ -4,6 +4,8 @@ This branch ports the **iOS 27.2 (24B119) userland for iPhone 14 Pro (iPhone15,2
 
 This is an experimental bring-up, not a daily-use phone OS. Many hardware features are incomplete, performance and graphics are unreliable, and the port disables or replaces parts of Apple's normal security and device stack. The iOS 16 port is maintained on a separate branch; this README describes the iOS 27 branch only.
 
+**Other device:** the port to the OnePlus 7T Pro 5G McLaren (`hotdogg`) is in [ios-hotdogg](https://github.com/coreycusick/ios-hotdogg) (not booting yet).
+
 ## Current status
 
 Status snapshot: **2026-11-18**. For detailed evidence, caveats, and engineering history, see [`docs/ios27.md`](docs/ios27.md) and [`NOTES.md`](NOTES.md).
