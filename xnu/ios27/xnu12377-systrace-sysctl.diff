@@ -1,0 +1,69 @@
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -36,6 +36,21 @@
+ #include <security/mac_framework.h>
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/sysctl.h>
++/* syscall failure tracer (see unix_syscall): process name, everyday errors too, lines left */
++static char sweet_st_name[MAXCOMLEN + 1];
++static int sweet_st_state;      /* 0 boot-arg not read yet */
++static int sweet_st_all;
++static int sweet_st_left = 600;
++SYSCTL_STRING(_kern, OID_AUTO, sweet_systrace, CTLFLAG_RW | CTLFLAG_LOCKED, sweet_st_name, sizeof(sweet_st_name),
++    "log failing syscalls of processes whose name contains this (empty: off)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_systrace_all, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_st_all, 0,
++    "1: also log ENOENT, ESRCH, EEXIST, ERANGE");
++SYSCTL_INT(_kern, OID_AUTO, sweet_systrace_left, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_st_left, 0,
++    "syscall failure lines still to log");
++#endif
++
+ #if CONFIG_DTRACE
+ extern int32_t dtrace_systrace_syscall(struct proc *, void *, int *);
+ extern void dtrace_systrace_syscall_return(unsigned short, int, int *);
+@@ -182,22 +197,23 @@
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	/*
+-	 * Diagnostic: boot-arg sweetsystrace=NAME logs the first 600 failing BSD syscalls of processes whose p_comm
+-	 * starts with NAME: "SYSERR name[pid] sc N err E a0 a1 a2 'str0' 'str1'" (a0/a1 that point at a readable
+-	 * user string are shown as strings). Finds what a daemon trips over when its own log says nothing.
++	 * Diagnostic: logs failing BSD syscalls of processes whose p_comm contains NAME:
++	 * "SYSERR name[pid] sc N err E a0 a1 a2 'str0' 'str1'" (a0/a1 that point at a readable user string are shown as
++	 * strings). Finds what a daemon trips over when its own log says nothing. NAME from boot-arg sweetsystrace=NAME
++	 * or, at run time (2026-11-23), sysctl kern.sweet_systrace=NAME (empty: off). The everyday misses (ENOENT, ESRCH,
++	 * EEXIST, ERANGE) are left out unless kern.sweet_systrace_all=1. kern.sweet_systrace_left: lines still to log
++	 * (600 at boot; write a number to start again).
+ 	 */
+ 	if (__improbable(error != 0 && error != ERESTART && error != EJUSTRETURN)) {
+-		static char sweet_st_name[MAXCOMLEN + 1];
+-		static int sweet_st_state;      /* 0 unparsed, 1 off, 2 on */
+-		static unsigned sweet_st_count;
+ 		if (sweet_st_state == 0) {
+-			sweet_st_state = (PE_parse_boot_argn("sweetsystrace", sweet_st_name, sizeof(sweet_st_name)) &&
+-			    sweet_st_name[0]) ? 2 : 1;
++			sweet_st_state = 1;
++			if (PE_parse_boot_argn("sweetsystrace", sweet_st_name, sizeof(sweet_st_name)) && sweet_st_name[0]) {
++				sweet_st_state = 2;
++			}
+ 		}
+-		/* NAME matches anywhere in p_comm ("Poster" catches PosterBoard and the poster extensions); the
+-		 * everyday misses (ENOENT, ESRCH, EEXIST, ERANGE) are left out so the 600 lines go to real failures */
+-		if (sweet_st_state == 2 && sweet_st_count < 600 && error != ENOENT && error != ESRCH &&
+-		    error != EEXIST && error != ERANGE && strnstr(proc->p_comm, sweet_st_name, sizeof(proc->p_comm)) != NULL) {
++		bool everyday = error == ENOENT || error == ESRCH || error == EEXIST || error == ERANGE;
++		if (sweet_st_name[0] && sweet_st_left > 0 && (!everyday || sweet_st_all) &&
++		    strnstr(proc->p_comm, sweet_st_name, sizeof(proc->p_comm)) != NULL) {
+ 			char s0[96] = "", s1[96] = "";
+ 			size_t n;
+ 			uint64_t a0 = uthread->uu_arg[0], a1 = uthread->uu_arg[1], a2 = uthread->uu_arg[2];
+@@ -207,7 +223,7 @@
+ 			if (a1 > 0x100000000ULL && a1 < 0x8000000000ULL && copyinstr((user_addr_t)a1, s1, sizeof(s1), &n) != 0) {
+ 				s1[0] = 0;
+ 			}
+-			sweet_st_count++;
++			sweet_st_left--;
+ 			printf("SYSERR %s[%d] sc %d err %d a0 %#llx a1 %#llx a2 %#llx '%s' '%s'\n", proc->p_comm, pid, code,
+ 			    error, a0, a1, a2, s0, s1);
+ 		}
