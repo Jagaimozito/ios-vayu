@@ -8,6 +8,8 @@ Plan and history: [`docs/macos27.md`](docs/macos27.md); day-to-day notes: [`NOTE
 Apple artifacts (IPSW, filesystems, kernelcaches, dyld caches, crash reports, dumps) never go into git: they live in
 `research/macos27/` and `outputs/`, which are git-ignored.
 
+**Other device:** the port to the OnePlus 7T Pro 5G McLaren (`hotdogg`) is in [ios-hotdogg](https://github.com/coreycusick/ios-hotdogg) (not booting yet).
+
 ## Status (2026-11-22)
 
 | | |
