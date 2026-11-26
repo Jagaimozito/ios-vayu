@@ -29,6 +29,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <TargetConditionals.h>
+#if TARGET_OS_OSX
+#include <libproc.h>
+#include <pthread.h>
+#include <stdlib.h>
+#endif
 
 /* ---- the display controller (see dispcolor.c for the probe this rests on) ---- */
 #define MDP             0x0ae01000ull
@@ -158,6 +163,59 @@ static float macos_brightness(void)
 		b = 1.0f;
 	return b;
 }
+
+/*
+ * 2026-11-23: brightness control gone after a reboot. corebrightnessd (the built-in display's brightness handler)
+ * started before WindowServer ("SkyLight: Server root port lookup error - bootstrap: unknown service"), so it never
+ * registered with it: WindowServer "Display 1, no brightness handler registered", DisplayServicesCanChangeBrightness
+ * false, no slider. Restarting corebrightnessd by hand fixed it. So: once WindowServer has been running for a few
+ * seconds and the display still cannot change brightness, restart corebrightnessd (launchd starts it again). Two tries
+ * during the login window were not enough (it registered only when restarted after login), so it keeps trying every
+ * 20 s while brightness cannot change, up to 15 times. Runs on its own thread; the main loop does not wait for it.
+ */
+static bool process_running(const char *name)
+{
+	int n = proc_listallpids(NULL, 0);
+	if (n <= 0)
+		return false;
+	pid_t *pids = calloc((size_t)n + 64, sizeof(pid_t));
+	if (pids == NULL)
+		return false;
+	n = proc_listallpids(pids, (int)(((size_t)n + 64) * sizeof(pid_t)));
+	bool found = false;
+	for (int i = 0; i < n && !found; i++) {
+		char pname[64] = "";
+		if (pids[i] > 0 && proc_name(pids[i], pname, sizeof(pname)) > 0 && !strcmp(pname, name))
+			found = true;
+	}
+	free(pids);
+	return found;
+}
+
+static void *corebrightness_kick(void *arg)
+{
+	(void)arg;
+	int ws_up = 0, kicks = 0;
+	for (int t = 0; t < 900 && kicks < 15; t++) {        /* every 2 s for up to 30 minutes */
+		sleep(2);
+		if (DisplayServicesCanChangeBrightness(CGMainDisplayID())) {
+			if (t > 0 || kicks > 0)
+				fprintf(stderr, "sweet-displayd: DisplayServices now says the main display can change brightness\n");
+			return NULL;
+		}
+		if (!process_running("WindowServer")) {
+			ws_up = 0;
+			continue;
+		}
+		if (++ws_up < 3)                                /* WindowServer up for about 6 s */
+			continue;
+		kicks++;
+		fprintf(stderr, "sweet-displayd: no brightness handler with WindowServer up: restarting corebrightnessd (%d)\n", kicks);
+		system("/usr/bin/killall corebrightnessd");
+		ws_up = -7;                                     /* give the new one about 20 s before trying again */
+	}
+	return NULL;
+}
 #endif
 static id blueLight;
 
@@ -200,6 +258,11 @@ int main(int argc, char **argv)
 		if (DisplayServicesCanChangeBrightness)
 			fprintf(stderr, "sweet-displayd: DisplayServices says the main display %s change brightness\n",
 			    DisplayServicesCanChangeBrightness(CGMainDisplayID()) ? "can" : "can NOT");
+		if (DisplayServicesCanChangeBrightness && !once) {
+			pthread_t kick;
+			if (pthread_create(&kick, NULL, corebrightness_kick, NULL) == 0)
+				pthread_detach(kick);
+		}
 #else
 		void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
 		BKSDisplayBrightnessGetCurrent = bbs ? (float (*)(void))dlsym(bbs, "BKSDisplayBrightnessGetCurrent") : NULL;

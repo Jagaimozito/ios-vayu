@@ -1,0 +1,199 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -36,6 +36,11 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <sys/proc_internal.h>
++#include <sys/proc_private.h>
++#include <sys/kauth.h>
++#include <kern/task.h>
++#include <bsm/audit.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -784,16 +789,180 @@
+  */
+ static unsigned sweet_qtn_logged;
+ 
++/*
++ * 2026-11-23: responsibility. tccd builds an "attribution chain" for every TCC request from libquarantine's
++ * responsibility_* calls, which are __mac_syscall("Quarantine", 180..187) (research: outputs/libquarantine-
++ * responsibility.txt). The stand-in above answered them 0 without filling anything, so tccd got PID 0 back
++ * ("proc_pidpath_audittoken() failed from PID[0]", "failed to construct a process for the responsible audit token",
++ * "Failed to create attribution chain") and denied every request: the Accessibility Keyboard's key events ("Sender is
++ * prohibited from synthesizing events"), the nameless "Application" prompt, all TCC. Answered now; the responsible
++ * process is the one launchd/posix_spawn recorded (p_responsible_pid) when it is alive, else the process itself.
++ *   180 get        {pid, int32 *resp_pid, uint64 *resp_uniqueid, [get2 fields: refused]}
++ *   181 set        {pid, responsible pid}
++ *   182 get3       {pid, pidversion, audit_token_t *resp_token (token query) | 0 (attribution query), ...}
++ *   183-187        set audit-token / hosted path / team: accepted, nothing kept
++ */
++extern void proc_set_responsible_pid(proc_t target_proc, pid_t responsible_pid);
++
++static proc_t
++sweet_resp_find(pid_t pid, int64_t pidversion, bool check_version)
++{
++	proc_t t = proc_find(pid);
++	if (t == PROC_NULL) {
++		return PROC_NULL;
++	}
++	if (check_version && pidversion != 0 && proc_pidversion(t) != (int)pidversion) {
++		proc_rele(t);
++		return PROC_NULL;
++	}
++	pid_t rp = t->p_responsible_pid;
++	if (rp > 0 && rp != proc_pid(t)) {
++		proc_t r = proc_find(rp);
++		if (r != PROC_NULL) {
++			proc_rele(t);
++			return r;
++		}
++	}
++	return t;
++}
++
+ static int
+-sweet_quarantine_syscall(struct proc *p, int call, user_addr_t arg __unused)
++sweet_resp_put64(user_addr_t where, uint64_t v)
+ {
+-	if (sweet_qtn_logged < 32) {
++	return where ? copyout(&v, where, sizeof(v)) : 0;
++}
++
++static int
++sweet_resp_put32(user_addr_t where, uint32_t v)
++{
++	return where ? copyout(&v, where, sizeof(v)) : 0;
++}
++
++/* a string into (size pointer, buffer): in, the buffer's size; out, the length with its NUL (0: none) */
++static int
++sweet_resp_putstr(user_addr_t sizep, user_addr_t buf, const char *str)
++{
++	uint64_t cap = 0, len = str ? strlen(str) + 1 : 0;
++	if (!sizep) {
++		return 0;
++	}
++	int e = copyin(sizep, &cap, sizeof(cap));
++	if (e) {
++		return e;
++	}
++	if (len > cap || !buf) {
++		len = 0;
++	}
++	if (len && (e = copyout(str, buf, (size_t)len))) {
++		return e;
++	}
++	return copyout(&len, sizep, sizeof(len));
++}
++
++static int
++sweet_resp_attribution(proc_t r, const uint64_t *f)
++{
++	int e = 0;
++	char *path = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	vnode_t vp = proc_getexecutablevnode(r);
++	if (path && vp != NULLVP) {
++		int len = MAXPATHLEN;
++		if (vn_getpath(vp, path, &len) != 0) {
++			path[0] = 0;
++		}
++	}
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	uint8_t zero32[32] = { 0 };
++	uint32_t csflags = proc_getcsflags(r);
++	bool platform = csproc_get_platform_binary(r) != 0;
++	const char *ident = cs_identity_get(r), *team = csproc_get_teamid(r);
++	if (!e) e = sweet_resp_putstr(f[0x18 / 8], f[0x20 / 8], path && path[0] ? path : NULL);    /* binary path */
++	if (!e) e = sweet_resp_put64(f[0x28 / 8], 0);                                               /* binary offset */
++	if (!e) e = sweet_resp_putstr(f[0x30 / 8], f[0x38 / 8], team);                              /* team ID */
++	if (!e) e = sweet_resp_putstr(f[0x40 / 8], f[0x48 / 8], ident);                             /* signing ID */
++	if (!e && f[0x50 / 8]) e = copyout(zero32, f[0x50 / 8], 16);                                /* user UUID */
++	if (!e) e = sweet_resp_put64(f[0x58 / 8], platform ? 1 : 0);                                /* bit 0: platform */
++	if (!e) e = sweet_resp_putstr(f[0x60 / 8], f[0x68 / 8], NULL);                              /* entitlements: none */
++	if (!e) e = sweet_resp_putstr(f[0x70 / 8], f[0x78 / 8], NULL);                              /* hosted path */
++	if (!e && f[0x80 / 8]) e = copyout(zero32, f[0x80 / 8], 32);                                /* persistent ID */
++	if (!e) e = sweet_resp_put32(f[0x88 / 8], proc_platform(r));
++	if (!e) e = sweet_resp_put32(f[0x90 / 8], proc_sdk(r));
++	if (!e) e = sweet_resp_put64(f[0x98 / 8], csflags);
++	if (!e) e = sweet_resp_put32(f[0xa0 / 8], 0);
++	if (!e) e = sweet_resp_put64(f[0xa8 / 8], 0);
++	if (!e) e = sweet_resp_putstr(f[0xb0 / 8], f[0xb8 / 8], NULL);                              /* hosted team ID */
++	if (!e && f[0xc0 / 8]) {
++		uint8_t b = 0;
++		e = copyout(&b, f[0xc0 / 8], 1);
++	}
++	if (path) {
++		kfree_data(path, MAXPATHLEN);
++	}
++	return e;
++}
++
++static int
++sweet_quarantine_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	int ret = 0;
++	if (call == 180 && arg) {
++		uint64_t f[5];
++		if ((ret = copyin(arg, f, sizeof(f))) == 0) {
++			if (f[3] != 0) {
++				ret = ENOTSUP;          /* the get2 form (path out): no caller in tccd */
++			} else {
++				proc_t r = sweet_resp_find((pid_t)f[0], 0, false);
++				if (r == PROC_NULL) {
++					ret = ESRCH;
++				} else {
++					ret = sweet_resp_put32(f[1], (uint32_t)proc_pid(r));
++					if (!ret) ret = sweet_resp_put64(f[2], proc_uniqueid(r));
++					proc_rele(r);
++				}
++			}
++		}
++	} else if (call == 181 && arg) {
++		int64_t f[2];
++		if ((ret = copyin(arg, f, sizeof(f))) == 0 && f[0] > 0 && f[1] > 0 &&
++		    (f[0] == proc_pid(p) || kauth_cred_issuser(kauth_cred_get()))) {
++			proc_t t = proc_find((pid_t)f[0]);
++			if (t != PROC_NULL) {
++				proc_set_responsible_pid(t, (pid_t)f[1]);
++				proc_rele(t);
++			}
++		}
++	} else if (call == 182 && arg) {
++		uint64_t f[0xc8 / 8];
++		if ((ret = copyin(arg, f, 0x28)) == 0) {
++			bool token_query = f[2] != 0;
++			if (!token_query) {
++				ret = copyin(arg, f, sizeof(f));
++			}
++			proc_t r = ret ? PROC_NULL : sweet_resp_find((pid_t)f[0], (int64_t)f[1], true);
++			if (!ret && r == PROC_NULL) {
++				ret = ESRCH;
++			} else if (!ret && token_query) {
++				audit_token_t tok;
++				task_get_audit_token(proc_task(r), &tok);
++				ret = copyout(&tok, (user_addr_t)f[2], sizeof(tok));
++				if (!ret) ret = sweet_resp_put64(f[3], proc_uniqueid(r));
++			} else if (!ret) {
++				ret = sweet_resp_attribution(r, f);
++			}
++			if (r != PROC_NULL) {
++				proc_rele(r);
++			}
++		}
++	}
++	if (sweet_qtn_logged < 64) {
+ 		char name[20];
+ 		sweet_qtn_logged++;
+ 		proc_name(proc_pid(p), name, sizeof(name));
+-		printf("SWEET Quarantine: %s[%d] op %d -> 0\n", name, proc_pid(p), call);
++		printf("SWEET Quarantine: %s[%d] op %d -> %d\n", name, proc_pid(p), call, ret);
+ 	}
+-	return 0;
++	return ret;
+ }
+ 
+ static const struct mac_policy_ops sweet_quarantine_mac_ops = {
