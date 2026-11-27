@@ -134,7 +134,7 @@ jobs:
           # Build m.dylib (sbwall static wallpaper stand-in)
           if [ -f scion-kernel/tools/ios27/metal/sbwall.m ]; then
             $CC -fobjc-arc -dynamiclib -install_name /usr/lib/m.dylib \
-              -framework Foundation -framework UIKit -framework QuartzCore \
+              -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics \
               scion-kernel/tools/ios27/metal/sbwall.m -o "$OV/usr/lib/m.dylib"
             codesign -f -s - "$OV/usr/lib/m.dylib"
           fi
