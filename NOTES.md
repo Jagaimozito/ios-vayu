@@ -12,13 +12,18 @@
 - **Stock `boot.img` header (from `dumps/stock_boot.img`):** Android boot header v2 (`hdr_sz=1660`, `page=4096`), `kernel_addr=0x8000`, `ramdisk_addr=0x1000000`, `tags_addr=0x100`, `dtb_addr=0x1f00000`
 
 ## Tracker & Lineage
-- Tracked on iOSOnAnd at https://hackios.appaiproxy.com/device/poco-x3-pro (repo `t3ddycarecaexiste/ios-vayu`, forked from `coreycusick/ios-guacamole` `ios27`).
+- Tracked on iOSOnAnd at https://hackios.appaiproxy.com/device/poco-x3-pro (repo `Jagaimozito/ios-vayu`, formerly `t3ddycarecaexiste/ios-vayu`, forked from `coreycusick/ios-guacamole` `ios27`).
 - Also references `nomorecoolnicknames/hackios-xnu-kernel-vayu` (`vayu` hardware/iOS 27 kernel line), `Scion-Project/xnu`, `Scion-Project/scion-kernel`, `UniXNU/AdrenoMetal`, and `akshaynexus/iOSPlus10`.
 
 ## Current Milestone & Next Concrete Action
-- **Verified (2026-11-27, CI run `45934305762`):** `mach.development.vayu` (`20,761,512` B, SHA-256 `28d3efab36153ed18a67f124e8ca4e8b4d7e4fc339ca5f18be74947ce8409a40`) packed into `dumps/vayu-xnu27-boot.img` (SHA-256 `6c05422d60df20cf4b8054a158b7947cce619485f519041358a19f401a12e7fc`). Temporary `fastboot boot` on POCO X3 Pro (`e3e6c87f`) booted **Darwin Kernel Version 25.5.0** (`xnu-12377.121.6`, `c2f63b2`) with crisp 1080×2400 CSOT framebuffer console output through MMU/pmap/GICv3/`SweetPlatformExpert`/BSD init to `IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable: 19 @IOKitBSDInit.cpp:975` (because `vayu_ufs.c` requires a UEFI `UFSDxe` mailbox).
-- **Verified earlier (2026-11-27):** `BOARD=vayu ./shim/build.sh` (`shim/out/Image`, 3,481,680 B) + Rust `tools/vayutool` (`dumps/shim-vayu-diag.img`, SHA-256 `15d9e9c6f3a2de23c8bc54aca6110f848abc44c1db02fa3f7a0cfad06562f72e`) enumerated UFS 3.1 (`0x01d84000`) and GPT (`userdata`, `super`, etc.).
-- **Next:** Add direct Qualcomm UFSHCI MMIO driver (`xnu/vayu/files/bsd/dev/vayu_mmio_ufs.c`) + `xnu/vayu/patches/0001-vayu-mmio-ufs.patch`, cache `dxb/fakeroot` + `firehose-ios` in CI, rebuild `mach.development.vayu`, and verify `cpus=8` + UFS `userdata` root probe.
+- **Verified (2026-11-27, commit `8c89a67`, CI run `45937062648`, photo `media_1795788503621_d0e96401.jpg`):** Direct Qualcomm UFSHCI MMIO fallback (`xnu/vayu/files/bsd/dev/vayu_mmio_ufs.c` + `0001-vayu-mmio-ufs.patch`) works on real POCO X3 Pro (`e3e6c87f`) hardware! Booted `dumps/vayu-xnu27-ufs-boot.img` (SHA-256 `95f6c1c6ec1b2f1f45be852afdb03c746d40f08693969526fb3893dc9f3dbc8b`, cmdline `debug=0xc -v serial=3 keepsyms=1 cpus=1 rd=ufsroot0 ufsroot=userdata vayu27=1 vayu_spawnattr=27`) via temporary `fastboot boot`:
+  - `SWEET UFS: "userdata" on LUN 0: first block 0x2b0200, 231605 MiB, read-only, DMA at 0x105260000 (MMIO fallback)`
+  - `BSD root: ufsroot0, major 1, minor 0` -> read sector 2 of Android's encrypted `userdata` (`hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : 5d1d`, `cannot mount root, errno = 19`)
+  - Also verified live on screen: `SWEET FB: AppleCLCD 1080x2400 stride 4320 at 0x9c000000, default surface 1, presented as 1125x2436`, `SWEET HID: buttons registered`, `SWEET HID: touch registered`, `SWEET BATTERY: static fallback`, `SWEET AMFI`, `SWEET Sandbox`, `SWEET Quarantine`, `SWEET HFS: hfs-627.100.6 registered`.
+- **Verified earlier (2026-11-27, CI run `45934305762`):** Initial Darwin 25.5.0 (`xnu-12377.121.6`) boot (`dumps/vayu-xnu27-boot.img`, SHA-256 `6c05422d60df20cf4b8054a158b7947cce619485f519041358a19f401a12e7fc`) and `BOARD=vayu` diagnostic shim (`dumps/shim-vayu-diag.img`, SHA-256 `15d9e9c6f3a2de23c8bc54aca6110f848abc44c1db02fa3f7a0cfad06562f72e`).
+- **Next:**
+  1. Enable 8-core SMP (`cpus=8 vayu_smp=1` + `/chosen/psci-method = "smc"` + `d73` identity in `tools/mkadt.py`) and verify all Kryo 485 cores come online (`vayu_smp_test=1`).
+  2. Build the lowered `arm64e -> arm64` iOS 27.2 (`24B119`, `iPhone15,2`) case-sensitive HFS+ rootfs image (`tools/mkios27root-mac.sh` -> sparse Android image via `tools/hfs2simg.py`) and flash to `userdata` (after explicit user confirmation) to boot `launchd` and userland.
 ---
 # Upstream Reference Notes (guacamole)
 # Shared-tree iOS touchfix quiet image (2026-11-23)
