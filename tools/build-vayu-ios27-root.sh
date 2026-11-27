@@ -8,6 +8,7 @@
 #
 # Apple IPSW/DMG artifacts and output images stay strictly in /mnt/e/ios-vayu-work (never in git).
 set -euo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 W="${WORK_DIR:-/mnt/e/ios-vayu-work}"
@@ -16,9 +17,9 @@ SK="$W/scion-kernel"
 T27="$SK/tools/ios27"
 PIPE="$T27/fullroot/pipeline"
 OVERLAY="${OVERLAY_DIR:-$W/overlay}"
-SIZE_GB="${SIZE_GB:-24}"
+SIZE_GB="${SIZE_GB:-22}"
 RAW_IMG="$W/ios27-root.img"
-SIMG="$W/ios27-root.simg"
+SIMG="${SIMG_OUT:-$REPO/dumps/ios27-root.simg}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run with sudo: sudo OVERLAY_DIR=$OVERLAY bash $0" >&2
@@ -89,7 +90,7 @@ if [[ ! -f "$CACHE_OUT/.done" ]]; then
     python3 -I "$T27/speed/cachepatch.py" "$CACHE_OUT" "$va" "$exp" "$new"
   done < "$T27/s9/patches-24B156.txt"
   echo "  -> 2e: fips-seal (recompute & verify libcorecrypto FIPS HMAC)"
-  python3 -I "$T27/a64e/fips-seal.py" reseal "$CACHE_M" --ref "$STOCK_DSC_DIR/dyld_shared_cache_arm64e"
+  python3 -I "$T27/a64e/fips-seal.py" reseal "$CACHE_M" --ref "$STOCK_DSC_DIR/dyld_shared_cache_arm64e" --log "$W/fips-seal.log"
   python3 -I "$T27/a64e/fips-seal.py" check "$CACHE_M" --ref "$STOCK_DSC_DIR/dyld_shared_cache_arm64e"
   touch "$CACHE_OUT/.done"
 else
@@ -98,6 +99,12 @@ fi
 
 echo "=== [3/7] Formatting ${SIZE_GB}G case-sensitive journaled HFS+ volume at $RAW_IMG ==="
 rm -f "$RAW_IMG" "$SIMG"
+: > "$RAW_IMG"
+if [[ "$RAW_IMG" == /mnt/e/* ]] && [[ -x /mnt/c/Windows/System32/fsutil.exe ]]; then
+  WIN_RAW="E:\\${RAW_IMG#/mnt/e/}"
+  WIN_RAW="${WIN_RAW//\//\\}"
+  /mnt/c/Windows/System32/fsutil.exe sparse setflag "$WIN_RAW" 1 >/dev/null 2>&1 || true
+fi
 truncate -s "${SIZE_GB}G" "$RAW_IMG"
 mkfs.hfsplus -s -J -v iOSRoot27 "$RAW_IMG"
 LOOP_DEV=$(losetup -f --show "$RAW_IMG")
@@ -113,6 +120,7 @@ rsync -aH --numeric-ids "$APP_ROOT/" "$R/private/preboot/Cryptexes/App/"
 CDST="$R/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld"
 mkdir -p "$CDST" "$R/System/Library/Caches/com.apple.dyld"
 for f in "$CACHE_OUT"/dyld_shared_cache_arm64e*; do
+  [[ "$f" == *.symbols ]] && continue
   cp -p "$f" "$CDST/"
   chown 0:0 "$CDST/${f##*/}"
   ln -f "$CDST/${f##*/}" "$R/System/Library/Caches/com.apple.dyld/${f##*/}"
@@ -220,6 +228,7 @@ umount "$R"
 losetup -d "$LOOP_DEV"
 LOOP_DEV=""
 
+fsck.hfsplus -f -y "$RAW_IMG" | grep -v 'Illegal name' || true
 fsck.hfsplus -f -y "$RAW_IMG" | grep -v 'Illegal name' || true
 fsck.hfsplus -f -n "$RAW_IMG"
 
