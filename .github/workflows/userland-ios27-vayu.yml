@@ -6,9 +6,12 @@ on:
       ios27_build:
         description: iOS 27 build for sbca QuartzCore table (24B156 or 24A446)
         default: "24B156"
+      runner:
+        description: GitHub Actions macOS runner label
+        default: "macos-15-intel"
 
 concurrency:
-  group: userland-ios27-vayu-${{ github.ref }}
+  group: userland-ios27-vayu-${{ github.ref }}-${{ inputs.runner || 'macos-15-intel' }}
   cancel-in-progress: true
 
 env:
@@ -17,7 +20,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
