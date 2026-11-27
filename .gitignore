@@ -1,10 +1,18 @@
 # device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
 backup/
+dumps/
+fw-vayu/
 dtb/
 recovery/
+# tracker & local secrets (never commit API keys)
+.env
+.env.*
+cli.mjs
+TRACKER_QUEUE.md
 # third-party/Apple sources fetched for reading
 research/
 shim/out/
+tools/vayutool/target/
 xnu/out/
 xnu/out-*/
 __pycache__/
