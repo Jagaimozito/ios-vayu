@@ -22,6 +22,7 @@ env:
   SCION_KERNEL_REPO: https://github.com/Scion-Project/scion-kernel.git
   VAYU_LINE_REPO: https://github.com/nomorecoolnicknames/hackios-xnu-kernel-vayu.git
   KDK_BUILD: 25F71
+  KDK_PATH: /Library/Developer/KDKs/KDK_26.5_25F71.kdk
   MACOS_VERSION: "26.5"
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: VAYU
@@ -47,38 +48,35 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
           xcrun --sdk iphoneos --show-sdk-version
+          sudo mkdir -p /Library/Developer/KDKs
+          sudo chown -R "$(whoami):staff" /Library/Developer/KDKs
 
       - name: Cache KDK 26.5 (25F71)
         id: kdk-cache
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/KDK_26.5_25F71.kdk
-          key: kdk-26.5-${{ env.KDK_BUILD }}-v1
+          path: /Library/Developer/KDKs/KDK_26.5_25F71.kdk
+          key: kdk-26.5-${{ env.KDK_BUILD }}-installed-v1
 
-      - name: Fetch and unpack KDK 26.5 (25F71)
+      - name: Fetch and install KDK 26.5 (25F71)
         if: steps.kdk-cache.outputs.cache-hit != 'true'
         run: |
-          KDK="${{ runner.temp }}/KDK_26.5_25F71.kdk"
           URL=$(curl -fsSL https://raw.githubusercontent.com/dortania/KdkSupportPkg/gh-pages/manifest.json |
             jq -r --arg b "$KDK_BUILD" '.[] | select(.build == $b) | .url' | head -1)
           test -n "$URL" && [ "$URL" != "null" ]
           mkdir -p "${{ runner.temp }}/kdk-dl"
           curl -fL --retry 3 -o "${{ runner.temp }}/kdk-dl/KDK.dmg" "$URL"
           hdiutil attach -readonly -nobrowse -mountpoint "${{ runner.temp }}/kdk-dl/mnt" "${{ runner.temp }}/kdk-dl/KDK.dmg" >/dev/null
-          pkgutil --expand-full "${{ runner.temp }}/kdk-dl/mnt/KernelDebugKit.pkg" "${{ runner.temp }}/kdk-dl/pkg" >/dev/null
+          sudo installer -pkg "${{ runner.temp }}/kdk-dl/mnt/KernelDebugKit.pkg" -target /
           hdiutil detach "${{ runner.temp }}/kdk-dl/mnt" -quiet
-          rm -rf "$KDK"
-          KFW=$(find "${{ runner.temp }}/kdk-dl/pkg" -type d -path "*/System/Library/Frameworks/Kernel.framework" | head -1)
-          test -n "$KFW" || { find "${{ runner.temp }}/kdk-dl/pkg" -maxdepth 4; exit 1; }
-          KDK_SRC=$(dirname "$(dirname "$(dirname "$(dirname "$KFW")")")")
-          mv "$KDK_SRC" "$KDK"
           rm -rf "${{ runner.temp }}/kdk-dl"
-          ls -la "$KDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2"
-          ls -la "$KDK/System/Library/KernelSupport/CoreEntitlements/V2/Kernel.h"
+          sudo chown -R "$(whoami):staff" "$KDK_PATH"
+          ls -la "$KDK_PATH/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2"
+          find "$KDK_PATH" -name Kernel.h
+          test -f "$KDK_PATH/System/Library/KernelSupport/CoreEntitlements/V2/Kernel.h"
 
       - name: Fetch scion-kernel, dxb, Scion XNU, and vayu ios27 overlay
         run: |
-          KDK="${{ runner.temp }}/KDK_26.5_25F71.kdk"
           git clone --depth 1 "$SCION_KERNEL_REPO" scion-kernel
 
           git init -q dxb
@@ -102,28 +100,28 @@ jobs:
 
           patch -s -p1 dxb/build.sh < scion-kernel/tools/ios27/dxb-ios.patch
 
-          # Fetch Scion-Project/xnu at pinned commit
-          mkdir -p dxb/work
-          git init -q dxb/work/xnu
-          git -C dxb/work/xnu fetch -q --depth 1 "$SCION_XNU_REPO" "$SCION_XNU_COMMIT"
-          git -C dxb/work/xnu checkout -q FETCH_HEAD
+          # Fetch Scion-Project/xnu at pinned commit into dxb/xnu (dxb WORK_DIR is dxb/)
+          git init -q dxb/xnu
+          git -C dxb/xnu fetch -q --depth 1 "$SCION_XNU_REPO" "$SCION_XNU_COMMIT"
+          git -C dxb/xnu checkout -q FETCH_HEAD
 
           # Fetch vayu ios27 line (hakios.patch + files/)
           git clone --depth 1 --filter=blob:none --sparse "$VAYU_LINE_REPO" vayu-line
           git -C vayu-line sparse-checkout set xnu/lines/ios27
-          git -C dxb/work/xnu apply "$PWD/vayu-line/xnu/lines/ios27/hakios.patch"
-          cp -R vayu-line/xnu/lines/ios27/files/. dxb/work/xnu/
+          git -C dxb/xnu apply "$PWD/vayu-line/xnu/lines/ios27/hakios.patch"
+          cp -R vayu-line/xnu/lines/ios27/files/. dxb/xnu/
 
           # Stage CoreEntitlements V2 headers from KDK (as tools/vayu/build-mac.sh)
-          CE="$KDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2"
-          mkdir -p dxb/work/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2
-          cp "$CE"/*.h dxb/work/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2/
-          cp "$KDK/System/Library/KernelSupport/CoreEntitlements/V2/Kernel.h" dxb/work/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2/Kernel.h
+          CE="$KDK_PATH/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2"
+          mkdir -p dxb/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2
+          cp "$CE"/*.h dxb/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2/
+          cp "$KDK_PATH/System/Library/KernelSupport/CoreEntitlements/V2/Kernel.h" dxb/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2/Kernel.h
 
       - name: Build XNU (VAYU, iOS target)
         working-directory: dxb
         env:
           SKIP_PATCHES: "1"
+          KDKROOT: /Library/Developer/KDKs/KDK_26.5_25F71.kdk
           XNU_SDKROOT: iphoneos
           XNU_FIREHOSE_IOS: ${{ github.workspace }}/scion-kernel/tools/ios27/firehose-ios.py
           XNU_JOBS: "4"
@@ -133,7 +131,6 @@ jobs:
           LOGICAL_CPU_OVERRIDE: "4"
           KERNEL_PARALLELISM_OVERRIDE: "1"
         run: |
-          export KDKROOT="${{ runner.temp }}/KDK_26.5_25F71.kdk"
           set -o pipefail
           bash build.sh 2>&1 | tee ../build.log
 
