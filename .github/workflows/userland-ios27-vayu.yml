@@ -142,7 +142,7 @@ jobs:
           # Build cc_fips_test stand-in (exit 0 for PAC-lowered corecrypto)
           printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/cc_fips_test.c"
           $CC "$RUNNER_TEMP/cc_fips_test.c" -o "$OV/usr/libexec/cc_fips_test"
-          codesign -f -s - "$OV/usr/libexec/cc_fips_test"
+          codesign -f -s - -i com.apple.cc_fips_test "$OV/usr/libexec/cc_fips_test"
 
           # Build devshd + diagnostic helpers
           if [ -f scion-kernel/tools/ios27/devsh/devshd.c ]; then
