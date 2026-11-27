@@ -1,0 +1,164 @@
+name: userland-ios27-vayu
+
+on:
+  workflow_dispatch:
+    inputs:
+      ios27_build:
+        description: iOS 27 build for sbca QuartzCore table (24B156 or 24A446)
+        default: "24B156"
+
+concurrency:
+  group: userland-ios27-vayu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SCION_KERNEL_REPO: https://github.com/Scion-Project/scion-kernel.git
+  IOS27_BUILD: ${{ inputs.ios27_build || '24B156' }}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host deps and select Xcode
+        run: |
+          brew install bison flex ninja glslang
+          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Selected Xcode: $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Clone scion-kernel
+        run: |
+          git clone --depth 1 "$SCION_KERNEL_REPO" scion-kernel
+
+      - name: Build Mesa 25.0.7 OSMesa (arm64-apple-ios) and sbca27 compositor
+        run: |
+          set -euo pipefail
+          cd scion-kernel
+          mkdir -p build/mesa-ios
+          cd build/mesa-ios
+          VERSION=25.0.7
+          SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
+          curl -fL --retry 3 -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
+          echo "$SHA256  mesa-$VERSION.tar.xz" | shasum -a 256 -c --quiet
+          tar xJf mesa-$VERSION.tar.xz
+          for p in "$PWD"/../../tools/ios27/mesa-ios/panfrost-*.patch "$PWD"/../../tools/ios27/mesa-ios/panvk-*.patch; do
+            patch -s -p1 -d mesa-$VERSION < "$p"
+          done
+          cp -r "$PWD/../../tools/ios27/mesa-ios/starbite-drm" mesa-$VERSION/src/starbite-drm
+
+          python3 -m venv venv
+          venv/bin/pip -q install meson mako pyyaml packaging
+          BISON_PREFIX=$(brew --prefix bison)
+          FLEX_PREFIX=$(brew --prefix flex)
+          export PATH="$BISON_PREFIX/bin:$FLEX_PREFIX/bin:$PWD/venv/bin:$PATH"
+
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC=$(xcrun --sdk iphoneos -f clang)
+          CXX=$(xcrun --sdk iphoneos -f clang++)
+          cat > cross.ini <<INI
+          [binaries]
+          c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+          cpp = ['$CXX', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+          objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+          ar = '$(xcrun --sdk iphoneos -f ar)'
+          ranlib = '$(xcrun --sdk iphoneos -f ranlib)'
+          strip = '$(xcrun --sdk iphoneos -f strip)'
+          pkg-config = 'false'
+
+          [host_machine]
+          system = 'darwin'
+          subsystem = 'ios'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          INI
+
+          # Build softpipe OSMesa (CPU/NEON GLES compositor for immediate bring-up on vayu)
+          meson setup build-osmesa mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
+            --prefix=/usr/local/starbite --libdir=lib --buildtype=release -Db_ndebug=true \
+            -Dplatforms= -Dgallium-drivers=softpipe -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+            -Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
+            -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
+            -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
+            -Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false
+          ninja -C build-osmesa src/gallium/targets/osmesa/libOSMesa.8.dylib
+
+          cd "$GITHUB_WORKSPACE/scion-kernel"
+          python3 tools/ios27/ca-gpu/sbca_table.py sync || true
+          IOS27_BUILD="$IOS27_BUILD" \
+            MESA="$PWD/build/mesa-ios/mesa-$VERSION" \
+            OSMESA="$PWD/build/mesa-ios/build-osmesa/src/gallium/targets/osmesa/libOSMesa.8.dylib" \
+            bash tools/ios27/ca-gpu/build-sbca27.sh
+
+      - name: Build Turnip (Adreno 640 Vulkan) and iOS 27 userland helpers
+        run: |
+          set -euo pipefail
+          BISON_PREFIX=$(brew --prefix bison)
+          FLEX_PREFIX=$(brew --prefix flex)
+          export PATH="$BISON_PREFIX/bin:$FLEX_PREFIX/bin:$PATH"
+
+          # Build Turnip libvulkan_freedreno.dylib for Adreno 640
+          METAL_WORK="$RUNNER_TEMP/metal-work" sh tools/build-turnip-ios.sh ios
+
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC="xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -isysroot $SDK -O2 -Wall"
+
+          OV="$GITHUB_WORKSPACE/overlay-out"
+          mkdir -p "$OV/usr/lib" "$OV/usr/local/starbite/lib" "$OV/usr/libexec" "$OV/private/var/local/bin"
+
+          # Copy sbca + OSMesa + Turnip
+          cp scion-kernel/out/libsbca.dylib "$OV/usr/lib/sbca.dylib"
+          cp scion-kernel/out/libsbca.dylib "$OV/usr/lib/s.dylib"
+          codesign -f -s - "$OV/usr/lib/sbca.dylib" "$OV/usr/lib/s.dylib"
+          cp scion-kernel/out/libsbgl.dylib "$OV/usr/local/starbite/lib/libsbgl.dylib"
+          cp scion-kernel/out/libOSMesa.8.dylib "$OV/usr/local/starbite/lib/libOSMesa.8.dylib"
+          cp "$RUNNER_TEMP/metal-work/turnip/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib" \
+            "$OV/usr/local/starbite/lib/libvulkan_freedreno.dylib"
+          install_name_tool -id /usr/local/starbite/lib/libvulkan_freedreno.dylib \
+            "$OV/usr/local/starbite/lib/libvulkan_freedreno.dylib"
+          codesign -f -s - "$OV/usr/local/starbite/lib/libvulkan_freedreno.dylib"
+
+          # Build m.dylib (sbwall static wallpaper stand-in)
+          if [ -f scion-kernel/tools/ios27/metal/sbwall.m ]; then
+            $CC -fobjc-arc -dynamiclib -install_name /usr/lib/m.dylib \
+              -framework Foundation -framework UIKit -framework QuartzCore \
+              scion-kernel/tools/ios27/metal/sbwall.m -o "$OV/usr/lib/m.dylib"
+            codesign -f -s - "$OV/usr/lib/m.dylib"
+          fi
+
+          # Build cc_fips_test stand-in (exit 0 for PAC-lowered corecrypto)
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/cc_fips_test.c"
+          $CC "$RUNNER_TEMP/cc_fips_test.c" -o "$OV/usr/libexec/cc_fips_test"
+          codesign -f -s - "$OV/usr/libexec/cc_fips_test"
+
+          # Build devshd + diagnostic helpers
+          if [ -f scion-kernel/tools/ios27/devsh/devshd.c ]; then
+            $CC scion-kernel/tools/ios27/devsh/devshd.c -o "$OV/private/var/local/bin/devshd" || true
+            [ -f "$OV/private/var/local/bin/devshd" ] && codesign -f -s - "$OV/private/var/local/bin/devshd"
+          fi
+          $CC userland/autorun/sweet-autorun.c -o "$OV/private/var/local/bin/sweet-autorun"
+          $CC userland/jb/mgtool.c -framework CoreFoundation -o "$OV/private/var/local/bin/mgtool"
+          $CC userland/flame/oslog.m -fobjc-arc -framework Foundation -o "$OV/private/var/local/bin/oslog"
+          $CC userland/flame/lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices -o "$OV/private/var/local/bin/lsreg"
+          codesign -f -s - "$OV/private/var/local/bin/sweet-autorun" "$OV/private/var/local/bin/mgtool"
+          codesign -f -s - --entitlements userland/flame/oslog-ents.plist "$OV/private/var/local/bin/oslog"
+          codesign -f -s - --entitlements userland/flame/lsreg-ents.plist "$OV/private/var/local/bin/lsreg"
+
+          (cd "$OV" && find . -type f ! -name MANIFEST.sha256 | sort | while IFS= read -r f; do shasum -a 256 "$f"; done > MANIFEST.sha256)
+          cat "$OV/MANIFEST.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland-ios27-vayu
+          path: overlay-out/
+          retention-days: 7

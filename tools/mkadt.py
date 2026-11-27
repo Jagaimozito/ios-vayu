@@ -235,7 +235,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ] + ([('psci-method', cstr('hvc' if qemu else 'smc'))] if VAYU else []), [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
@@ -256,10 +256,16 @@ def build(seed=None, qemu=False, highmem=False):
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
+        if VAYU:
+            cpu_compat = cstr('qcom,kryo485') + cstr('ARM,v8')
+            cpu_freq = 2956800000 if core == 7 else (2419200000 if core >= 4 else 1785600000)
+        else:
+            cpu_compat = cstr('qcom,kryo470') + cstr('ARM,v8')
+            cpu_freq = 2304000000 if core >= 6 else 1804800000
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('compatible', cpu_compat),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
@@ -270,7 +276,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(cpu_freq)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
