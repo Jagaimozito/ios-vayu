@@ -8,6 +8,7 @@
  * and caches off, x0 = boot_args (physical).
  */
 #include <stdint.h>
+#include "board.h"
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
@@ -75,6 +76,126 @@ static int magic_ok(const char *m)
 }
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
+
+#if defined(BOARD_VAYU)
+#define NVT_TLMM_NORTH	0x03900000UL
+#define NVT_TLMM_SOUTH	0x03D00000UL
+#define NVT_PIN_CFG(tile, pin)	((tile) + 0x1000UL * (pin))
+#define NVT_PIN_IO(tile, pin)	(NVT_PIN_CFG(tile, pin) + 4)
+#define NVT_PIN_RESET	12U
+#define NVT_PIN_INT	122U
+#define NVT_PIN_VDDIO	100U
+#define NVT_SPI_PIN0	55U
+#define NVT_SPI_FUNC	1U
+
+static inline uint32_t nvt_rd(uintptr_t pa)
+{
+	return *(volatile uint32_t *)pa;
+}
+
+static inline void nvt_wr(uintptr_t pa, uint32_t v)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t *)pa = v;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void nvt_udelay(uint64_t us)
+{
+	uint64_t frq, start, end;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
+	end = start + (frq / 1000000ULL) * us;
+	for (;;) {
+		uint64_t cur;
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(cur));
+		if (cur >= end)
+			break;
+	}
+}
+
+static int nvt_has_word(const char *cmdline, const char *word)
+{
+	uint64_t n = 0;
+
+	while (word[n] != 0)
+		n++;
+	for (const char *p = cmdline; *p != 0;) {
+		while (*p == ' ')
+			p++;
+		const char *q = p;
+		while (*q != 0 && *q != ' ')
+			q++;
+		if ((uint64_t)(q - p) == n) {
+			uint64_t i = 0;
+			while (i < n && p[i] == word[i])
+				i++;
+			if (i == n)
+				return 1;
+		}
+		p = q;
+	}
+	return 0;
+}
+
+static int nvt_pin_out_high(uintptr_t tile, unsigned pin)
+{
+	uint32_t cfg = nvt_rd(NVT_PIN_CFG(tile, pin));
+	uint32_t io = nvt_rd(NVT_PIN_IO(tile, pin));
+
+	return ((cfg >> 2) & 0xfU) == 0 && ((cfg >> 9) & 1U) != 0 && (io & 2U) != 0;
+}
+
+static void nvt_pin_set(uintptr_t tile, unsigned pin, unsigned func, unsigned pull,
+			unsigned ma, int output, int high)
+{
+	uintptr_t cfg_pa = NVT_PIN_CFG(tile, pin);
+	uintptr_t io_pa = NVT_PIN_IO(tile, pin);
+	uint32_t cfg = nvt_rd(cfg_pa);
+	uint32_t newcfg = cfg & ~((0xfU << 2) | 0x3U | (0x7U << 6) | (1U << 9));
+
+	if (output)
+		nvt_wr(io_pa, high ? 2U : 0U);
+	newcfg |= ((func & 0xfU) << 2) | (pull & 3U) | ((((ma / 2U) - 1U) & 7U) << 6);
+	if (output)
+		newcfg |= 1U << 9;
+	nvt_wr(cfg_pa, newcfg);
+}
+
+static void vayu_nvt_qup_setup(const char *cmdline)
+{
+	int keep, reset_up, vddio_up;
+	unsigned i;
+
+	if (!nvt_has_word(cmdline, "nvt_qup=1") && !nvt_has_word(cmdline, "touch_driver=nvt_qup"))
+		return;
+	keep = !nvt_has_word(cmdline, "nvt_qup_keep_power=0");
+	reset_up = nvt_pin_out_high(NVT_TLMM_NORTH, NVT_PIN_RESET);
+	vddio_up = nvt_pin_out_high(NVT_TLMM_SOUTH, NVT_PIN_VDDIO);
+	if (!(keep && reset_up && vddio_up)) {
+		keep = 0;
+		nvt_pin_set(NVT_TLMM_SOUTH, NVT_PIN_VDDIO, 0, 0, 2, 1, 1);
+		nvt_pin_set(NVT_TLMM_NORTH, NVT_PIN_RESET, 0, 3, 8, 1, 0);
+		nvt_pin_set(NVT_TLMM_SOUTH, NVT_PIN_INT, 0, 1, 8, 0, 0);
+		nvt_udelay(4000);
+	}
+	for (i = 0; i < 4; i++)
+		nvt_pin_set(NVT_TLMM_SOUTH, NVT_SPI_PIN0 + i, NVT_SPI_FUNC, 1, 6, 0, 0);
+	for (i = 0; i < 4; i++) {
+		uint32_t cfg = nvt_rd(NVT_PIN_CFG(NVT_TLMM_SOUTH, NVT_SPI_PIN0 + i));
+		if (((cfg >> 2) & 0xfU) != NVT_SPI_FUNC) {
+			con_str("NVT", "qup17 mux failed");
+			return;
+		}
+	}
+	if (!keep) {
+		nvt_pin_set(NVT_TLMM_NORTH, NVT_PIN_RESET, 0, 3, 8, 1, 1);
+		nvt_udelay(10000);
+	}
+	con_str("NVT", keep ? "qup17 muxed (power kept)" : "qup17 muxed + reset released");
+}
+#endif
 
 /* Bytes a payload takes in the ramdisk: up to the end of its last segment or its ADT. */
 static uint64_t payload_span(const struct payload *p)
@@ -188,6 +309,10 @@ const char *loader_boot_n(uintptr_t dtb, int n)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
+
+#if defined(BOARD_VAYU)
+	vayu_nvt_qup_setup(p->cmdline);
+#endif
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);

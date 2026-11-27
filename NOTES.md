@@ -16,11 +16,14 @@
 - Also references `nomorecoolnicknames/hackios-xnu-kernel-vayu` (`vayu` hardware/iOS 27 kernel line), `Scion-Project/xnu`, `Scion-Project/scion-kernel`, `UniXNU/AdrenoMetal`, and `akshaynexus/iOSPlus10`.
 
 ## Current Milestone & Next Concrete Action
-- **Verified (2026-11-27, photos `media_1795806010982_8a06e78b.jpg`, `media_1795806018621_f47adbcd.jpg`, `media_1795806110113_0c546d60.jpg`, iOSOnAnd update `#6`):** **iOS 27.2.1 (`24B156`) booted to SpringBoard Lock Screen on POCO X3 Pro (`e3e6c87f`)!**
-  - After live-patching `cc_fips_test` CodeDirectory ident (`com.apple.cc_fips_test`) on `/dev/block/sda32`, `launchd` brought up `backboardd` and `SpringBoard[30]`.
-  - Panel showed the Apple progress bar (`media_1795806010982_8a06e78b.jpg`), live `SWEET FB: display on` + `VAYU FB: display on: backlight not driven (no vayu_wled=2)` (`media_1795806018621_f47adbcd.jpg`), and rendered the iOS 27.2.1 Lock Screen with green charging battery icon, Control Center grabber, and Home indicator (`media_1795806110113_0c546d60.jpg`).
-  - Overlapping white kernel console text appeared because `dumps/vayu-ios27-full-boot.img` used `-v serial=3 sweeteacces=1` without `sweetfb_noconsole=1`.
-- **Clean Boot Image Built (`2026-11-27`):**
+- **Verified (2026-11-27, photo `media_1795807147777_30e8bd74.jpg`, iOSOnAnd update `#7`):** **100% clean iOS 27.2.1 (`24B156`) Lock Screen on POCO X3 Pro (`e3e6c87f`)!**
+  - Booted `dumps/vayu-ios27-clean-boot.img` (`sweetfb_noconsole=1`, `vayu_wled=2`, no `-v`/`serial=3`/`sweeteacces=1`): zero overlapping kernel console text, Lock Screen clock (`4:04` / `Wed Dec 31`), green charging battery icon, Control Center grabber, and `"Swipe up to open"` Home indicator rendered cleanly.
+- **Verified earlier (2026-11-27, photos `media_1795806010982_8a06e78b.jpg`, `media_1795806018621_f47adbcd.jpg`, `media_1795806110113_0c546d60.jpg`, iOSOnAnd update `#6`):** First boot to SpringBoard Lock Screen after live-patching `cc_fips_test` CodeDirectory ident (`com.apple.cc_fips_test`) on `/dev/block/sda32`.
+- **Touch & Boot Loader Prep (`2026-11-27`):**
+  - Added `vayu_nvt_qup_setup()` (`#if defined(BOARD_VAYU)`) to `shim/loader.c` (`NVT_TLMM_SOUTH` pins `55..58` -> `qup17` func `1`, `GPIO 100` VDDIO, `GPIO 122` INT, `NVT_TLMM_NORTH` `GPIO 12` RESET when `nvt_qup=1` or `touch_driver=nvt_qup` is in cmdline). Rebuilt `shim/out/Image` (`3,485,776` B, `0` ABS64 relocations).
+  - Packed `dumps/vayu-ios27-touch.payload` (`+touchscreen=1 +nvt_qup=1`) and `dumps/vayu-ios27-touch-boot.img` (`25,174,016` B, SHA-256 `ae525ac353e30d86f103219ef97ecbe01ffb9dc966e59c8569a303e75394e54e`).
+  - Confirmed `vayu_nvt.c` and `vayu_adreno.c` are already in `dumps/xnu-ios27-vayu-ufs/mach.development.vayu` and read `/fw/<name>` from the HFS+ rootfs via `vayu_input_fw("fw", ...)`.
+- **Clean Boot Image (`2026-11-27`):**
   - `dumps/vayu-ios27-clean-boot.img` (`25,169,920` B, SHA-256 `d8e3652836be2e87e860e1add4e55b5c2d3a81e5b84c5872bfc4563bbd2da0dd`): generated via `tools/set-payload-args.py` removing `-v`, `serial=3`, `sweeteacces=1`, `debug=0xc` and adding `debug=0x8 sweetfb_noconsole=1 vayu_wled=2`.
 - **Verified earlier (2026-11-27, photo `media_1795805110231_4b2864fc.jpg`):** First full **iOS 27.2.1 (`24B156`)** boot on POCO X3 Pro (`e3e6c87f`): all 8 Kryo 485 cores (`CPU_BOOTED 0..7`) online via PSCI SMC (`cpus=8 vayu_smp=1`), UFS 3.1 HFS+ rootfs mounted, lowered `arm64e -> arm64` `dyld_shared_cache` loaded, `pid 1: launchd` ran; fixed `cc_fips_test` CodeDirectory ident (`5ba6da5`, `E:\ios-vayu-work\overlay\usr\libexec\cc_fips_test` `0x812c`, `E:\ios-vayu-work\ios27-root.img` `FIBMAP` block `3272944`, offset `0x31f0f012c`).
 - **Rootfs & Boot Artifacts (`2026-11-27`, commits `d9765e9`, `2a55cea`):**
@@ -29,9 +32,9 @@
   - **Previous Boot Image (`dumps/vayu-ios27-full-boot.img`):** `25,169,920` B, SHA-256 `b67419e148f8e5044b00663cbb8b1bc6c10395c91a39731c83795c5653d0be83`.
 - **Verified earlier (2026-11-27, commit `8c89a67`, CI run `45937062648`, photo `media_1795788503621_d0e96401.jpg`):** Direct Qualcomm UFSHCI MMIO fallback (`vayu_mmio_ufs.c`) + `AppleCLCD` (`1080x2400 @ 0x9c000000`), `SWEET HFS`, `SWEET AMFI`, `SWEET Sandbox`, `SWEET Quarantine`, `SWEET HID`.
 - **Next:**
-  1. Test `fastboot boot dumps/vayu-ios27-clean-boot.img` for clean UI without overlapping console text (`sweetfb_noconsole=1`) + PM8150L WLED backlight (`vayu_wled=2`).
-  2. Pull `j20s_novatek_ts_fw02.bin` and `a630_sqe.fw` from `/vendor/firmware` on the phone in OrangeFox recovery into `fw-vayu/`.
-  3. Add `nvt_qup` TLMM GPIO 55–58 (`qup17`), `GPIO 100` (VDDIO), and `GPIO 12` (reset) setup to `shim/` (`BOARD_VAYU`), and wire firmware loading (`fw_var=1` or embedded small image) for Novatek NT36675 SPI touch (`touchscreen=1 nvt_qup=1`) and Adreno 640 hardware GPU (`gpu=1 vayu_gpu=1 vayu_cmd_db=0x85f20000`).
+  1. Pull `/vendor/firmware/j20s_novatek_ts_fw02.bin` and `/vendor/firmware/a630_sqe.fw` from OrangeFox recovery (`e3e6c87f`) into `fw-vayu/`.
+  2. Stage `/fw/{j20s_novatek_ts_fw02.bin,a630_sqe.fw,a640_gmu.bin,a640_zap.*}` into the HFS+ rootfs and sync changed blocks onto `/dev/block/sda32` (OrangeFox kernel lacks `hfsplus`).
+  3. `adb reboot bootloader` and `fastboot boot dumps/vayu-ios27-touch-boot.img` to test Novatek NT36675 SPI touch, then enable Adreno 640 hardware GPU (`gpu=1 vayu_gpu=1 vayu_cmd_db=0x85f20000`).
 ---
 # Upstream Reference Notes (guacamole)
 # Shared-tree iOS touchfix quiet image (2026-11-23)
