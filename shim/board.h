@@ -17,6 +17,17 @@
 #define IMEM_RESTART_REASON	0x146bf65cUL	/* msm-imem@146bf000 + 0x65c (unused by ABL) */
 #define REBOOT_VIA_PMIC_PON	1
 #define PSHOLD_WRITABLE		0
+#elif defined(BOARD_VAYU)
+/* POCO X3 Pro (vayu), SM8150-AC. Facts from the live FDT + stock boot.img:
+ *  - cont_splash_region@9c000000 (size 0x02400000), CSOT 42_02_0b 1080x2400 video-mode panel
+ *  - qcom,msm-imem@146bf000, restart_reason@65c -> 0x146bf65c
+ *  - SM8150 ABL uses PMIC PON_SOFT_RB_SPARE + PSCI SYSTEM_RESET; PS_HOLD is XPU-protected. */
+#define BOARD_NAME		"vayu"
+#define FB_W			1080
+#define FB_H			2400
+#define IMEM_RESTART_REASON	0x146bf65cUL
+#define REBOOT_VIA_PMIC_PON	1
+#define PSHOLD_WRITABLE		0
 #else
 #define BOARD_NAME		"sweet"
 #define FB_W			1080
