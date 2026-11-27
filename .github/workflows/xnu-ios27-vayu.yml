@@ -68,9 +68,13 @@ jobs:
           pkgutil --expand-full "${{ runner.temp }}/kdk-dl/mnt/KernelDebugKit.pkg" "${{ runner.temp }}/kdk-dl/pkg" >/dev/null
           hdiutil detach "${{ runner.temp }}/kdk-dl/mnt" -quiet
           rm -rf "$KDK"
-          mv "${{ runner.temp }}/kdk-dl/pkg/KDK.pkg/Payload" "$KDK"
+          KFW=$(find "${{ runner.temp }}/kdk-dl/pkg" -type d -path "*/System/Library/Frameworks/Kernel.framework" | head -1)
+          test -n "$KFW" || { find "${{ runner.temp }}/kdk-dl/pkg" -maxdepth 4; exit 1; }
+          KDK_SRC=$(dirname "$(dirname "$(dirname "$(dirname "$KFW")")")")
+          mv "$KDK_SRC" "$KDK"
           rm -rf "${{ runner.temp }}/kdk-dl"
           ls -la "$KDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2"
+          ls -la "$KDK/System/Library/KernelSupport/CoreEntitlements/V2/Kernel.h"
 
       - name: Fetch scion-kernel, dxb, Scion XNU, and vayu ios27 overlay
         run: |
