@@ -1,0 +1,168 @@
+name: xnu-ios27-vayu
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      keep_going:
+        description: Pass -k to make (collect all compile errors in one run)
+        default: "true"
+
+concurrency:
+  group: xnu-ios27-vayu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  SCION_XNU_REPO: https://github.com/Scion-Project/xnu.git
+  SCION_XNU_COMMIT: c2f63b275f83406995066d6e6e29e4ce7a8ba56d
+  SCION_KERNEL_REPO: https://github.com/Scion-Project/scion-kernel.git
+  VAYU_LINE_REPO: https://github.com/nomorecoolnicknames/hackios-xnu-kernel-vayu.git
+  KDK_BUILD: 25F71
+  MACOS_VERSION: "26.5"
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: VAYU
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host deps and select Xcode
+        run: |
+          brew install jq gum bash cmake ninja
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Selected Xcode: $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Cache KDK 26.5 (25F71)
+        id: kdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/KDK_26.5_25F71.kdk
+          key: kdk-26.5-${{ env.KDK_BUILD }}-v1
+
+      - name: Fetch and unpack KDK 26.5 (25F71)
+        if: steps.kdk-cache.outputs.cache-hit != 'true'
+        run: |
+          KDK="${{ runner.temp }}/KDK_26.5_25F71.kdk"
+          URL=$(curl -fsSL https://raw.githubusercontent.com/dortania/KdkSupportPkg/gh-pages/manifest.json |
+            jq -r --arg b "$KDK_BUILD" '.[] | select(.build == $b) | .url' | head -1)
+          test -n "$URL" && [ "$URL" != "null" ]
+          mkdir -p "${{ runner.temp }}/kdk-dl"
+          curl -fL --retry 3 -o "${{ runner.temp }}/kdk-dl/KDK.dmg" "$URL"
+          hdiutil attach -readonly -nobrowse -mountpoint "${{ runner.temp }}/kdk-dl/mnt" "${{ runner.temp }}/kdk-dl/KDK.dmg" >/dev/null
+          pkgutil --expand-full "${{ runner.temp }}/kdk-dl/mnt/KernelDebugKit.pkg" "${{ runner.temp }}/kdk-dl/pkg" >/dev/null
+          hdiutil detach "${{ runner.temp }}/kdk-dl/mnt" -quiet
+          rm -rf "$KDK"
+          mv "${{ runner.temp }}/kdk-dl/pkg/KDK.pkg/Payload" "$KDK"
+          rm -rf "${{ runner.temp }}/kdk-dl"
+          ls -la "$KDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2"
+
+      - name: Fetch scion-kernel, dxb, Scion XNU, and vayu ios27 overlay
+        run: |
+          KDK="${{ runner.temp }}/KDK_26.5_25F71.kdk"
+          git clone --depth 1 "$SCION_KERNEL_REPO" scion-kernel
+
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+
+          # Plain arm64 libfirehose_kernel (no ARMv8.1 LSE atomics) + SKIP_PATCHES support
+          python3 - dxb/build.sh <<'PY'
+          import sys
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          t = p.read_text()
+          old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
+          new = ('ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc '
+                 '-Wno-packed -mcpu=cortex-a53 -march=armv8-a+crypto"')
+          assert t.count(old) == 1
+          t = t.replace(old, new).replace('make install -j8', 'make install -j4')
+          t = t.replace('\n    patches\n', '\n    [ -n "${SKIP_PATCHES:-}" ] || patches\n', 1)
+          p.write_text(t)
+          PY
+
+          patch -s -p1 dxb/build.sh < scion-kernel/tools/ios27/dxb-ios.patch
+
+          # Fetch Scion-Project/xnu at pinned commit
+          mkdir -p dxb/work
+          git init -q dxb/work/xnu
+          git -C dxb/work/xnu fetch -q --depth 1 "$SCION_XNU_REPO" "$SCION_XNU_COMMIT"
+          git -C dxb/work/xnu checkout -q FETCH_HEAD
+
+          # Fetch vayu ios27 line (hakios.patch + files/)
+          git clone --depth 1 --filter=blob:none --sparse "$VAYU_LINE_REPO" vayu-line
+          git -C vayu-line sparse-checkout set xnu/lines/ios27
+          git -C dxb/work/xnu apply "$PWD/vayu-line/xnu/lines/ios27/hakios.patch"
+          cp -R vayu-line/xnu/lines/ios27/files/. dxb/work/xnu/
+
+          # Stage CoreEntitlements V2 headers from KDK (as tools/vayu/build-mac.sh)
+          CE="$KDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2"
+          mkdir -p dxb/work/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2
+          cp "$CE"/*.h dxb/work/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2/
+          cp "$KDK/System/Library/KernelSupport/CoreEntitlements/V2/Kernel.h" dxb/work/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2/Kernel.h
+
+      - name: Build XNU (VAYU, iOS target)
+        working-directory: dxb
+        env:
+          SKIP_PATCHES: "1"
+          XNU_SDKROOT: iphoneos
+          XNU_FIREHOSE_IOS: ${{ github.workspace }}/scion-kernel/tools/ios27/firehose-ios.py
+          XNU_JOBS: "4"
+          XNU_EXTRA_MAKEARGS: ${{ inputs.keep_going == 'false' && 'LOGCOLORS=n' || '-k LOGCOLORS=n' }}
+          MEMORY_SIZE_OVERRIDE: "15032385536"
+          PHYS_CPU_OVERRIDE: "4"
+          LOGICAL_CPU_OVERRIDE: "4"
+          KERNEL_PARALLELISM_OVERRIDE: "1"
+        run: |
+          export KDKROOT="${{ runner.temp }}/KDK_26.5_25F71.kdk"
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+
+      - name: Collect kernel artifact
+        if: always()
+        run: |
+          mkdir -p out
+          CFG_LOWER=$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')
+          MACH_LOWER=$(echo "$MACHINE_CONFIG" | tr '[:upper:]' '[:lower:]')
+          OBJ_DIR="dxb/build/xnu-ios.obj/${KERNEL_CONFIG}_ARM64_${MACHINE_CONFIG}"
+          K="$OBJ_DIR/mach.${CFG_LOWER}.${MACH_LOWER}"
+          ls -la "$OBJ_DIR" 2>/dev/null || true
+          if [ -f "$K" ]; then
+            cp "$K" out/
+            [ -f "$K.unstripped" ] && cp "$K.unstripped" out/ || true
+          fi
+          cp dxb/fakeroot/System/Library/Kernels/mach.* out/ 2>/dev/null || true
+          if ls out/mach.* >/dev/null 2>&1; then
+            (cd out && shasum -a 256 mach.* > SHA256SUMS && cat SHA256SUMS)
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-ios27-vayu-log
+          path: build.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-ios27-vayu
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn

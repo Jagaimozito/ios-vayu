@@ -37,6 +37,7 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # --highmem window 0x100000000+0xfcc00000 is RAM with no fixed carve-outs, but
 # the low PHYS_BASE window crosses the 0xbbb00000 hole, so use --highmem.
 GUACAMOLE = '--guacamole' in sys.argv
+VAYU = '--vayu' in sys.argv
 # --scale2: present an @2x screen, 828x1792 (414x896 points, the iPhone XR / 11 screen; 375x812 @2x has no UIKit
 # status bar layout), with kernel boot-arg sweetfb_scale=2 (xnu 0240 + 0241): 1.85x fewer pixels to draw. MobileGestalt caches the screen: move its cache aside after switching.
 SCALE2 = '--scale2' in sys.argv
@@ -53,6 +54,10 @@ if RAM5G:
 if GUACAMOLE:
     FB_W, FB_H, FB_STRIDE = 1440, 3120, 1440 * 4
     FB_SIZE = 0x1200000
+elif VAYU:
+    # POCO X3 Pro (vayu): CSOT 42_02_0b 1080x2400 panel, cont_splash_region@9c000000 size 0x02400000.
+    FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+    FB_SIZE = 0x2400000
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -422,8 +427,8 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    if GUACAMOLE and '--highmem' not in sys.argv:
-        sys.exit('--guacamole needs --highmem (the low window crosses a DDR hole)')
+    if (GUACAMOLE or VAYU) and '--highmem' not in sys.argv:
+        sys.exit('--guacamole/--vayu needs --highmem (the low window crosses a DDR hole)')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
