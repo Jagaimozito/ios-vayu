@@ -211,14 +211,19 @@ chmod 0755 "$R/usr/lib/sbca.dylib" "$R/usr/lib/s.dylib" "$R/usr/local/starbite/l
 install -d -m 0777 "$R/private/var/local" "$R/private/var/local/oslog" "$R/private/var/local/m2v-cache" "$R/private/var/tmp"
 chmod 0755 "$R/private/var/local"
 
-# Stage POCO X3 Pro (vayu) vendor firmware (Adreno 640 + Novatek NT36675 touch + WLAN/BT)
+# Stage POCO X3 Pro (vayu) vendor firmware (Adreno 640 + Novatek NT36675 touch)
 install -d -o 0 -g 0 -m 0755 "$R/fw" "$R/usr/standalone/firmware/sweet"
-if [[ -d "$REPO/fw-vayu/gpu" ]]; then
-  cp -f "$REPO/fw-vayu/gpu"/* "$R/fw/" 2>/dev/null || true
-  cp -f "$REPO/fw-vayu/gpu"/* "$R/usr/standalone/firmware/sweet/" 2>/dev/null || true
-fi
-find "$REPO/fw-vayu" -type f -name '*novatek*' -exec cp -f {} "$R/fw/" \; 2>/dev/null || true
-chown -R 0:0 "$R/fw" "$R/usr/standalone/firmware/sweet"
+for f in a630_sqe.fw a640_gmu.bin a640_zap.mdt a640_zap.b00 a640_zap.b01 a640_zap.b02; do
+  if [[ -f "$REPO/fw-vayu/gpu/$f" ]]; then
+    install -o 0 -g 0 -m 0644 "$REPO/fw-vayu/gpu/$f" "$R/fw/$f"
+    install -o 0 -g 0 -m 0644 "$REPO/fw-vayu/gpu/$f" "$R/usr/standalone/firmware/sweet/$f"
+  fi
+done
+for f in j20s_novatek_ts_fw01.bin j20s_novatek_ts_fw02.bin; do
+  if [[ -f "$REPO/fw-vayu/touch/$f" ]]; then
+    install -o 0 -g 0 -m 0644 "$REPO/fw-vayu/touch/$f" "$R/fw/$f"
+  fi
+done
 
 sync
 df -h "$R"

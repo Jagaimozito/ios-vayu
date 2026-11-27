@@ -31,10 +31,14 @@
   - **Lowered iOS 27.2.1 (`24B156`, `iPhone12,1`) HFS+ Rootfs (`E:\ios-vayu-work\ios27-root.img` -> `/dev/block/sda32`):** 22 GiB case-sensitive journaled HFS+, `2.2` GiB free headroom; `34.4M` shared-cache PAC words + `10,208` stub-island words + `5` `patches-24B156.txt` words + `libcorecrypto` FIPS resealed `0 broken` + `3,753` standalone Mach-Os / `11.37M` PAC words lowered `0 errors`. Flashed via OrangeFox ADB (`24.4` MiB/s, `b'HX\x00\x05'` verified).
   - **Previous Boot Image (`dumps/vayu-ios27-full-boot.img`):** `25,169,920` B, SHA-256 `b67419e148f8e5044b00663cbb8b1bc6c10395c91a39731c83795c5653d0be83`.
 - **Verified earlier (2026-11-27, commit `8c89a67`, CI run `45937062648`, photo `media_1795788503621_d0e96401.jpg`):** Direct Qualcomm UFSHCI MMIO fallback (`vayu_mmio_ufs.c`) + `AppleCLCD` (`1080x2400 @ 0x9c000000`), `SWEET HFS`, `SWEET AMFI`, `SWEET Sandbox`, `SWEET Quarantine`, `SWEET HID`.
+- **Touch & GPU Firmware Extracted & Staged (`2026-11-27`):**
+  - Extracted Novatek NT36675 SPI touch firmware from phone's stock kernel (`dumps/boot_unpacked/kernel` `.builtin_fw` table, verified against `vayu_nvt.c`'s `nvt_fw_parse()`): `fw-vayu/touch/j20s_novatek_ts_fw02.bin` (`0x1bc5000`, `139,264` B, `ver=0xc8`, CSOT `42_02_0b`), `fw-vayu/touch/j20s_novatek_ts_fw01.bin` (`0x1b81000`, `139,264` B, `ver=0xca`), and `fw-vayu/touch/j20s_novatek_ts_fw02_c6.bin` (`0x1cd5000`, `139,264` B, `ver=0xc6` backup).
+  - Pulled `/vendor/firmware/a630_sqe.fw` (`32,136` B) via OrangeFox ADB into `fw-vayu/gpu/a630_sqe.fw` (completing `a630_sqe.fw`, `a640_gmu.bin`, `a640_zap.{mdt,b00,b01,b02}`).
+  - Mounted `E:\ios-vayu-work\ios27-root.img` in WSL2 (`hfsplus`), verified `cc_fips_test` ident (`com.apple.cc_fips_test`), copied all 8 touch + GPU firmware files into `/fw/` (`chmod 644`), ran `fsck.hfsplus -f -y` (`The volume iOSRoot27 appears to be OK`; `-fn` has only `ABTStat/EBTStat/CBTStat/CatStat == 0x0000`, `VIStat = 0x8000` Linux-HFS+ minor VHB bit `35`). Updated `tools/build-vayu-ios27-root.sh` to stage both `fw-vayu/gpu/*` and `fw-vayu/touch/j20s_novatek_ts_fw0*.bin` cleanly.
+  - Read-only 4 MiB SHA-256 chunk comparison against `/dev/block/sda32` (`5632` chunks total): **441 differing chunks (`1,764` MiB)** saved in `dumps/sda32_diff_chunks.txt` (~72 s delta sync vs 22 GiB full flash).
 - **Next:**
-  1. Pull `/vendor/firmware/j20s_novatek_ts_fw02.bin` and `/vendor/firmware/a630_sqe.fw` from OrangeFox recovery (`e3e6c87f`) into `fw-vayu/`.
-  2. Stage `/fw/{j20s_novatek_ts_fw02.bin,a630_sqe.fw,a640_gmu.bin,a640_zap.*}` into the HFS+ rootfs and sync changed blocks onto `/dev/block/sda32` (OrangeFox kernel lacks `hfsplus`).
-  3. `adb reboot bootloader` and `fastboot boot dumps/vayu-ios27-touch-boot.img` to test Novatek NT36675 SPI touch, then enable Adreno 640 hardware GPU (`gpu=1 vayu_gpu=1 vayu_cmd_db=0x85f20000`).
+  1. Wait for user confirmation to apply the `1,764` MiB delta sync (`441` chunks) onto `userdata` (`/dev/block/sda32`) over OrangeFox ADB.
+  2. Immediately `adb reboot bootloader` and `fastboot boot dumps/vayu-ios27-touch-boot.img` to test Novatek NT36675 SPI touch (`touchscreen=1 nvt_qup=1`), then enable Adreno 640 hardware GPU (`gpu=1 vayu_gpu=1 vayu_cmd_db=0x85f20000`).
 ---
 # Upstream Reference Notes (guacamole)
 # Shared-tree iOS touchfix quiet image (2026-11-23)
