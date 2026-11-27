@@ -16,9 +16,9 @@
 - Also references `nomorecoolnicknames/hackios-xnu-kernel-vayu` (`vayu` hardware/iOS 27 kernel line), `Scion-Project/xnu`, `Scion-Project/scion-kernel`, `UniXNU/AdrenoMetal`, and `akshaynexus/iOSPlus10`.
 
 ## Current Milestone & Next Concrete Action
-- **Verified (2026-11-27):** `BOARD=vayu ./shim/build.sh` built `shim/out/Image` (3,481,680 B); Rust `tools/vayutool` (`cargo test` 1/1 passed) packed `dumps/shim-vayu-diag.img` (5,279,744 B, SHA-256 `15d9e9c6f3a2de23c8bc54aca6110f848abc44c1db02fa3f7a0cfad06562f72e`). Temporary `fastboot boot dumps/shim-vayu-diag.img` on POCO X3 Pro (`e3e6c87f`) displayed the yellow/white console (`SHIM sweet milestone 4: xnu loader`, `BOARD vayu`) on the 1080×2400 CSOT video-mode panel (`0x9c000000`) and enumerated the UFS 3.1 controller (`0x01d84000`) and GPT partitions (`userdata`, `super`, etc.).
-- **Next:** Add `--vayu` to `tools/mkadt.py`, create `.github/workflows/xnu-ios27-vayu.yml` (`macos-15`, KDK 26.5 `25F71`, `Scion-Project/xnu` + `vayu` `ios27` overlay), build `mach.development.vayu`, and test temporary `fastboot boot` to `"waiting for root device"`.
-
+- **Verified (2026-11-27, CI run `45934305762`):** `mach.development.vayu` (`20,761,512` B, SHA-256 `28d3efab36153ed18a67f124e8ca4e8b4d7e4fc339ca5f18be74947ce8409a40`) packed into `dumps/vayu-xnu27-boot.img` (SHA-256 `6c05422d60df20cf4b8054a158b7947cce619485f519041358a19f401a12e7fc`). Temporary `fastboot boot` on POCO X3 Pro (`e3e6c87f`) booted **Darwin Kernel Version 25.5.0** (`xnu-12377.121.6`, `c2f63b2`) with crisp 1080×2400 CSOT framebuffer console output through MMU/pmap/GICv3/`SweetPlatformExpert`/BSD init to `IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable: 19 @IOKitBSDInit.cpp:975` (because `vayu_ufs.c` requires a UEFI `UFSDxe` mailbox).
+- **Verified earlier (2026-11-27):** `BOARD=vayu ./shim/build.sh` (`shim/out/Image`, 3,481,680 B) + Rust `tools/vayutool` (`dumps/shim-vayu-diag.img`, SHA-256 `15d9e9c6f3a2de23c8bc54aca6110f848abc44c1db02fa3f7a0cfad06562f72e`) enumerated UFS 3.1 (`0x01d84000`) and GPT (`userdata`, `super`, etc.).
+- **Next:** Add direct Qualcomm UFSHCI MMIO driver (`xnu/vayu/files/bsd/dev/vayu_mmio_ufs.c`) + `xnu/vayu/patches/0001-vayu-mmio-ufs.patch`, cache `dxb/fakeroot` + `firehose-ios` in CI, rebuild `mach.development.vayu`, and verify `cpus=8` + UFS `userdata` root probe.
 ---
 # Upstream Reference Notes (guacamole)
 # Shared-tree iOS touchfix quiet image (2026-11-23)

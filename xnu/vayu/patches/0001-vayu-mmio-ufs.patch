@@ -1,0 +1,27 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0d0c43d..558cffb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -188,6 +188,7 @@ bsd/dev/vayu_display_power.c	optional scion_vayu
+ # K6 (storage (UFS, NBD, HFS/APFS), USB-NCM):
+ bsd/dev/vayu_storage.c	optional scion_vayu
+ bsd/dev/vayu_ufs.c	optional scion_vayu
++bsd/dev/vayu_mmio_ufs.c	optional scion_vayu
+ bsd/dev/vayu_usbnet.c	optional scion_vayu
+ bsd/dev/vayu_usbnet_ecm.c	optional scion_vayu
+ bsd/dev/vayu_nbd.c	optional scion_vayu
+diff --git a/bsd/dev/vayu_ufs.c b/bsd/dev/vayu_ufs.c
+index e494e33..30e926d 100644
+--- a/bsd/dev/vayu_ufs.c
++++ b/bsd/dev/vayu_ufs.c
+@@ -459,8 +459,8 @@ sweet_ufs_rootdev(dev_t *dev)
+ 		return ENODEV;
+ 	}
+ 	if (!ufs_ready) {
+-		printf("VAYU: rd=ufsroot0: no UFS mailbox in this run (ufs=2, and the loader's ufs_shared_pa=): refused\n");
+-		return ENODEV;
++		extern int vayu_mmio_ufs_rootdev(dev_t *dev);
++		return vayu_mmio_ufs_rootdev(dev);
+ 	}
+ 	if (!PE_parse_boot_arg_str("ufsroot", name, sizeof(name)) || name[0] == 0) {
+ 		printf("VAYU: rd=ufsroot0 without ufsroot=NAME: no partition is taken by default: refused\n");

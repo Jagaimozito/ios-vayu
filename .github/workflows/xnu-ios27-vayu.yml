@@ -111,11 +111,27 @@ jobs:
           git -C dxb/xnu apply "$PWD/vayu-line/xnu/lines/ios27/hakios.patch"
           cp -R vayu-line/xnu/lines/ios27/files/. dxb/xnu/
 
+          # Apply repo-local vayu overlay and patches
+          if [ -d xnu/vayu/files ]; then
+            cp -R xnu/vayu/files/. dxb/xnu/
+          fi
+          if [ -d xnu/vayu/patches ]; then
+            for p in "$PWD"/xnu/vayu/patches/*.patch; do
+              [ -e "$p" ] && git -C dxb/xnu apply "$p"
+            done
+          fi
+
           # Stage CoreEntitlements V2 headers from KDK (as tools/vayu/build-mac.sh)
           CE="$KDK_PATH/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform/CoreEntitlements/V2"
           mkdir -p dxb/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2
           cp "$CE"/*.h dxb/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2/
           cp "$KDK_PATH/System/Library/KernelSupport/CoreEntitlements/V2/Kernel.h" dxb/xnu/EXTERNAL_HEADERS/CoreEntitlements/V2/Kernel.h
+
+      - name: Cache dxb fakeroot toolchain & headers
+        uses: actions/cache@v4
+        with:
+          path: dxb/fakeroot
+          key: dxb-fakeroot-${{ env.DXB_SHA }}-${{ env.KDK_BUILD }}-${{ env.SCION_XNU_COMMIT }}-${{ env.KERNEL_CONFIG }}-v1
 
       - name: Build XNU (VAYU, iOS target)
         working-directory: dxb
