@@ -1,6 +1,6 @@
 # iOS 27.2 on OnePlus 7 Pro (guacamole)
 
-This branch ports the **iOS 27.2 (24B119) userland for iPhone 14 Pro (iPhone15,2 / D73AP)** to the OnePlus 7 Pro (`guacamole`, Qualcomm SM8150 / Snapdragon 855, Adreno 640, 8 GB RAM). The device tree presents the D73 identity while the custom XNU kernel and userland drivers adapt the phone's hardware.
+This project ports the iOS 27.2.1 userland to the POCO X3 Pro (vayu / bhima), powered by the Qualcomm Snapdragon 860 (SM8150-AC) and Adreno 640 GPU.
 
 This is an experimental bring-up, not a daily-use phone OS. Many hardware features are incomplete, performance and graphics are unreliable, and the port disables or replaces parts of Apple's normal security and device stack. The iOS 16 port is maintained on a separate branch; this README describes the iOS 27 branch only.
 
