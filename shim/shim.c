@@ -382,6 +382,85 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+#if defined(BOARD_VAYU)
+static int has_sub(const char *s, int len, const char *sub)
+{
+	int n = 0;
+	while (sub[n])
+		n++;
+	for (int i = 0; i + n <= len; i++) {
+		int j = 0;
+		while (j < n && s[i + j] == sub[j])
+			j++;
+		if (j == n)
+			return 1;
+	}
+	return 0;
+}
+
+static void vayu_show_prevlog(struct mmu_info *mi)
+{
+	(void)mmu_enable(mi);
+	con_clear(BLACK);
+	uint64_t pbase = 0xc0000000ULL;
+	uint64_t live_pa = pbase + 0x1c72240ULL;
+	uint64_t magic = rd64(live_pa);
+	if (magic != 0x214556494c554e58ULL) {
+		pbase = 0x100000000ULL;
+		live_pa = pbase + 0x1c72240ULL;
+		magic = rd64(live_pa);
+	}
+	con_hex("XMGIC", magic);
+	if (magic != 0x214556494c554e58ULL) {
+		con_str("XLOG", "no XNULIVE! in DRAM (enter fastboot directly from iOS)");
+		return;
+	}
+	uint64_t log_va = rd64(live_pa + 16);
+	uint64_t len_va = rd64(live_pa + 24);
+	uintptr_t log_pa = (uintptr_t)(log_va - 0xfffffff006000000ULL + pbase);
+	uintptr_t len_pa = (uintptr_t)(len_va - 0xfffffff006000000ULL + pbase);
+	uint32_t len = rd32(len_pa);
+	if (len > 524288U)
+		len = 524288U;
+	con_hex2("XLOG", "pa=", (uint32_t)log_pa, "len=", len);
+	volatile const uint8_t *p = (volatile const uint8_t *)log_pa;
+	uint32_t pos = 0;
+	int shown = 0;
+	while (pos < len && shown < 38) {
+		char raw[220];
+		int rlen = 0;
+		while (pos < len) {
+			uint8_t c = p[pos++];
+			if (c == '\n')
+				break;
+			if (c >= 32 && c < 127 && rlen < (int)sizeof(raw) - 1)
+				raw[rlen++] = (char)c;
+		}
+		raw[rlen] = 0;
+		int match = has_sub(raw, rlen, "extra RAM") ||
+			    has_sub(raw, rlen, "nvt:") ||
+			    has_sub(raw, rlen, "VAYU TOUCH") ||
+			    has_sub(raw, rlen, "nvt-qup: ready") ||
+			    has_sub(raw, rlen, "nvt-qup: not ready") ||
+			    has_sub(raw, rlen, "nvt-qup: resx") ||
+			    has_sub(raw, rlen, "nvt-qup: gsi:") ||
+			    has_sub(raw, rlen, "pins after");
+		if (match && !has_sub(raw, rlen, "gsi: P1") && !has_sub(raw, rlen, "smr")) {
+			char shortline[84];
+			int slen = rlen < 83 ? rlen : 83;
+			for (int k = 0; k < slen; k++)
+				shortline[k] = raw[k];
+			shortline[slen] = 0;
+			con_str("L", shortline);
+			shown++;
+		}
+	}
+	con_hex("SHOWN", (uint64_t)shown);
+	for (;;)
+		__asm__ volatile("wfe");
+}
+#endif
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
@@ -501,6 +580,11 @@ void shim_main(uint64_t dtb)
 	}
 	con_str("LOADER", why);
 	con_skip();
+
+#if defined(BOARD_VAYU)
+	stage = "prevlog";
+	vayu_show_prevlog(&mi);
+#endif
 
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";

@@ -50,7 +50,7 @@ SCALE2 = '--scale2' in sys.argv
 # low-bank gaps), keeping ~2 GiB.
 RAM5G = '--ram5g' in sys.argv
 if RAM5G:
-    HIGH_PHYS_BASE, HIGH_MEM_SIZE = 0x100000000, 0x140000000
+    HIGH_PHYS_BASE, HIGH_MEM_SIZE = (0xc0000000, 0x140000000) if VAYU else (0x100000000, 0x140000000)
 if GUACAMOLE:
     FB_W, FB_H, FB_STRIDE = 1440, 3120, 1440 * 4
     FB_SIZE = 0x1200000

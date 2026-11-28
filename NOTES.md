@@ -16,7 +16,12 @@
 - Also references `nomorecoolnicknames/hackios-xnu-kernel-vayu` (`vayu` hardware/iOS 27 kernel line), `Scion-Project/xnu`, `Scion-Project/scion-kernel`, `UniXNU/AdrenoMetal`, and `akshaynexus/iOSPlus10`.
 
 ## Current Milestone & Next Concrete Action
-- **Verified (2026-11-27, photo `media_1795807147777_30e8bd74.jpg`, iOSOnAnd update `#7`):** **100% clean iOS 27.2.1 (`24B156`) Lock Screen on POCO X3 Pro (`e3e6c87f`)!**
+- **Verified (2026-11-27, photo `media_1795824205230_eaacdfb4.jpg`, iOSOnAnd `boot: works` + `touch: works` for `iOS 27.2`):** **iOS 27.2.1 (`24B156`) Home Screen + real Novatek NT36675 SPI touchscreen working on POCO X3 Pro (`e3e6c87f`)!**
+  - Added DRAM `prevlog` reader (`vayu_show_prevlog()` in `shim/shim.c`) which pinpointed why `vayu_qup_spi` failed on the first touch boot (`nvt-qup: gsi: no 32 KB contiguous RAM below 4 GB` / `cannot allocate the ring block`): `kmem_alloc_contig(..., max_pa=4 GiB)` only searches the main `vm_pages[]` window (`gDramBase`), not `hakios-extra-ram`.
+  - Moved `vayu`'s main RAM window in `tools/mkadt.py` (`--highmem --ram5g --vayu`) to `0xc0000000..0x200000000` (`5 GiB` contiguous, with `1 GiB` directly below `4 GiB`, clear of all vendor carve-outs `<= 0xb0800000` and the `0xbbb00000..0xc0000000` hole).
+  - Booted `dumps/vayu-ios27-touch-lowwin-boot.img` (`25,174,016` B, SHA-256 `c767a2e97f6b9171f5dfc5c7903b7fe719d8edbe6c190de00d28654b638c3c42`, `touchscreen=1 nvt_qup=1 nvt_qup_keep_power=0 nvt_qup_xnu_reset=1 sweetfb_noconsole=1`): Novatek NT36675 SPI touch unlocked the Lock Screen straight into the **iOS 27.2.1 Home Screen** (all stock icons + dock rendered cleanly).
+  - Observed: UI is currently slow because GPU hardware acceleration is still off (CPU Mesa `softpipe` `libOSMesa.8.dylib`), and background is black because `/private/var/local/sbwallpaper.png` is not yet staged.
+- **Verified earlier (2026-11-27, photo `media_1795807147777_30e8bd74.jpg`, iOSOnAnd update `#7`):** **100% clean iOS 27.2.1 (`24B156`) Lock Screen on POCO X3 Pro (`e3e6c87f`)!**
   - Booted `dumps/vayu-ios27-clean-boot.img` (`sweetfb_noconsole=1`, `vayu_wled=2`, no `-v`/`serial=3`/`sweeteacces=1`): zero overlapping kernel console text, Lock Screen clock (`4:04` / `Wed Dec 31`), green charging battery icon, Control Center grabber, and `"Swipe up to open"` Home indicator rendered cleanly.
 - **Verified earlier (2026-11-27, photos `media_1795806010982_8a06e78b.jpg`, `media_1795806018621_f47adbcd.jpg`, `media_1795806110113_0c546d60.jpg`, iOSOnAnd update `#6`):** First boot to SpringBoard Lock Screen after live-patching `cc_fips_test` CodeDirectory ident (`com.apple.cc_fips_test`) on `/dev/block/sda32`.
 - **Touch & Boot Loader Prep (`2026-11-27`):**
